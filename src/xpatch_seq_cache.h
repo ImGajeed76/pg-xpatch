@@ -28,6 +28,7 @@
  * 1. Group Max Seq Cache: (relid, group_value) -> max_seq
  *    - Used during INSERT to quickly get the next sequence number
  *    - One entry per group
+ *    - Uses BLAKE3 hashing for collision-resistant key storage
  *
  * 2. TID Seq Cache: (relid, tid) -> seq
  *    - Used during READ to quickly get seq for a tuple
@@ -66,22 +67,34 @@ void xpatch_seq_cache_init(void);
  * Parameters:
  *   relid       - Relation OID
  *   group_value - Group column value (use 0 if no group_by)
+ *   typid       - Type OID of the group column (for proper hashing)
  *   found       - Output: true if found in cache, false if cache miss
  */
-int32 xpatch_seq_cache_get_max_seq(Oid relid, Datum group_value, bool *found);
+int32 xpatch_seq_cache_get_max_seq(Oid relid, Datum group_value, Oid typid, bool *found);
 
 /*
  * Set the maximum sequence number for a group.
  * Called after a successful INSERT or after populating from a scan.
+ *
+ * Parameters:
+ *   relid       - Relation OID
+ *   group_value - Group column value (use 0 if no group_by)
+ *   typid       - Type OID of the group column (for proper hashing)
+ *   max_seq     - The maximum sequence number
  */
-void xpatch_seq_cache_set_max_seq(Oid relid, Datum group_value, int32 max_seq);
+void xpatch_seq_cache_set_max_seq(Oid relid, Datum group_value, Oid typid, int32 max_seq);
 
 /*
  * Increment and return the next sequence number for a group.
  * Atomically increments max_seq by 1 and returns the new value.
  * If group not in cache, sets it to 1 and returns 1.
+ *
+ * Parameters:
+ *   relid       - Relation OID
+ *   group_value - Group column value (use 0 if no group_by)
+ *   typid       - Type OID of the group column (for proper hashing)
  */
-int32 xpatch_seq_cache_next_seq(Oid relid, Datum group_value);
+int32 xpatch_seq_cache_next_seq(Oid relid, Datum group_value, Oid typid);
 
 /* ================================================================
  * TID Seq Cache - for READ optimization

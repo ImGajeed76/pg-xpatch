@@ -86,8 +86,8 @@ bytea *xpatch_decode_delta(const uint8 *base_data, size_t base_len,
  *   delta_len - Length of delta
  *   tag_out   - Output: extracted tag value
  *
- * Returns NULL on success, or an error message string on failure.
- * The error string is statically allocated and should NOT be freed.
+ * Returns NULL on success, or a palloc'd error message string on failure.
+ * The error string lives until end of memory context (typically transaction).
  */
 const char *xpatch_get_delta_tag(const uint8 *delta, size_t delta_len,
                                  size_t *tag_out);

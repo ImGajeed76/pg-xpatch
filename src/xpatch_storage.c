@@ -27,8 +27,9 @@
  * 
  * Physical Storage Format:
  * - We store tuples with delta-compressed content in the delta columns
- * - Keyframes are encoded with empty base (full content)
- * - Deltas reference previous versions via tag (tag=0 means previous row)
+ * - Keyframes are encoded with tag=0 (XPATCH_KEYFRAME_TAG) against empty base
+ * - Deltas reference previous versions via tag: tag=1 means previous row,
+ *   tag=2 means 2 rows back, etc.
  * 
  * IMPORTANT: We cannot use heap_beginscan on xpatch tables because that
  * requires heap AM. Instead, we use direct buffer access.
@@ -53,6 +54,7 @@
 
 /* Forward declarations */
 static bytea *datum_to_bytea(Datum value, Oid typid, bool isnull);
+static Oid get_group_column_typid(Relation rel, XPatchConfig *config);
 
 /*
  * Convert a Datum of various varlena types to bytea for compression.
@@ -108,6 +110,24 @@ datum_to_bytea(Datum value, Oid typid, bool isnull)
 }
 
 /*
+ * Get the type OID of the group_by column.
+ * Returns InvalidOid if no group_by column is configured.
+ */
+static Oid
+get_group_column_typid(Relation rel, XPatchConfig *config)
+{
+    TupleDesc tupdesc;
+    Form_pg_attribute attr;
+    
+    if (config->group_by_attnum == InvalidAttrNumber)
+        return InvalidOid;
+    
+    tupdesc = RelationGetDescr(rel);
+    attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+    return attr->atttypid;
+}
+
+/*
  * Convert bytea back to original Datum type.
  * 
  * Since we stored the raw varlena bytes in datum_to_bytea, we just need to
@@ -116,9 +136,7 @@ datum_to_bytea(Datum value, Oid typid, bool isnull)
  * 
  * We always return a fresh copy to ensure the caller owns the memory and
  * it won't be unexpectedly freed (important for tuple materialization in Sort).
- */
-/*
- * Convert bytea back to original Datum type.
+ * 
  * Exported for use by xpatch_tam.c for lazy reconstruction.
  */
 Datum
@@ -158,6 +176,8 @@ bytea_to_datum(bytea *data, Oid typid)
  * Scan the table using direct buffer access to find the maximum sequence number.
  * Returns 0 if the group is empty.
  * 
+ * Reads MAX(_xp_seq) from tuples directly - O(n) scan but only reads one int per tuple.
+ * 
  * OPTIMIZATION: First checks the seq cache for O(1) lookup via hash table.
  * On cache miss, performs a full table scan and populates the cache.
  * 
@@ -185,9 +205,30 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
     Form_pg_attribute attr;
     Datum tuple_group;
     bool group_isnull;
+    Oid group_typid = InvalidOid;
+    
+    tupdesc = RelationGetDescr(rel);
+    
+    /* _xp_seq column is required */
+    if (config->xp_seq_attnum == InvalidAttrNumber)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("xpatch: table \"%s\" is missing required _xp_seq column",
+                        RelationGetRelationName(rel)),
+                 errhint("Recreate the table or run: ALTER TABLE %s ADD COLUMN _xp_seq INT",
+                         RelationGetRelationName(rel))));
+    }
+    
+    /* Get group column type OID for proper hash computation */
+    if (config->group_by_attnum != InvalidAttrNumber)
+    {
+        Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+        group_typid = group_attr->atttypid;
+    }
     
     /* Try cache first - O(1) lookup */
-    max_seq = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel), group_value, &found);
+    max_seq = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel), group_value, group_typid, &found);
     if (found)
     {
         elog(DEBUG1, "xpatch: get_max_seq cache hit for group, max_seq=%d", max_seq);
@@ -198,7 +239,6 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
     
     /* Cache miss - scan the table */
     max_seq = 0;
-    tupdesc = RelationGetDescr(rel);
     nblocks = RelationGetNumberOfBlocks(rel);
     
     /* Scan all blocks */
@@ -222,6 +262,26 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
             tuple.t_tableOid = RelationGetRelid(rel);
             ItemPointerSet(&tuple.t_self, blkno, offnum);
             
+            /*
+             * MVCC visibility check: skip tuples that are not visible.
+             */
+            {
+                TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple.t_data);
+                
+                /* Skip if inserter hasn't committed and isn't us */
+                if (!TransactionIdIsCurrentTransactionId(xmin) &&
+                    !TransactionIdDidCommit(xmin))
+                    continue;
+                
+                /* Skip if tuple is deleted by a committed transaction */
+                if (!(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
+                {
+                    TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+                    if (TransactionIdDidCommit(xmax))
+                        continue;
+                }
+            }
+            
             /* If we have group_by, check if this tuple matches */
             if (config->group_by_attnum != InvalidAttrNumber)
             {
@@ -235,7 +295,17 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
                 }
             }
             
-            max_seq++;
+            /* Get sequence number from _xp_seq column */
+            {
+                bool seq_isnull;
+                Datum seq_datum = heap_getattr(&tuple, config->xp_seq_attnum, tupdesc, &seq_isnull);
+                if (!seq_isnull)
+                {
+                    int32 tuple_seq = DatumGetInt32(seq_datum);
+                    if (tuple_seq > max_seq)
+                        max_seq = tuple_seq;
+                }
+            }
         }
         
         LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -243,7 +313,7 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
     }
     
     /* Populate the cache for future lookups */
-    xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value, max_seq);
+    xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value, group_typid, max_seq);
     
     return max_seq;
 }
@@ -301,6 +371,29 @@ xpatch_get_max_version(Relation rel, XPatchConfig *config,
             tuple.t_tableOid = RelationGetRelid(rel);
             ItemPointerSet(&tuple.t_self, blkno, offnum);
             
+            /*
+             * MVCC visibility check: skip tuples that are not visible.
+             * A tuple is visible if:
+             * 1. XMIN is committed (or current txn) AND
+             * 2. Not deleted (XMAX invalid) OR delete not yet committed
+             */
+            {
+                TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple.t_data);
+                
+                /* Skip if inserter hasn't committed and isn't us */
+                if (!TransactionIdIsCurrentTransactionId(xmin) &&
+                    !TransactionIdDidCommit(xmin))
+                    continue;
+                
+                /* Skip if tuple is deleted by a committed transaction */
+                if (!(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
+                {
+                    TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+                    if (TransactionIdDidCommit(xmax))
+                        continue;
+                }
+            }
+            
             version_datum = heap_getattr(&tuple, config->order_by_attnum, tupdesc, &isnull);
             
             if (isnull)
@@ -334,10 +427,18 @@ xpatch_get_max_version(Relation rel, XPatchConfig *config,
                 switch (typid)
                 {
                     case INT2OID:
-                        cmp = DatumGetInt16(version_datum) - DatumGetInt16(max_version);
+                        {
+                            int16 a = DatumGetInt16(version_datum);
+                            int16 b = DatumGetInt16(max_version);
+                            cmp = (a > b) ? 1 : ((a < b) ? -1 : 0);
+                        }
                         break;
                     case INT4OID:
-                        cmp = DatumGetInt32(version_datum) - DatumGetInt32(max_version);
+                        {
+                            int32 a = DatumGetInt32(version_datum);
+                            int32 b = DatumGetInt32(max_version);
+                            cmp = (a > b) ? 1 : ((a < b) ? -1 : 0);
+                        }
                         break;
                     case INT8OID:
                         v1 = DatumGetInt64(version_datum);
@@ -369,6 +470,7 @@ xpatch_get_max_version(Relation rel, XPatchConfig *config,
 
 /*
  * Fetch a physical row by group and sequence number using direct buffer access.
+ * Searches for tuple where _xp_seq = target_seq.
  */
 HeapTuple
 xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
@@ -384,7 +486,6 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
     OffsetNumber maxoff;
     ItemId itemId;
     HeapTupleData tuple;
-    int32 current_seq = 0;
     Datum tuple_group;
     bool group_isnull;
     Form_pg_attribute attr;
@@ -426,12 +527,15 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
                     continue;
             }
             
-            current_seq++;
-            
-            if (current_seq == target_seq)
+            /* Check sequence number from _xp_seq column */
             {
-                result = heap_copytuple(&tuple);
-                break;
+                bool seq_isnull;
+                Datum seq_datum = heap_getattr(&tuple, config->xp_seq_attnum, tupdesc, &seq_isnull);
+                if (!seq_isnull && DatumGetInt32(seq_datum) == target_seq)
+                {
+                    result = heap_copytuple(&tuple);
+                    break;
+                }
             }
         }
         
@@ -525,7 +629,8 @@ xpatch_reconstruct_from_delta(Relation rel, XPatchConfig *config,
     /* Cache the result */
     if (result != NULL)
     {
-        xpatch_cache_put(RelationGetRelid(rel), group_value, seq, attnum, result);
+        Oid group_typid = get_group_column_typid(rel, config);
+        xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid, seq, attnum, result);
     }
     
     return result;
@@ -569,9 +674,12 @@ xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
     typid = attr->atttypid;
     
     /* 1. Check LRU cache first - O(1) hash lookup */
-    result = xpatch_cache_get(RelationGetRelid(rel), group_value, seq, attnum);
-    if (result != NULL)
-        return result;
+    {
+        Oid group_typid = get_group_column_typid(rel, config);
+        result = xpatch_cache_get(RelationGetRelid(rel), group_value, group_typid, seq, attnum);
+        if (result != NULL)
+            return result;
+    }
     
     /* 2. Fetch the physical tuple for this sequence */
     physical_tuple = xpatch_fetch_by_seq(rel, config, group_value, seq);
@@ -639,9 +747,12 @@ xpatch_reconstruct_column_with_tuple(Relation rel, XPatchConfig *config,
     typid = attr->atttypid;
     
     /* Check LRU cache first */
-    result = xpatch_cache_get(RelationGetRelid(rel), group_value, seq, attnum);
-    if (result != NULL)
-        return result;
+    {
+        Oid group_typid = get_group_column_typid(rel, config);
+        result = xpatch_cache_get(RelationGetRelid(rel), group_value, group_typid, seq, attnum);
+        if (result != NULL)
+            return result;
+    }
     
     /* Get the delta/compressed value from the tuple we already have */
     delta_datum = heap_getattr(physical_tuple, attnum, tupdesc, &isnull);
@@ -661,6 +772,10 @@ xpatch_reconstruct_column_with_tuple(Relation rel, XPatchConfig *config,
 /*
  * Convert a logical tuple (from user INSERT) to physical format.
  * This performs delta compression on configured columns.
+ *
+ * Supports "restore mode" for pg_dump/pg_restore: if the user explicitly
+ * provides a non-NULL _xp_seq value, that value is used instead of
+ * auto-generating. This allows COPY FROM to restore data correctly.
  */
 HeapTuple
 xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
@@ -692,9 +807,15 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     bytea *candidate;
     Size candidate_size;
     bytea *cache_content;
+    bool restore_mode = false;
+    int32 user_seq = 0;
+    Oid group_typid = InvalidOid;
     
     tupdesc = RelationGetDescr(rel);
     natts = tupdesc->natts;
+    
+    /* Ensure slot is materialized early so we can check _xp_seq */
+    slot_getallattrs(slot);
     
     /* Get group value if configured */
     if (config->group_by_attnum != InvalidAttrNumber)
@@ -704,39 +825,90 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
             group_value = (Datum) 0;
     }
     
+    /* Get group column type OID for proper hash computation */
+    if (config->group_by_attnum != InvalidAttrNumber)
+    {
+        Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+        group_typid = group_attr->atttypid;
+    }
+    
+    /*
+     * Check for restore mode: if user explicitly provides _xp_seq, use it.
+     * This enables pg_restore / COPY FROM with explicit sequence numbers.
+     */
+    if (config->xp_seq_attnum != InvalidAttrNumber)
+    {
+        Datum seq_datum = slot_getattr(slot, config->xp_seq_attnum, &isnull);
+        if (!isnull)
+        {
+            user_seq = DatumGetInt32(seq_datum);
+            if (user_seq > 0)
+            {
+                restore_mode = true;
+                new_seq = user_seq;
+                elog(DEBUG1, "xpatch: restore mode - using explicit _xp_seq=%d", new_seq);
+                
+                /*
+                 * Update the seq cache if this seq is higher than what we have.
+                 * This ensures subsequent auto-generated inserts continue correctly.
+                 */
+                {
+                    bool cache_found;
+                    int32 cached_max = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel), 
+                                                                     group_value, group_typid,
+                                                                     &cache_found);
+                    if (!cache_found || new_seq > cached_max)
+                    {
+                        xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value, 
+                                                     group_typid, new_seq);
+                    }
+                }
+            }
+        }
+    }
+    
     /* 
-     * Calculate sequence number using the seq cache.
+     * Calculate sequence number using the seq cache (normal mode only).
      * xpatch_seq_cache_next_seq() atomically increments and returns the new seq.
      * If the group isn't in the cache, it returns 0 and we fall back to a scan.
      */
-    new_seq = xpatch_seq_cache_next_seq(RelationGetRelid(rel), group_value);
-    
-    if (new_seq == 0)
+    if (!restore_mode)
     {
-        /* Cache miss or cache full - fall back to scan (populates cache) */
-        new_seq = xpatch_get_max_seq(rel, config, group_value) + 1;
-        /* Update the cache with the new seq */
-        xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value, new_seq);
+        new_seq = xpatch_seq_cache_next_seq(RelationGetRelid(rel), group_value, group_typid);
+        
+        if (new_seq == 0)
+        {
+            /* Cache miss or cache full - fall back to scan (populates cache) */
+            new_seq = xpatch_get_max_seq(rel, config, group_value) + 1;
+            /* Update the cache with the new seq */
+            xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value, group_typid, new_seq);
+        }
     }
     
     /* Determine if this is a keyframe */
     is_keyframe = (new_seq == 1) || (new_seq % config->keyframe_every == 1);
     
-    elog(DEBUG1, "xpatch: inserting seq %d, is_keyframe=%d", new_seq, is_keyframe);
-    
-    /* Ensure slot is materialized */
-    slot_getallattrs(slot);
+    elog(DEBUG1, "xpatch: inserting seq %d, is_keyframe=%d%s", new_seq, is_keyframe,
+         restore_mode ? " (restore mode)" : "");
     
     /* Allocate arrays for physical tuple */
     values = palloc(natts * sizeof(Datum));
     nulls = palloc(natts * sizeof(bool));
     
-    /* Copy all attributes, compressing delta columns */
+    /* Copy all attributes, compressing delta columns and setting _xp_seq */
     for (i = 0; i < natts; i++)
     {
         attnum = i + 1;
         is_delta_col = false;
         delta_col_index = -1;
+        
+        /* Handle _xp_seq column - set to the new sequence number */
+        if (config->xp_seq_attnum != InvalidAttrNumber && attnum == config->xp_seq_attnum)
+        {
+            values[i] = Int32GetDatum(new_seq);
+            nulls[i] = false;
+            continue;
+        }
         
         /* Check if this is a delta column */
         for (j = 0; j < config->num_delta_columns; j++)
@@ -863,9 +1035,11 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
             values[i] = PointerGetDatum(compressed);
             
             /* Cache the original content for future delta encoding */
-            cache_content = datum_to_bytea(slot_getattr(slot, attnum, &isnull), typid, false);
-            xpatch_cache_put(RelationGetRelid(rel), group_value, new_seq, attnum, cache_content);
-            pfree(cache_content);
+            {
+                cache_content = datum_to_bytea(slot_getattr(slot, attnum, &isnull), typid, false);
+                xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid, new_seq, attnum, cache_content);
+                pfree(cache_content);
+            }
             
             pfree(raw_content);
         }
@@ -881,7 +1055,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
 }
 
 /*
- * Convert a physical tuple to logical format using direct buffer access.
+ * Convert a physical tuple to logical format.
  * 
  * This is the core reconstruction function called during scans and fetches.
  * It takes a physical tuple (with delta-compressed columns) and reconstructs
@@ -889,9 +1063,8 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
  * 
  * Process:
  * 1. Extract all attributes from physical tuple into slot
- * 2. Determine sequence number via TID->seq cache (O(1) hash lookup)
- * 3. On cache miss: Scan group to build TID->seq mappings (O(n) but rare)
- * 4. For each delta column: Reconstruct using fast path (tuple already available)
+ * 2. Get sequence number from _xp_seq column (O(1) read)
+ * 3. For each delta column: Reconstruct using fast path (tuple already available)
  * 
  * IMPORTANT: Uses xpatch_reconstruct_column_with_tuple() to avoid redundant
  * tuple fetches. This optimization provides 12x speedup vs naive approach.
@@ -906,24 +1079,10 @@ xpatch_physical_to_logical(Relation rel, XPatchConfig *config,
     Datum group_value = (Datum) 0;
     int32 seq = 0;
     int i, j;
-    ItemPointer tid;
-    BlockNumber nblocks;
-    BlockNumber blkno;
-    Buffer buffer;
-    Page page;
-    OffsetNumber offnum;
-    OffsetNumber maxoff;
-    ItemId itemId;
-    HeapTupleData tuple;
-    int32 count = 0;
-    Datum tuple_group;
-    bool group_isnull;
-    Form_pg_attribute grp_attr;
     AttrNumber attnum;
     Form_pg_attribute attr;
     Oid typid;
     bytea *reconstructed;
-    bool found_tid = false;
     
     tupdesc = RelationGetDescr(rel);
     natts = tupdesc->natts;
@@ -963,74 +1122,14 @@ xpatch_physical_to_logical(Relation rel, XPatchConfig *config,
             group_value = (Datum) 0;
     }
     
-    /* Find this tuple's sequence number - try TID cache first */
-    tid = &physical_tuple->t_self;
-    
-    seq = xpatch_seq_cache_get_tid_seq(RelationGetRelid(rel), tid, &found_tid);
-    
-    if (!found_tid)
+    /* Get sequence number from _xp_seq column */
+    if (slot->tts_isnull[config->xp_seq_attnum - 1])
     {
-        /*
-         * TID cache miss - scan the group to find seq and populate the cache.
-         * This is a one-time cost per group; subsequent reads will hit the cache.
-         */
-        nblocks = RelationGetNumberOfBlocks(rel);
-        count = 0;
-        
-        for (blkno = 0; blkno < nblocks; blkno++)
-        {
-            buffer = ReadBuffer(rel, blkno);
-            LockBuffer(buffer, BUFFER_LOCK_SHARE);
-            
-            page = BufferGetPage(buffer);
-            maxoff = PageGetMaxOffsetNumber(page);
-            
-            for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
-            {
-                itemId = PageGetItemId(page, offnum);
-                
-                if (!ItemIdIsNormal(itemId))
-                    continue;
-                
-                tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
-                tuple.t_len = ItemIdGetLength(itemId);
-                tuple.t_tableOid = RelationGetRelid(rel);
-                ItemPointerSet(&tuple.t_self, blkno, offnum);
-                
-                /* Check group if specified */
-                if (config->group_by_attnum != InvalidAttrNumber)
-                {
-                    tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
-                    
-                    if (!group_isnull)
-                    {
-                        grp_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
-                        if (!datumIsEqual(group_value, tuple_group, grp_attr->attbyval, grp_attr->attlen))
-                            continue;
-                    }
-                }
-                
-                count++;
-                
-                /* Cache this TID -> seq mapping */
-                xpatch_seq_cache_set_tid_seq(RelationGetRelid(rel), &tuple.t_self, count);
-                
-                if (ItemPointerEquals(&tuple.t_self, tid))
-                {
-                    seq = count;
-                    found_tid = true;
-                    /* Don't break - continue to populate cache for rest of group */
-                }
-            }
-            
-            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-            ReleaseBuffer(buffer);
-        }
-        
-        /* If we still didn't find the tuple, use count as seq (shouldn't happen) */
-        if (seq == 0)
-            seq = count > 0 ? count : 1;
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("xpatch: _xp_seq column is NULL")));
     }
+    seq = DatumGetInt32(slot->tts_values[config->xp_seq_attnum - 1]);
 
     /* Reconstruct delta columns - replace compressed data with decompressed */
     for (j = 0; j < config->num_delta_columns; j++)

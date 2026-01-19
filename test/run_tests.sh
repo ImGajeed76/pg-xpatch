@@ -31,6 +31,15 @@ TESTS=(
     "08_parallel"
     "09_multi_delta"
     "10_no_group"
+    "11_delete"
+    "12_vacuum"
+    "13_crash_recovery"
+    "14_describe"
+    "15_warm_cache"
+    "16_auto_index"
+    "17_edge_cases"
+    "18_restore_mode"
+    "20_comprehensive"
 )
 
 # Create results directory

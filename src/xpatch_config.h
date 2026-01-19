@@ -38,7 +38,7 @@
  */
 typedef struct XPatchConfig
 {
-    /* Column identifiers (names as specified in WITH clause) */
+    /* Column identifiers (from catalog or auto-detection) */
     char       *group_by;           /* Column for grouping (optional, NULL if none) */
     char       *order_by;           /* Column for ordering (required) */
     char      **delta_columns;      /* Array of delta column names */

@@ -4,6 +4,9 @@
 -- Suppress NOTICE messages for cleaner test output
 SET client_min_messages = warning;
 
+-- Clean up from previous runs
+DROP TABLE IF EXISTS test_errors;
+
 -- Create a test table
 CREATE TABLE test_errors (
     id INT,

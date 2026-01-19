@@ -1,113 +1,371 @@
 # pg-xpatch
 
-PostgreSQL extension for storing versioned data with automatic delta compression. Built on [xpatch](https://github.com/ImGajeed76/xpatch).
+A PostgreSQL Table Access Method (TAM) extension for storing versioned data with automatic delta compression. Built on the [xpatch](https://github.com/ImGajeed76/xpatch) delta encoding library.
 
 ## What It Does
 
-Store versioned rows (like document revisions, config history, audit logs) with 20x space savings. Compression is automatic and transparent - you just INSERT/SELECT normally.
+Store versioned rows (document revisions, config history, audit logs, etc.) with massive space savings. Compression is automatic and transparent - you just INSERT and SELECT normally.
 
 ```sql
--- Create table
+-- Create a table using the xpatch access method
 CREATE TABLE documents (
     doc_id   INT,
     version  INT,
     content  TEXT
 ) USING xpatch;
 
--- Configure (or let it auto-detect)
+-- Configure grouping and ordering (optional - auto-detection works for most cases)
 SELECT xpatch.configure('documents',
     group_by => 'doc_id',
-    order_by => 'version',
-    delta_columns => ARRAY['content']::text[]
+    order_by => 'version'
 );
 
 -- Insert versions normally
 INSERT INTO documents VALUES (1, 1, 'Hello World');
-INSERT INTO documents VALUES (1, 2, 'Hello PostgreSQL!');
+INSERT INTO documents VALUES (1, 2, 'Hello PostgreSQL World!');
+INSERT INTO documents VALUES (1, 3, 'Hello PostgreSQL World! Updated.');
 
 -- Query normally - reconstruction is automatic
-SELECT * FROM documents WHERE doc_id = 1;
+SELECT * FROM documents WHERE doc_id = 1 ORDER BY version;
 
--- Check compression
+-- Check compression stats
 SELECT * FROM xpatch_stats('documents');
+```
+
+## Features
+
+### What Works
+
+- **Automatic delta compression** - Only stores differences between versions
+- **Transparent reconstruction** - SELECT works normally, deltas are decoded on-the-fly
+- **Auto-detection** - Automatically detects group_by, order_by, and delta columns
+- **Parallel scans** - Full support for parallel query execution
+- **Index support** - B-tree indexes work on all columns (including delta-compressed ones)
+- **MVCC** - Basic multi-version concurrency control
+- **DELETE** - Cascade delete removes a version and all subsequent versions in the chain
+- **VACUUM** - Dead tuple cleanup works
+- **WAL logging** - Crash recovery supported
+- **Shared memory cache** - LRU cache for reconstructed content across all backends
+
+### What Doesn't Work (By Design)
+
+- **UPDATE** - Not supported. Insert a new version instead. This is intentional for append-only versioned data.
+- **Out-of-order inserts** - Versions must be inserted in order within each group
+- **Hidden columns** - The internal `_xp_seq` column is visible in `SELECT *` (PostgreSQL limitation)
+
+### Utility Functions
+
+```sql
+-- Describe a table: shows config, schema, and storage stats
+SELECT * FROM xpatch.describe('documents');
+
+-- Warm the cache for faster subsequent queries
+SELECT * FROM xpatch.warm_cache('documents');
+SELECT * FROM xpatch.warm_cache('documents', max_groups => 100);
+
+-- Get compression statistics
+SELECT * FROM xpatch_stats('documents');
+
+-- Inspect internal storage for a specific group (debugging/analysis)
+SELECT * FROM xpatch_inspect('documents', 1);  -- group_value = 1
+
+-- Get cache statistics (requires shared_preload_libraries)
+SELECT * FROM xpatch_cache_stats();
+
+-- Get xpatch library version
+SELECT xpatch_version();
+
+-- Dump all table configs as SQL (for backup/migration)
+SELECT * FROM xpatch.dump_configs();
+
+-- Fix config OIDs after pg_restore
+SELECT xpatch.fix_restored_configs();
 ```
 
 ## Performance
 
-**Storage:** 20x smaller than heap tables (544 KB vs 11 MB for 10k versioned rows)
+### Storage Compression
 
-**Reads:** Comparable to heap with warm cache, slower on cold reads
+Space savings depend heavily on your data patterns. Here are real benchmarks with 5000 rows (100 documents x 50 versions each):
 
-**Writes:** 3-5x slower than heap (delta encoding overhead)
+| Data Pattern | xpatch Size | heap Size | Space Saved |
+|--------------|-------------|-----------|-------------|
+| Incremental changes (base content + small additions) | 416 KB | 9.2 MB | **95% smaller** |
+| Identical content across versions | 488 KB | 648 KB | 25% smaller |
+| Completely random data | 816 KB | 728 KB | 12% larger (overhead) |
 
-Good for append-only versioned data where space matters more than write speed.
+**Key insight:** xpatch shines when versions share content. For typical document versioning (where each version is similar to the previous), expect 10-20x space savings. For random/unrelated data, xpatch adds overhead and provides no benefit.
+
+### Query Performance
+
+**Important:** These benchmarks are rough indicators, not precise measurements. Your mileage will vary based on hardware, data patterns, cache state, and query complexity.
+
+Benchmark setup: 10,100 rows (101 documents x 100 versions), incremental text data. xpatch: 776 KB, heap: 17 MB.
+
+| Operation | xpatch | heap | Slowdown |
+|-----------|--------|------|----------|
+| **Full table COUNT** | | | |
+| - Cold cache | 44ms | 2.6ms | 17x slower |
+| - Warm cache | 20ms | 1.4ms | 14x slower |
+| **Point lookup (single doc, 100 rows)** | 0.7ms | 0.05ms | 14x slower |
+| **Point lookup (single row)** | 0.13ms | 0.02ms | 6x slower |
+| **GROUP BY aggregate** | 27ms | 3ms | 9x slower |
+| **Latest version per doc** | 28ms | 5.5ms | 5x slower |
+| **Text search (LIKE)** | 3.4ms | 1.5ms | 2x slower |
+| **INSERT (100 rows)** | 33ms | 0.3ms | 100x slower |
+| **Parallel scan (2 workers)** | 31ms | 3.5ms | 9x slower |
+
+**Key observations:**
+- **Reads are 5-17x slower** due to delta reconstruction overhead
+- **Writes are ~100x slower** due to delta encoding (this is the main trade-off)
+- **Cache helps** but doesn't eliminate the reconstruction cost
+- **Indexed lookups** are faster than full scans but still have overhead
+
+**When to use xpatch:**
+- Storage cost is a primary concern (95% space savings)
+- Data is written once and read occasionally
+- Append-only versioned data (audit logs, document history, config snapshots)
+- You can tolerate higher write latency
+
+**When NOT to use xpatch:**
+- High-frequency reads on the same data
+- Write-heavy workloads where latency matters
+- Data with no similarity between versions (random data)
+
+### Cache Behavior
+
+The shared memory cache dramatically improves read performance for repeated access:
+
+```sql
+-- First query (cold): ~35ms for 5000 rows
+SELECT COUNT(*) FROM documents;
+
+-- Second query (warm): ~1ms for 5000 rows  
+SELECT COUNT(*) FROM documents;
+```
+
+To enable the shared memory cache, add to `postgresql.conf`:
+```
+shared_preload_libraries = 'pg_xpatch'
+```
 
 ## Installation
 
-**Requirements:** PostgreSQL 16, Rust 1.92+, Git
+### Requirements
+
+- PostgreSQL 16+
+- Rust 1.70+ (for building the xpatch library)
+- cbindgen (for generating C headers from Rust)
+- Git
+
+### Building
 
 ```bash
-git clone https://github.com/yourusername/pg-xpatch
+git clone https://github.com/ImGajeed76/pg-xpatch
 cd pg-xpatch
 
-# Build (automatically clones xpatch library)
+# Build (automatically clones xpatch library if needed)
 make clean && make && make install
 
-# Enable
+# Restart PostgreSQL if using shared memory cache
+# Add to postgresql.conf: shared_preload_libraries = 'pg_xpatch'
+
+# Enable the extension
 psql -c "CREATE EXTENSION pg_xpatch;"
 ```
 
-The Makefile automatically clones the xpatch library into `tmp/xpatch` if it doesn't exist.
+### Docker Development Environment
 
-See `.devcontainer/` for a pre-configured Docker environment.
+A pre-configured Docker environment is available in `.devcontainer/`:
+
+```bash
+# Build and run
+docker build -t pg-xpatch-dev .devcontainer/
+docker run -d --name pg-xpatch-dev -v $(pwd):/workspace pg-xpatch-dev
+
+# Build and test inside container
+docker exec pg-xpatch-dev bash -c "cd /workspace && make && make install"
+docker exec -u postgres pg-xpatch-dev psql -c "CREATE EXTENSION pg_xpatch;"
+```
+
+## Configuration
+
+### Auto-Detection
+
+For most tables, xpatch auto-detects the configuration:
+- **group_by**: Not set (whole table is one version chain) or explicitly configured
+- **order_by**: Last INT/BIGINT column before `_xp_seq`
+- **delta_columns**: All TEXT, BYTEA, JSON, JSONB columns
+
+### Explicit Configuration
+
+```sql
+SELECT xpatch.configure('my_table',
+    group_by => 'doc_id',           -- Column that groups versions (optional)
+    order_by => 'version',          -- Column that orders versions
+    delta_columns => ARRAY['content', 'metadata']::text[],  -- Columns to compress
+    keyframe_every => 100,          -- Full snapshot every N versions (default: 100)
+    compress_depth => 1,            -- How many previous versions to consider (default: 1)
+    enable_zstd => true             -- Enable zstd compression (default: true)
+);
+```
+
+### Inspecting Configuration
+
+```sql
+-- Full table description
+SELECT * FROM xpatch.describe('my_table');
+
+-- Just the config
+SELECT * FROM xpatch.get_config('my_table');
+```
 
 ## How It Works
 
-Groups rows by an ID column, orders by version, stores only deltas between versions. Every 100th row is a keyframe (full content). Three-tier cache speeds up reconstruction.
+### Storage Model
 
-Delta encoding uses xpatch's tag system - each delta can reference any previous version, not just the immediate predecessor. This makes reverts extremely small.
+1. **Grouping**: Rows are grouped by an optional `group_by` column (e.g., document ID)
+2. **Ordering**: Within each group, rows are ordered by an `order_by` column (e.g., version number)
+3. **Keyframes**: Every Nth row (default: 100) stores full content
+4. **Deltas**: Other rows store only the differences from the previous version
 
-## Limitations
+### Reconstruction
 
-Version 0.1.0 is append-only:
-- No UPDATE/DELETE (insert new versions instead)
-- No VACUUM yet
-- Basic MVCC only
+When you SELECT a delta-compressed row:
+1. Find the nearest keyframe
+2. Apply deltas sequentially to reconstruct the content
+3. Cache the result for future queries
 
-These trade-offs are fine for immutable version history.
+### Internal Column
 
-**Note:** Indexes work on all columns, including delta columns (reconstruction happens transparently during index scans).
+xpatch automatically adds an `_xp_seq` column to track sequence numbers. This column:
+- Is added automatically via event trigger on `CREATE TABLE ... USING xpatch`
+- Is used internally for efficient delta chain traversal
+- Is visible in `SELECT *` (PostgreSQL doesn't support truly hidden columns)
+- Should be excluded in your queries if you don't want to see it: `SELECT doc_id, version, content FROM ...`
+
+### Automatic Indexes
+
+xpatch automatically creates indexes for efficient lookups:
+- Basic `_xp_seq` index on table creation
+- Composite `(group_by, _xp_seq)` index when `group_by` is configured
+
+## Testing
+
+```bash
+# Run all tests (20 test files)
+# First create the test database and extension
+createdb xpatch_test
+psql -d xpatch_test -c "CREATE EXTENSION pg_xpatch;"
+
+# Then run all test files
+for f in test/sql/*.sql; do
+    psql -d xpatch_test -f "$f"
+done
+
+# Or use the test runner
+./test/run_tests.sh run
+```
+
+The test suite covers:
+- Basic INSERT/SELECT operations
+- Delta compression and reconstruction
+- Keyframe behavior
+- Index support
+- Parallel scans
+- DELETE with cascade
+- VACUUM
+- Error handling
+- Edge cases (empty tables, NULL values, unusual types, large data)
+
+## Limitations and Known Issues
+
+### Intentional Limitations
+
+- **No UPDATE**: Use INSERT with a new version number instead
+- **Ordered inserts only**: Versions must be inserted in ascending order within each group
+- **Append-only design**: Optimized for immutable version history
+
+### Current Limitations (May Be Addressed Later)
+
+- **`_xp_seq` visible**: PostgreSQL doesn't support hidden columns
+- **Cold read performance**: First query on uncached data is slow
+- **Write overhead**: Delta encoding adds INSERT latency
+
+### Technical Debt (Known Implementation Issues)
+
+These issues exist in the current implementation and may be addressed in future versions:
+
+- **WAL critical sections**: INSERT and DELETE WAL logging don't use `START_CRIT_SECTION()`/`END_CRIT_SECTION()`. In rare crash scenarios during these operations, data corruption is theoretically possible. For most use cases (non-critical data, infrequent crashes), this is acceptable.
+
+- **MVCC visibility simplified**: The `xpatch_tuple_satisfies_snapshot()` function currently returns true for all tuples. This means concurrent transactions may see uncommitted data in rare edge cases. Full MVCC semantics would require significant additional complexity.
+
+- **Hash table after eviction**: The LRU cache uses linear probing for collision resolution. When entries are evicted, this can theoretically break probe chains, causing cache misses for entries that exist. In practice, the cache is effective enough that this rarely impacts performance.
+
+- **SPI connection error handling**: The config loading code uses SPI without full PG_TRY/PG_CATCH wrapping. An error during config load could theoretically leave SPI in an inconsistent state, though this would only affect the current transaction.
+
+These issues are documented for transparency. For typical workloads (versioned document storage, audit logs), they don't cause problems. If you're using pg-xpatch in a high-concurrency, mission-critical environment, be aware of these limitations.
+
+### PostgreSQL Version
+
+Currently tested on PostgreSQL 16. Other versions may work but are not officially supported.
 
 ## License
 
-Dual-licensed: **AGPL-3.0-or-later** for open source, commercial license available for proprietary use.
+pg-xpatch is dual-licensed: AGPL-3.0-or-later for open source, with a commercial option for proprietary use.
 
-### Why AGPL?
+### The Philosophy
 
-I love open source. I don't love massive corporations taking community work and giving nothing back. AGPL ensures that if you modify and distribute pg-xpatch (including running it as a service), you share those improvements.
+I'm a huge fan of open source. I also don't want massive corporations extracting value from community work without giving anything back. AGPL solves this - if you modify pg-xpatch and distribute it (including running it as a service), those improvements stay open.
 
-For most people, AGPL is perfect. You're building open source? Great, use it freely.
+That said, I'm not trying to build a licensing business here. This is about fairness, not revenue.
 
-### Commercial License
+### Do You Need a Commercial License?
 
-If you're a large company with AGPL restrictions or need to use this in proprietary infrastructure at scale, let's talk: **xpatch-commercial@alias.oseifert.ch**
+**Probably not if you're:**
 
-**Small businesses and startups:** Probably free. I just want to know who's using it.
+- Building open source software (AGPL is perfect)
+- A small team or indie developer
+- Experimenting or doing research
+- A startup figuring things out
 
-**Large companies:** Yeah, I'll ask for something reasonable. You have the resources to support open source work.
+**Maybe if you're:**
 
-**Want to contribute code instead?** Even better. Help improve pg-xpatch and we'll work out the licensing.
+- A large company with AGPL restrictions
+- Integrating this into proprietary infrastructure at scale
+- Need legal certainty for closed-source use
 
-I'm not building a licensing business - this is about fairness. Don't be a massive corp that extracts value without contributing back.
+### How Commercial Licensing Works
 
-See LICENSE-AGPL.txt and LICENSE-COMMERCIAL.txt for details.
+Email me at xpatch-commercial@alias.oseifert.ch and let's talk.
+
+Small businesses? Probably free - I just want to know who's using it and how.
+
+Larger companies? Yeah, I'll ask for something, but it'll be reasonable. You have the resources to support open source work, so let's make it fair.
+
+Would rather contribute code than pay? Even better. Help make pg-xpatch better and we'll figure out the licensing stuff.
+
+I'm not interested in complex contracts or pricing games. Just don't be a massive corp that takes community work and gives nothing back. That's literally the only thing I'm trying to prevent.
+
+### Contributor License Agreement
+
+If you contribute code, you're granting us rights to use it under both AGPL and commercial terms. This sounds scarier than it is - it just means we can handle licensing requests without tracking down every contributor for permission.
+
+The AGPL version stays open forever. This just gives us flexibility to be reasonable with companies that need commercial licenses.
+
+See `LICENSE-AGPL.txt` for the full text, or `LICENSE-COMMERCIAL.txt` for commercial terms.
 
 ## Contributing
 
-Contributions welcome. If you contribute code, you grant rights to use it under both AGPL and commercial terms (so we can handle licensing without tracking down every contributor).
+Contributions are welcome! Please open an issue or pull request on GitHub.
+
+Before submitting:
+1. Run the test suite (`test/sql/*.sql`)
+2. Add tests for new functionality
+3. Keep commits focused and well-documented
 
 ## Links
 
-- **xpatch library:** https://github.com/ImGajeed76/xpatch
-- **Tests:** `./test/run_tests.sh run`
-- **Benchmarks:** `./benchmark/run_benchmark.sh`
+- **xpatch library**: https://github.com/ImGajeed76/xpatch
+- **Issue tracker**: https://github.com/ImGajeed76/pg-xpatch/issues
+- **Tests**: `test/sql/*.sql`

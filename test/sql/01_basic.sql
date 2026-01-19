@@ -16,11 +16,11 @@ INSERT INTO test_basic VALUES (1, 1, 'First version');
 INSERT INTO test_basic VALUES (1, 2, 'Second version');
 INSERT INTO test_basic VALUES (1, 3, 'Third version');
 
--- Select all rows
-SELECT * FROM test_basic ORDER BY version;
+-- Select all rows (excluding _xp_seq for cleaner output)
+SELECT id, version, content FROM test_basic ORDER BY version;
 
 -- Select with WHERE clause
-SELECT * FROM test_basic WHERE version = 2;
+SELECT id, version, content FROM test_basic WHERE version = 2;
 
 -- Select specific columns
 SELECT id, version FROM test_basic ORDER BY version;
@@ -48,8 +48,8 @@ INSERT INTO test_configured VALUES (1, 2, 'Doc 1', 'Body version 2 with changes'
 INSERT INTO test_configured VALUES (2, 1, 'Doc 2', 'Different document');
 INSERT INTO test_configured VALUES (2, 2, 'Doc 2', 'Different document updated');
 
--- Verify data retrieval
-SELECT * FROM test_configured ORDER BY doc_id, rev;
+-- Verify data retrieval (excluding _xp_seq)
+SELECT doc_id, rev, title, body FROM test_configured ORDER BY doc_id, rev;
 
 -- Verify group_by works - each doc can have same rev numbers
 SELECT doc_id, COUNT(*) as versions FROM test_configured GROUP BY doc_id ORDER BY doc_id;

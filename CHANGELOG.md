@@ -17,10 +17,19 @@ Initial release.
   - Group→maxseq cache (O(1) hash lookup)
 - Auto-configuration with manual override via `xpatch.configure()`
 - Index support on all columns (including delta columns with transparent reconstruction)
+- DELETE support with cascade (removes version and all subsequent versions in chain)
+- VACUUM support for dead tuple cleanup
+- Restore mode for pg_dump/pg_restore compatibility
 - Utility functions:
   - `xpatch_stats()` - compression statistics
   - `xpatch_cache_stats()` - cache performance
-- Comprehensive test suite (11 tests)
+  - `xpatch_inspect()` - inspect internal storage details for a group
+  - `xpatch_version()` - get library version
+  - `xpatch.describe()` - full table introspection
+  - `xpatch.warm_cache()` - pre-populate cache
+  - `xpatch.dump_configs()` - export configs as SQL
+  - `xpatch.fix_restored_configs()` - fix OIDs after pg_restore
+- Comprehensive test suite (20 tests)
 
 ### Performance
 
@@ -30,7 +39,6 @@ Initial release.
 
 ### Known Limitations
 
-- Append-only (no UPDATE/DELETE)
-- No VACUUM implementation
+- Append-only (no UPDATE support - by design)
 - Basic MVCC only
 - PostgreSQL 16 only

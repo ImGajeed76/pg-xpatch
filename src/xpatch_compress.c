@@ -115,6 +115,9 @@ xpatch_decode_delta(const uint8 *base_data, size_t base_len,
 
 /*
  * Extract the tag from a delta
+ * 
+ * Thread-safe: Returns palloc'd error string (caller must pfree if non-NULL)
+ * or NULL on success.
  */
 const char *
 xpatch_get_delta_tag(const uint8 *delta, size_t delta_len, size_t *tag_out)
@@ -125,11 +128,14 @@ xpatch_get_delta_tag(const uint8 *delta, size_t delta_len, size_t *tag_out)
 
     if (error != NULL)
     {
-        /* Copy error to static buffer before freeing */
-        static char error_buf[256];
-        snprintf(error_buf, sizeof(error_buf), "%s", (char *) error);
+        /* 
+         * Allocate error in PostgreSQL memory context for thread safety.
+         * Caller is responsible for checking and handling the error.
+         * The error string lives until end of transaction/statement.
+         */
+        char *pg_error = pstrdup((char *) error);
         xpatch_free_error(error);
-        return error_buf;
+        return pg_error;
     }
 
     return NULL;

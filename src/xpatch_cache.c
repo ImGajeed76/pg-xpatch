@@ -40,6 +40,7 @@
  */
 
 #include "xpatch_cache.h"
+#include "xpatch_hash.h"
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -64,11 +65,11 @@
 /* Cache entry key - must be fixed size for shared memory hash */
 typedef struct XPatchCacheKey
 {
-    Oid         relid;
-    int64       group_value;    /* Datum cast to int64 for fixed size */
-    int32       seq;
-    AttrNumber  attnum;
-    int16       padding;        /* Alignment padding */
+    Oid             relid;
+    XPatchGroupHash group_hash;     /* 128-bit BLAKE3 hash of group value */
+    int32           seq;
+    AttrNumber      attnum;
+    int16           padding;        /* Alignment padding */
 } XPatchCacheKey;
 
 /* Cache entry - stored in shared hash table */
@@ -80,7 +81,8 @@ typedef struct XPatchCacheEntry
     int32           num_slots;      /* Number of slots used */
     int32           lru_prev;       /* Previous entry in LRU (index, -1 = head) */
     int32           lru_next;       /* Next entry in LRU (index, -1 = tail) */
-    bool            in_use;         /* Entry is valid */
+    bool            in_use;         /* Entry is valid and holds data */
+    bool            tombstone;      /* Entry was deleted, continue probing */
 } XPatchCacheEntry;
 
 /* Content slot header */
@@ -116,6 +118,21 @@ static bool shmem_initialized = false;
 /* Hooks for shared memory */
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+/*
+ * Backend exit callback - clears per-backend pointers to shared memory.
+ * This is a defensive measure; PostgreSQL handles shared memory detachment
+ * automatically, but clearing these helps catch bugs where code tries to
+ * access the cache after the backend has started shutting down.
+ */
+static void
+xpatch_cache_shmem_exit(int code, Datum arg)
+{
+    /* Clear per-backend pointers to shared memory */
+    shared_cache = NULL;
+    content_slots = NULL;
+    shmem_initialized = false;
+}
 
 /*
  * Calculate required shared memory size
@@ -266,6 +283,7 @@ lru_push_front(XPatchCacheEntry *entry, int entry_idx)
 
 /*
  * Evict least recently used entry
+ * Sets a tombstone marker so linear probing continues past this slot.
  */
 static void
 evict_lru_entry(void)
@@ -285,8 +303,14 @@ evict_lru_entry(void)
     if (victim->slot_index >= 0)
         free_slots(victim->slot_index);
     
-    /* Mark entry as unused */
+    /* 
+     * Mark entry as tombstone (not in_use but also not empty).
+     * This is crucial for linear probing - we must continue probing
+     * past deleted entries to find entries that were inserted after
+     * this one and probed past it during insertion.
+     */
     victim->in_use = false;
+    victim->tombstone = true;  /* Keep probing past this slot */
     victim->slot_index = -1;
     victim->content_size = 0;
     victim->num_slots = 0;
@@ -297,6 +321,7 @@ evict_lru_entry(void)
 
 /*
  * Hash function for cache key - fast O(1) lookup
+ * Uses FNV-1a to combine the 128-bit group hash with other key fields.
  */
 static inline uint32
 hash_cache_key(const XPatchCacheKey *key)
@@ -307,9 +332,14 @@ hash_cache_key(const XPatchCacheKey *key)
     h = 2166136261u;
     h ^= (uint32) key->relid;
     h *= 16777619u;
-    h ^= (uint32) (key->group_value & 0xFFFFFFFF);
+    /* Incorporate 128-bit group hash */
+    h ^= (uint32) (key->group_hash.h1 & 0xFFFFFFFF);
     h *= 16777619u;
-    h ^= (uint32) (key->group_value >> 32);
+    h ^= (uint32) (key->group_hash.h1 >> 32);
+    h *= 16777619u;
+    h ^= (uint32) (key->group_hash.h2 & 0xFFFFFFFF);
+    h *= 16777619u;
+    h ^= (uint32) (key->group_hash.h2 >> 32);
     h *= 16777619u;
     h ^= (uint32) key->seq;
     h *= 16777619u;
@@ -321,6 +351,7 @@ hash_cache_key(const XPatchCacheKey *key)
 
 /*
  * Find entry by key using hash table with linear probing - O(1) average
+ * Properly handles tombstones to maintain correct probing behavior.
  */
 static int32
 find_entry(const XPatchCacheKey *key)
@@ -333,14 +364,22 @@ find_entry(const XPatchCacheKey *key)
         int32 idx = (hash + probes) % XPATCH_SHMEM_MAX_ENTRIES;
         XPatchCacheEntry *entry = &shared_cache->entries[idx];
         
-        if (!entry->in_use)
+        if (!entry->in_use && !entry->tombstone)
         {
-            /* Empty slot - key not found */
+            /* Empty slot (never used) - key not found */
             return -1;
         }
         
+        /* Skip tombstones but continue probing */
+        if (entry->tombstone)
+        {
+            probes++;
+            continue;
+        }
+        
+        /* Check if this is the entry we're looking for */
         if (entry->key.relid == key->relid &&
-            entry->key.group_value == key->group_value &&
+            xpatch_group_hash_equals(entry->key.group_hash, key->group_hash) &&
             entry->key.seq == key->seq &&
             entry->key.attnum == key->attnum)
         {
@@ -355,25 +394,37 @@ find_entry(const XPatchCacheKey *key)
 
 /*
  * Find free entry slot using hash-based placement
- * Uses the same hash as find_entry for consistency
+ * Uses the same hash as find_entry for consistency.
+ * Can reuse tombstone slots to reclaim space.
  */
 static int32
 find_free_entry_for_key(const XPatchCacheKey *key)
 {
     uint32 hash = hash_cache_key(key);
     int probes = 0;
+    int32 first_tombstone = -1;
     
     while (probes < XPATCH_SHMEM_MAX_ENTRIES)
     {
         int32 idx = (hash + probes) % XPATCH_SHMEM_MAX_ENTRIES;
+        XPatchCacheEntry *entry = &shared_cache->entries[idx];
         
-        if (!shared_cache->entries[idx].in_use)
+        /* Empty slot (never used) - can use it */
+        if (!entry->in_use && !entry->tombstone)
             return idx;
+        
+        /* 
+         * Tombstone slot - remember the first one we see.
+         * We prefer the first tombstone to maintain good probe locality.
+         */
+        if (entry->tombstone && first_tombstone < 0)
+            first_tombstone = idx;
         
         probes++;
     }
     
-    return -1;
+    /* If we found a tombstone, we can reuse it */
+    return first_tombstone;
 }
 
 /*
@@ -467,6 +518,7 @@ xpatch_shmem_startup(void)
         for (i = 0; i < XPATCH_SHMEM_MAX_ENTRIES; i++)
         {
             shared_cache->entries[i].in_use = false;
+            shared_cache->entries[i].tombstone = false;
             shared_cache->entries[i].slot_index = -1;
             shared_cache->entries[i].lru_prev = -1;
             shared_cache->entries[i].lru_next = -1;
@@ -495,6 +547,9 @@ xpatch_shmem_startup(void)
     LWLockRelease(AddinShmemInitLock);
     
     shmem_initialized = true;
+    
+    /* Register exit callback to clear per-backend pointers */
+    on_shmem_exit(xpatch_cache_shmem_exit, (Datum) 0);
 }
 
 /*
@@ -524,7 +579,7 @@ xpatch_cache_init(void)
  * Look up content in the cache
  */
 bytea *
-xpatch_cache_get(Oid relid, Datum group_value, int32 seq, AttrNumber attnum)
+xpatch_cache_get(Oid relid, Datum group_value, Oid typid, int32 seq, AttrNumber attnum)
 {
     XPatchCacheKey key;
     int32 entry_idx;
@@ -534,10 +589,10 @@ xpatch_cache_get(Oid relid, Datum group_value, int32 seq, AttrNumber attnum)
     if (!shmem_initialized || shared_cache == NULL)
         return NULL;
     
-    /* Build key */
+    /* Build key with 128-bit BLAKE3 hash of group value */
     memset(&key, 0, sizeof(key));
     key.relid = relid;
-    key.group_value = (int64) group_value;
+    key.group_hash = xpatch_compute_group_hash(group_value, typid, false);
     key.seq = seq;
     key.attnum = attnum;
     
@@ -582,7 +637,7 @@ xpatch_cache_get(Oid relid, Datum group_value, int32 seq, AttrNumber attnum)
  * Store content in the cache
  */
 void
-xpatch_cache_put(Oid relid, Datum group_value, int32 seq,
+xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int32 seq,
                  AttrNumber attnum, bytea *content)
 {
     XPatchCacheKey key;
@@ -605,10 +660,10 @@ xpatch_cache_put(Oid relid, Datum group_value, int32 seq,
     num_slots_needed = (content_size + sizeof(content_slots[0].data) - 1) / 
                        sizeof(content_slots[0].data);
     
-    /* Build key */
+    /* Build key with 128-bit BLAKE3 hash of group value */
     memset(&key, 0, sizeof(key));
     key.relid = relid;
-    key.group_value = (int64) group_value;
+    key.group_hash = xpatch_compute_group_hash(group_value, typid, false);
     key.seq = seq;
     key.attnum = attnum;
     
@@ -668,6 +723,7 @@ xpatch_cache_put(Oid relid, Datum group_value, int32 seq,
     entry->content_size = content_size;
     entry->num_slots = num_slots_needed;
     entry->in_use = true;
+    entry->tombstone = false;  /* Clear tombstone when reusing slot */
     
     /* Copy content to slots */
     copy_to_slots(first_slot, content);

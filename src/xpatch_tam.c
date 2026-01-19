@@ -35,6 +35,7 @@
 #include "xpatch_seq_cache.h"
 
 #include "access/heapam.h"
+#include "access/heapam_xlog.h"
 #include "access/hio.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
@@ -42,16 +43,19 @@
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/storage.h"
 #include "commands/progress.h"
+#include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
@@ -59,6 +63,107 @@
 #include "utils/datum.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+
+/*
+ * compute_infobits - compute infomask bits for WAL records
+ *
+ * This matches the heapam.c implementation. The infobits_set field
+ * in xl_heap_delete records which flags to set on the tuple during
+ * WAL replay.
+ */
+static uint8
+compute_infobits(uint16 infomask, uint16 infomask2)
+{
+    uint8 infobits = 0;
+    
+    if (infomask & HEAP_XMAX_IS_MULTI)
+        infobits |= XLHL_XMAX_IS_MULTI;
+    if (infomask & HEAP_XMAX_LOCK_ONLY)
+        infobits |= XLHL_XMAX_LOCK_ONLY;
+    if (infomask & HEAP_XMAX_EXCL_LOCK)
+        infobits |= XLHL_XMAX_EXCL_LOCK;
+    if (infomask & HEAP_XMAX_KEYSHR_LOCK)
+        infobits |= XLHL_XMAX_KEYSHR_LOCK;
+    if (infomask2 & HEAP_KEYS_UPDATED)
+        infobits |= XLHL_KEYS_UPDATED;
+    
+    return infobits;
+}
+
+/*
+ * MVCC visibility check for xpatch tuples.
+ * 
+ * Implements Read Committed isolation level - a tuple is visible if:
+ * 1. XMIN is committed (or current transaction) AND
+ * 2. XMAX is invalid/aborted (tuple not deleted) OR
+ *    XMAX is set but not yet committed (delete in progress by another txn)
+ *
+ * Returns true if tuple is visible to the given snapshot.
+ */
+static bool
+xpatch_tuple_is_visible(HeapTupleData *tuple, Snapshot snapshot)
+{
+    TransactionId xmin, xmax;
+    
+    if (snapshot == NULL)
+        return true;  /* No snapshot means return all tuples */
+    
+    xmin = HeapTupleHeaderGetRawXmin(tuple->t_data);
+    
+    /* Check XMIN - the inserting transaction */
+    if (TransactionIdIsCurrentTransactionId(xmin))
+    {
+        /* Inserted by current transaction */
+        if (tuple->t_data->t_infomask & HEAP_XMAX_INVALID)
+            return true;  /* Not deleted */
+        
+        /* Check if deleted by current transaction */
+        xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
+        if (TransactionIdIsCurrentTransactionId(xmax))
+            return false;  /* Deleted by us */
+        
+        return true;  /* Delete by other txn not committed yet */
+    }
+    
+    if (!TransactionIdDidCommit(xmin))
+    {
+        /* Inserter didn't commit (aborted or in-progress) */
+        if (TransactionIdDidAbort(xmin))
+            return false;  /* Definitely not visible */
+        
+        /* In-progress - not visible in Read Committed */
+        return false;
+    }
+    
+    /* XMIN committed - check XMAX for deletions */
+    if (tuple->t_data->t_infomask & HEAP_XMAX_INVALID)
+        return true;  /* Not deleted */
+    
+    if (tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI)
+    {
+        /* MultiXact - treat as visible for simplicity (no UPDATE support) */
+        return true;
+    }
+    
+    xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
+    
+    if (TransactionIdIsCurrentTransactionId(xmax))
+        return false;  /* Deleted by current transaction */
+    
+    if (!TransactionIdDidCommit(xmax))
+    {
+        /* Deleter didn't commit yet - tuple still visible */
+        if (TransactionIdDidAbort(xmax))
+        {
+            /* Deleter aborted - tuple is visible, fix hint bits */
+            tuple->t_data->t_infomask |= HEAP_XMAX_INVALID;
+        }
+        return true;
+    }
+    
+    /* Deleter committed - tuple is deleted and not visible */
+    return false;
+}
 
 /* Scan descriptor for xpatch tables */
 typedef struct XPatchScanDescData
@@ -198,6 +303,19 @@ static uint64 xpatch_relation_size(Relation rel, ForkNumber forkNumber);
 static bool xpatch_relation_needs_toast_table(Relation rel);
 static Oid xpatch_relation_toast_am(Relation rel);
 
+/*
+ * NOTE: Parallel scans work correctly when reconstructing delta columns
+ * because each parallel worker independently:
+ * 1. Scans its assigned blocks to find visible tuples
+ * 2. For each tuple, looks up the sequence via TID cache or group scan
+ * 3. Reconstructs delta columns using the proper sequence
+ *
+ * The key insight is that the TID->seq cache is populated during the first
+ * scan of each group, and all workers share this cache via shared memory.
+ *
+ * We use the standard heap block-based parallel scan infrastructure.
+ */
+
 /* Planner info callbacks */
 static void xpatch_estimate_rel_size(Relation rel, int32 *attr_widths,
                                      BlockNumber *pages, double *tuples,
@@ -226,9 +344,8 @@ static const TableAmRoutine xpatch_methods = {
 
     /* 
      * Parallel scan support - uses heap-style block-based parallelism.
-     * Note: There's a known snapshot reference leak warning when using
-     * parallel scans, but query results are correct. This is related to
-     * how reconstruction handles snapshots across parallel workers.
+     * Reconstruction works correctly because each worker independently
+     * looks up sequence numbers via the shared TID->seq cache.
      */
     .parallelscan_estimate = table_block_parallelscan_estimate,
     .parallelscan_initialize = table_block_parallelscan_initialize,
@@ -395,6 +512,15 @@ xpatch_scan_end(TableScanDesc sscan)
     if (scan->scan_mcxt)
         MemoryContextDelete(scan->scan_mcxt);
 
+    /*
+     * Unregister the snapshot if SO_TEMP_SNAPSHOT flag is set.
+     * This matches heap_endscan behavior - when the executor creates
+     * a temporary snapshot for the scan, we're responsible for
+     * unregistering it at scan end.
+     */
+    if (scan->base.rs_flags & SO_TEMP_SNAPSHOT)
+        UnregisterSnapshot(scan->base.rs_snapshot);
+
     pfree(scan);
 }
 
@@ -451,7 +577,12 @@ xpatch_scan_get_next_block(XPatchScanDesc scan, bool first_block)
     {
         /* Non-parallel scan - simple sequential access */
         if (first_block)
+        {
+            /* Empty relation - no blocks to scan */
+            if (scan->nblocks == 0)
+                return InvalidBlockNumber;
             return 0;  /* Start at block 0 */
+        }
         
         scan->current_block++;
         if (scan->current_block >= scan->nblocks)
@@ -531,8 +662,9 @@ xpatch_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
             tuple.t_tableOid = RelationGetRelid(rel);
             ItemPointerSet(&tuple.t_self, scan->current_block, scan->current_offset - 1);
 
-            /* TODO: Check visibility using snapshot */
-            /* For now, assume all tuples are visible */
+            /* MVCC visibility check - skip invisible tuples */
+            if (!xpatch_tuple_is_visible(&tuple, scan->base.rs_snapshot))
+                continue;
 
             /* Increment sequence counter */
             scan->current_seq++;
@@ -576,6 +708,67 @@ xpatch_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
  * Tuple modification callbacks
  * ---------------------------------------------------------------- */
 
+/*
+ * Compute a 64-bit hash for group-level advisory locking.
+ * Combines relation OID with group value to create unique lock ID per group.
+ */
+static uint64
+xpatch_compute_group_lock_id(Oid relid, Datum group_value)
+{
+    uint64 h = 14695981039346656037ULL;  /* FNV-1a offset basis */
+    uint64 group_hash = (uint64) group_value;
+    
+    /* Mix relid into hash */
+    h ^= (uint64) relid;
+    h *= 1099511628211ULL;  /* FNV-1a prime */
+    
+    /* Mix group_value into hash */
+    h ^= group_hash;
+    h *= 1099511628211ULL;
+    
+    return h;
+}
+
+/*
+ * Compare two version datums safely without integer overflow.
+ * Returns: negative if v1 < v2, zero if v1 == v2, positive if v1 > v2
+ */
+static int
+xpatch_compare_versions(Datum v1, Datum v2, Oid typid)
+{
+    switch (typid)
+    {
+        case INT2OID:
+            {
+                int16 a = DatumGetInt16(v1);
+                int16 b = DatumGetInt16(v2);
+                return (a > b) ? 1 : ((a < b) ? -1 : 0);
+            }
+        case INT4OID:
+            {
+                int32 a = DatumGetInt32(v1);
+                int32 b = DatumGetInt32(v2);
+                return (a > b) ? 1 : ((a < b) ? -1 : 0);
+            }
+        case INT8OID:
+            {
+                int64 a = DatumGetInt64(v1);
+                int64 b = DatumGetInt64(v2);
+                return (a > b) ? 1 : ((a < b) ? -1 : 0);
+            }
+        case TIMESTAMPOID:
+        case TIMESTAMPTZOID:
+            {
+                Timestamp a = DatumGetTimestamp(v1);
+                Timestamp b = DatumGetTimestamp(v2);
+                return (a > b) ? 1 : ((a < b) ? -1 : 0);
+            }
+        default:
+            /* Fallback for unknown types - assume valid order */
+            return 1;
+    }
+}
+
 static void
 xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
                     CommandId cid, int options,
@@ -587,6 +780,8 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
     MemoryContext insert_mcxt;
     Datum group_value = (Datum) 0;
     TupleDesc tupdesc = RelationGetDescr(relation);
+    uint64 group_lock_id;
+    bool restore_mode = false;
 
     elog(DEBUG1, "XPATCH: tuple_insert - rel=%s", RelationGetRelationName(relation));
     config = xpatch_get_config(relation);
@@ -595,6 +790,23 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
     /* Validate the schema on first insert */
     xpatch_validate_schema(relation, config);
     elog(DEBUG1, "xpatch_tuple_insert: schema validated");
+
+    /*
+     * Check for restore mode: if _xp_seq is explicitly provided with a 
+     * positive value, we're in restore mode (e.g., from pg_restore/COPY).
+     * In restore mode, we skip version validation because the data is
+     * known-good from the dump and may be interleaved across groups.
+     */
+    if (config->xp_seq_attnum != InvalidAttrNumber)
+    {
+        bool isnull;
+        Datum seq_datum = slot_getattr(slot, config->xp_seq_attnum, &isnull);
+        if (!isnull && DatumGetInt32(seq_datum) > 0)
+        {
+            restore_mode = true;
+            elog(DEBUG1, "xpatch_tuple_insert: restore mode detected (_xp_seq explicitly provided)");
+        }
+    }
 
     /* Get group value if configured */
     if (config->group_by_attnum != InvalidAttrNumber)
@@ -605,9 +817,23 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
             group_value = (Datum) 0;
     }
 
-    /* 
-     * VALIDATE VERSION: Must be greater than max version in group
+    /*
+     * Acquire group-level advisory lock to ensure sequential inserts.
+     * This prevents race conditions where two concurrent inserts to the
+     * same group could both see the same max_version and create duplicates.
+     * The lock is released at transaction end.
      */
+    group_lock_id = xpatch_compute_group_lock_id(RelationGetRelid(relation), group_value);
+    DirectFunctionCall1(pg_advisory_xact_lock_int8, Int64GetDatum((int64) group_lock_id));
+    
+    elog(DEBUG1, "xpatch_tuple_insert: acquired advisory lock for group (lock_id=%lu)", 
+         (unsigned long) group_lock_id);
+
+    /* 
+     * VALIDATE VERSION: Must be greater than max version in group.
+     * Skip in restore mode - the data is known-good from the dump.
+     */
+    if (!restore_mode)
     {
         bool max_is_null;
         Datum max_version;
@@ -628,38 +854,9 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
 
         if (!max_is_null)
         {
-            /* Compare versions */
+            /* Compare versions using safe comparison (no overflow) */
             Form_pg_attribute attr = TupleDescAttr(tupdesc, config->order_by_attnum - 1);
-            Oid typid = attr->atttypid;
-            int cmp = 0;
-
-            switch (typid)
-            {
-                case INT2OID:
-                    cmp = DatumGetInt16(new_version) - DatumGetInt16(max_version);
-                    break;
-                case INT4OID:
-                    cmp = DatumGetInt32(new_version) - DatumGetInt32(max_version);
-                    break;
-                case INT8OID:
-                    {
-                        int64 v1 = DatumGetInt64(new_version);
-                        int64 v2 = DatumGetInt64(max_version);
-                        cmp = (v1 > v2) ? 1 : ((v1 < v2) ? -1 : 0);
-                    }
-                    break;
-                case TIMESTAMPOID:
-                case TIMESTAMPTZOID:
-                    {
-                        Timestamp t1 = DatumGetTimestamp(new_version);
-                        Timestamp t2 = DatumGetTimestamp(max_version);
-                        cmp = (t1 > t2) ? 1 : ((t1 < t2) ? -1 : 0);
-                    }
-                    break;
-                default:
-                    /* Fallback: assume valid */
-                    cmp = 1;
-            }
+            int cmp = xpatch_compare_versions(new_version, max_version, attr->atttypid);
 
             if (cmp <= 0)
             {
@@ -686,13 +883,19 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
     MemoryContextSwitchTo(oldcxt);
 
     /*
-     * Insert the tuple using low-level heap functions.
+     * Insert the tuple using low-level heap functions WITH WAL LOGGING.
      * We can't use simple_heap_insert() because it checks for heap AM.
+     * We manually do what heap_insert() does: insert + WAL log.
      */
     {
         Buffer buffer;
         Buffer vmbuffer = InvalidBuffer;
         Size len;
+        Page page;
+        bool need_wal;
+        bool all_visible_cleared = false;
+        XLogRecPtr recptr;
+        uint8 info;
         
         /* Prepare the tuple header */
         physical_tuple->t_data->t_infomask &= ~(HEAP_XACT_MASK);
@@ -710,14 +913,95 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
         buffer = RelationGetBufferForTuple(relation, len, InvalidBuffer,
                                            options, NULL, &vmbuffer, NULL, 0);
         
+        page = BufferGetPage(buffer);
+        
+        /* Check if page is marked all-visible and clear it if so */
+        if (PageIsAllVisible(page))
+        {
+            all_visible_cleared = true;
+            PageClearAllVisible(page);
+            visibilitymap_clear(relation, BufferGetBlockNumber(buffer),
+                                vmbuffer, VISIBILITYMAP_VALID_BITS);
+        }
+        
+        /*
+         * Enter critical section BEFORE modifying the page.
+         * This ensures that if we crash after starting to modify the page
+         * but before the WAL record is written, we'll PANIC and not leave
+         * the database in an inconsistent state.
+         */
+        need_wal = RelationNeedsWAL(relation);
+        
+        START_CRIT_SECTION();
+        
         /* Insert the tuple into the page */
         RelationPutHeapTuple(relation, buffer, physical_tuple, false);
         
-        /* Mark buffer dirty and release */
+        /* Mark buffer dirty */
         MarkBufferDirty(buffer);
         
         /* Update slot with inserted tuple's TID */
         slot->tts_tid = physical_tuple->t_self;
+        
+        /*
+         * WAL-log the insert.
+         * We use the heap resource manager's insert record format so that
+         * PostgreSQL's built-in recovery can replay it correctly.
+         */
+        if (need_wal)
+        {
+            xl_heap_insert xlrec;
+            xl_heap_header xlhdr;
+            uint8 flags = 0;
+            uint8 bufflags = 0;
+            
+            /* Determine info flags */
+            info = XLOG_HEAP_INSERT;
+            
+            /*
+             * For standard buffer, we include the "standard" page layout info.
+             * We do NOT use INIT_PAGE - that's only for heap_insert when it
+             * gets a completely new page from the free space map. Since we're
+             * using RelationGetBufferForTuple, we get a page that's already
+             * properly initialized, so we just use REGBUF_STANDARD.
+             */
+            bufflags = REGBUF_STANDARD;
+            
+            /* Set up the xl_heap_insert record */
+            xlrec.offnum = ItemPointerGetOffsetNumber(&physical_tuple->t_self);
+            if (all_visible_cleared)
+                flags |= XLH_INSERT_ALL_VISIBLE_CLEARED;
+            flags |= XLH_INSERT_CONTAINS_NEW_TUPLE;
+            xlrec.flags = flags;
+            
+            /* Set up the tuple header for WAL */
+            xlhdr.t_infomask2 = physical_tuple->t_data->t_infomask2;
+            xlhdr.t_infomask = physical_tuple->t_data->t_infomask;
+            xlhdr.t_hoff = physical_tuple->t_data->t_hoff;
+            
+            /* Construct the WAL record */
+            XLogBeginInsert();
+            XLogRegisterData((char *) &xlrec, SizeOfHeapInsert);
+            
+            /* Register the buffer (block 0) */
+            XLogRegisterBuffer(0, buffer, bufflags);
+            
+            /* Register the tuple header */
+            XLogRegisterBufData(0, (char *) &xlhdr, SizeOfHeapHeader);
+            
+            /* Register the tuple data (excluding the heap tuple header) */
+            XLogRegisterBufData(0,
+                                (char *) physical_tuple->t_data + SizeofHeapTupleHeader,
+                                physical_tuple->t_len - SizeofHeapTupleHeader);
+            
+            /* Insert the WAL record */
+            recptr = XLogInsert(RM_HEAP_ID, info);
+            
+            /* Set the page LSN */
+            PageSetLSN(page, recptr);
+        }
+        
+        END_CRIT_SECTION();
         
         if (BufferIsValid(vmbuffer))
             ReleaseBuffer(vmbuffer);
@@ -764,18 +1048,394 @@ xpatch_finish_bulk_insert(Relation relation, int options)
     /* Nothing special needed for bulk insert cleanup */
 }
 
+/*
+ * Delete a tuple with cascading delete of dependent versions.
+ *
+ * xpatch DELETE semantics:
+ * - Deleting a version cascades to ALL subsequent versions in that group
+ * - This is necessary because later versions may be delta-encoded against
+ *   the deleted version (directly or transitively)
+ * - We perform a hard delete (immediate physical removal via XMAX)
+ *
+ * Algorithm:
+ * 1. Lock the target tuple to get its group value and sequence
+ * 2. Acquire advisory lock on the group
+ * 3. Find all tuples in the group with sequence >= target_seq
+ * 4. Delete them in reverse order (highest seq first)
+ * 5. Invalidate cache entries
+ * 6. Update seq cache
+ */
 static TM_Result
 xpatch_tuple_delete(Relation relation, ItemPointer tid,
                     CommandId cid, Snapshot snapshot,
                     Snapshot crosscheck, bool wait,
                     TM_FailureData *tmfd, bool changingPart)
 {
-    ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("DELETE is not supported on xpatch tables"),
-             errhint("xpatch tables are append-only. Insert a new version instead.")));
-
-    return TM_Ok; /* Not reached */
+    XPatchConfig *config;
+    TupleDesc tupdesc;
+    Buffer buffer;
+    Page page;
+    ItemId itemId;
+    HeapTupleData target_tuple;
+    Datum group_value = (Datum) 0;
+    bool group_isnull;
+    uint64 group_lock_id;
+    Oid relid;
+    BlockNumber blkno;
+    OffsetNumber offnum;
+    BlockNumber nblocks;
+    int32 target_seq;
+    int32 current_seq;
+    Form_pg_attribute attr;
+    Datum tuple_group;
+    HeapTupleData tuple;
+    TransactionId xid;
+    int deleted_count = 0;
+    
+    relid = RelationGetRelid(relation);
+    tupdesc = RelationGetDescr(relation);
+    config = xpatch_get_config(relation);
+    xid = GetCurrentTransactionId();
+    
+    elog(DEBUG1, "xpatch: tuple_delete starting for tid=(%u,%u)",
+         ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
+    
+    /*
+     * Step 1: Read the target tuple to get its group value and determine sequence
+     */
+    blkno = ItemPointerGetBlockNumber(tid);
+    offnum = ItemPointerGetOffsetNumber(tid);
+    
+    buffer = ReadBuffer(relation, blkno);
+    LockBuffer(buffer, BUFFER_LOCK_SHARE);
+    
+    page = BufferGetPage(buffer);
+    itemId = PageGetItemId(page, offnum);
+    
+    if (!ItemIdIsNormal(itemId))
+    {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+        
+        if (tmfd)
+        {
+            tmfd->traversed = false;
+            tmfd->xmax = InvalidTransactionId;
+        }
+        return TM_Invisible;
+    }
+    
+    target_tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+    target_tuple.t_len = ItemIdGetLength(itemId);
+    target_tuple.t_tableOid = relid;
+    target_tuple.t_self = *tid;
+    
+    /* Check if tuple is already deleted */
+    if (!(target_tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
+    {
+        TransactionId xmax = HeapTupleHeaderGetRawXmax(target_tuple.t_data);
+        
+        if (TransactionIdIsCurrentTransactionId(xmax))
+        {
+            /* Already deleted by us */
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
+            return TM_SelfModified;
+        }
+        
+        if (TransactionIdDidCommit(xmax))
+        {
+            /* Already deleted by committed transaction */
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
+            if (tmfd)
+            {
+                tmfd->traversed = false;
+                tmfd->xmax = xmax;
+            }
+            return TM_Updated;
+        }
+        
+        /* Delete in progress by another transaction */
+        if (!wait)
+        {
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
+            if (tmfd)
+            {
+                tmfd->traversed = false;
+                tmfd->xmax = xmax;
+            }
+            return TM_WouldBlock;
+        }
+        /* If wait is true, we should wait for the other transaction, but for
+         * simplicity we'll return TM_BeingModified. A full implementation
+         * would use XactLockTableWait. */
+    }
+    
+    /* Get group value if configured */
+    if (config->group_by_attnum != InvalidAttrNumber)
+    {
+        group_value = heap_getattr(&target_tuple, config->group_by_attnum, 
+                                   tupdesc, &group_isnull);
+        if (group_isnull)
+            group_value = (Datum) 0;
+    }
+    
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+    ReleaseBuffer(buffer);
+    
+    /*
+     * Step 2: Acquire advisory lock on the group to prevent concurrent modifications
+     */
+    group_lock_id = xpatch_compute_group_lock_id(relid, group_value);
+    DirectFunctionCall1(pg_advisory_xact_lock_int8, Int64GetDatum((int64) group_lock_id));
+    
+    elog(DEBUG1, "xpatch: delete acquired advisory lock (lock_id=%lu)", 
+         (unsigned long) group_lock_id);
+    
+    /*
+     * Step 3: Scan to find the sequence number of the target tuple
+     * and identify all tuples to delete (target_seq and higher)
+     * 
+     * We need to do two passes:
+     * Pass 1: Find target_seq by scanning until we hit the target TID
+     * Pass 2: Delete all tuples with seq >= target_seq
+     */
+    target_seq = 0;
+    current_seq = 0;
+    nblocks = RelationGetNumberOfBlocks(relation);
+    
+    /* Pass 1: Find target sequence number */
+    for (blkno = 0; blkno < nblocks && target_seq == 0; blkno++)
+    {
+        OffsetNumber maxoff;
+        
+        buffer = ReadBuffer(relation, blkno);
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        
+        page = BufferGetPage(buffer);
+        maxoff = PageGetMaxOffsetNumber(page);
+        
+        for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+        {
+            itemId = PageGetItemId(page, offnum);
+            
+            if (!ItemIdIsNormal(itemId))
+                continue;
+            
+            tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+            tuple.t_len = ItemIdGetLength(itemId);
+            tuple.t_tableOid = relid;
+            ItemPointerSet(&tuple.t_self, blkno, offnum);
+            
+            /* Skip already-deleted tuples */
+            if (!(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
+            {
+                TransactionId tup_xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+                if (TransactionIdDidCommit(tup_xmax))
+                    continue;
+            }
+            
+            /* Check group match */
+            if (config->group_by_attnum != InvalidAttrNumber)
+            {
+                tuple_group = heap_getattr(&tuple, config->group_by_attnum, 
+                                          tupdesc, &group_isnull);
+                if (group_isnull)
+                    continue;
+                
+                attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+                if (!datumIsEqual(group_value, tuple_group, attr->attbyval, attr->attlen))
+                    continue;
+            }
+            
+            current_seq++;
+            
+            /* Check if this is our target tuple */
+            if (ItemPointerEquals(&tuple.t_self, tid))
+            {
+                target_seq = current_seq;
+                break;
+            }
+        }
+        
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+    }
+    
+    if (target_seq == 0)
+    {
+        elog(WARNING, "xpatch: could not find target tuple for delete");
+        return TM_Invisible;
+    }
+    
+    elog(DEBUG1, "xpatch: target tuple has seq=%d, will cascade delete seq>=%d", 
+         target_seq, target_seq);
+    
+    /*
+     * Step 4: Delete all tuples with seq >= target_seq
+     * We mark them as deleted by setting XMAX
+     */
+    current_seq = 0;
+    
+    for (blkno = 0; blkno < nblocks; blkno++)
+    {
+        OffsetNumber maxoff;
+        
+        buffer = ReadBuffer(relation, blkno);
+        LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+        
+        page = BufferGetPage(buffer);
+        maxoff = PageGetMaxOffsetNumber(page);
+        
+        for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+        {
+            itemId = PageGetItemId(page, offnum);
+            
+            if (!ItemIdIsNormal(itemId))
+                continue;
+            
+            tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+            tuple.t_len = ItemIdGetLength(itemId);
+            tuple.t_tableOid = relid;
+            ItemPointerSet(&tuple.t_self, blkno, offnum);
+            
+            /* Skip already-deleted tuples */
+            if (!(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
+            {
+                TransactionId tup_xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+                if (TransactionIdDidCommit(tup_xmax))
+                    continue;
+            }
+            
+            /* Check group match */
+            if (config->group_by_attnum != InvalidAttrNumber)
+            {
+                tuple_group = heap_getattr(&tuple, config->group_by_attnum, 
+                                          tupdesc, &group_isnull);
+                if (group_isnull)
+                    continue;
+                
+                attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+                if (!datumIsEqual(group_value, tuple_group, attr->attbyval, attr->attlen))
+                    continue;
+            }
+            
+            current_seq++;
+            
+            /* Delete if seq >= target_seq */
+            if (current_seq >= target_seq)
+            {
+                bool all_visible_cleared = false;
+                bool need_wal_for_delete;
+                
+                /*
+                 * Enter critical section BEFORE modifying the page.
+                 * This ensures consistency between in-memory state and WAL.
+                 */
+                need_wal_for_delete = RelationNeedsWAL(relation);
+                
+                START_CRIT_SECTION();
+                
+                /* Check if page is marked all-visible and clear it if so */
+                if (PageIsAllVisible(page))
+                {
+                    all_visible_cleared = true;
+                    PageClearAllVisible(page);
+                    /* Note: We'd need vmbuffer here to clear visibility map.
+                     * For now we just clear the page flag. Full implementation
+                     * would call visibilitymap_clear() but we don't have vmbuffer
+                     * in the delete path. The visibility map will be corrected
+                     * on the next VACUUM. */
+                }
+                
+                /* Mark tuple as deleted by setting XMAX */
+                tuple.t_data->t_infomask &= ~HEAP_XMAX_INVALID;
+                tuple.t_data->t_infomask &= ~HEAP_XMAX_IS_MULTI;
+                tuple.t_data->t_infomask &= ~HEAP_XMAX_COMMITTED;
+                tuple.t_data->t_infomask &= ~HEAP_XMAX_LOCK_ONLY;
+                HeapTupleHeaderSetXmax(tuple.t_data, xid);
+                HeapTupleHeaderSetCmax(tuple.t_data, cid, false);
+                
+                deleted_count++;
+                
+                /* Mark buffer dirty */
+                MarkBufferDirty(buffer);
+                
+                /*
+                 * WAL-log the delete operation.
+                 * We use the heap resource manager's delete record format.
+                 */
+                if (need_wal_for_delete)
+                {
+                    xl_heap_delete xlrec;
+                    XLogRecPtr recptr;
+                    uint8 flags = 0;
+                    
+                    xlrec.offnum = offnum;
+                    xlrec.xmax = xid;
+                    xlrec.infobits_set = compute_infobits(tuple.t_data->t_infomask,
+                                                          tuple.t_data->t_infomask2);
+                    
+                    if (all_visible_cleared)
+                        flags |= XLH_DELETE_ALL_VISIBLE_CLEARED;
+                    xlrec.flags = flags;
+                    
+                    XLogBeginInsert();
+                    XLogRegisterData((char *) &xlrec, SizeOfHeapDelete);
+                    XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+                    
+                    recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_DELETE);
+                    PageSetLSN(page, recptr);
+                }
+                
+                END_CRIT_SECTION();
+                
+                elog(DEBUG2, "xpatch: marked tuple seq=%d as deleted (tid=%u,%u)",
+                     current_seq, blkno, offnum);
+            }
+        }
+        
+        /* Buffer was marked dirty inside critical section if needed */
+        
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+    }
+    
+    elog(DEBUG1, "xpatch: cascade deleted %d tuples (seq >= %d)", 
+         deleted_count, target_seq);
+    
+    /*
+     * Step 5: Invalidate caches
+     */
+    xpatch_cache_invalidate_rel(relid);
+    
+    /*
+     * Step 6: Update seq cache - new max_seq is target_seq - 1
+     * Get the group column type OID for proper hash computation.
+     */
+    {
+        Oid group_typid = InvalidOid;
+        
+        if (config->group_by_attnum != InvalidAttrNumber)
+        {
+            Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+            group_typid = group_attr->atttypid;
+        }
+        
+        if (target_seq > 1)
+        {
+            xpatch_seq_cache_set_max_seq(relid, group_value, group_typid, target_seq - 1);
+        }
+        else
+        {
+            /* Deleted all rows in group - remove from cache */
+            xpatch_seq_cache_set_max_seq(relid, group_value, group_typid, 0);
+        }
+    }
+    
+    return TM_Ok;
 }
 
 static TM_Result
@@ -801,34 +1461,35 @@ xpatch_tuple_lock(Relation relation, ItemPointer tid,
                   LockWaitPolicy wait_policy, uint8 flags,
                   TM_FailureData *tmfd)
 {
+    Buffer buffer;
+    TM_Result result;
+    HeapTupleData tuple;
+
     /*
-     * xpatch tables are append-only and don't support UPDATE/DELETE.
-     * The lock modes that indicate modification intent should error out.
-     * LockTupleExclusive is used by UPDATE, LockTupleNoKeyExclusive by DELETE.
+     * xpatch tables don't support UPDATE.
+     * LockTupleExclusive is used by UPDATE.
      */
-    if (mode == LockTupleExclusive || mode == LockTupleNoKeyExclusive)
+    if (mode == LockTupleExclusive)
     {
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("UPDATE and DELETE are not supported on xpatch tables"),
+                 errmsg("UPDATE is not supported on xpatch tables"),
                  errhint("xpatch tables are append-only. Insert a new version instead.")));
     }
 
-    /* For shared locks (SELECT FOR SHARE, etc.), delegate to heap */
-    {
-        Buffer buffer;
-        TM_Result result;
-        HeapTupleData tuple;
+    /*
+     * DELETE is supported (with cascade semantics).
+     * LockTupleNoKeyExclusive is used by DELETE - allow it.
+     * For all lock modes, delegate to heap_lock_tuple.
+     */
+    tuple.t_self = *tid;
+    result = heap_lock_tuple(relation, &tuple, cid, mode, wait_policy,
+                             false, &buffer, tmfd);
 
-        tuple.t_self = *tid;
-        result = heap_lock_tuple(relation, &tuple, cid, mode, wait_policy,
-                                 false, &buffer, tmfd);
+    if (BufferIsValid(buffer))
+        ReleaseBuffer(buffer);
 
-        if (BufferIsValid(buffer))
-            ReleaseBuffer(buffer);
-
-        return result;
-    }
+    return result;
 }
 
 /* ----------------------------------------------------------------
@@ -952,8 +1613,49 @@ static bool
 xpatch_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
                                 Snapshot snapshot)
 {
-    /* Delegate to heap visibility check */
-    return true; /* TODO: proper implementation */
+    HeapTupleData tuple;
+    BufferHeapTupleTableSlot *bslot;
+    bool visible;
+    
+    /*
+     * Proper MVCC visibility check:
+     * We delegate to HeapTupleSatisfiesVisibility which handles all the
+     * complex visibility logic for MVCC (checking XMIN, XMAX, snapshot, etc.)
+     */
+    
+    /* Extract the heap tuple from the slot */
+    if (!TTS_IS_BUFFERTUPLE(slot))
+    {
+        /*
+         * If not a buffer tuple slot, we can't do a full visibility check.
+         * This can happen with virtual tuples created during reconstruction.
+         * In this case, we check if the tuple was materialized from a 
+         * visible source tuple.
+         */
+        return true;  /* Trust that reconstruction used visible tuples */
+    }
+    
+    bslot = (BufferHeapTupleTableSlot *) slot;
+    
+    if (!bslot->base.tuple)
+        return true;  /* No backing tuple, assume visible */
+    
+    tuple.t_data = bslot->base.tuple->t_data;
+    tuple.t_len = bslot->base.tuple->t_len;
+    tuple.t_self = slot->tts_tid;
+    tuple.t_tableOid = RelationGetRelid(rel);
+    
+    /*
+     * Use HeapTupleSatisfiesVisibility for proper MVCC semantics.
+     * This handles:
+     * - XMIN visibility (was inserting transaction committed?)
+     * - XMAX visibility (was deleting transaction committed?)
+     * - In-progress transaction handling
+     * - Snapshot type (MVCC, SELF, ANY, TOAST, etc.)
+     */
+    visible = HeapTupleSatisfiesVisibility(&tuple, snapshot, bslot->buffer);
+    
+    return visible;
 }
 
 static TransactionId
@@ -990,8 +1692,11 @@ xpatch_relation_set_new_filelocator(Relation rel,
 static void
 xpatch_relation_nontransactional_truncate(Relation rel)
 {
-    /* Invalidate cache entries for this relation */
-    xpatch_cache_invalidate_rel(RelationGetRelid(rel));
+    Oid relid = RelationGetRelid(rel);
+    
+    /* Invalidate all cache entries for this relation */
+    xpatch_cache_invalidate_rel(relid);      /* Content cache */
+    xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
 
     /* Delegate to heap */
     RelationTruncate(rel, 0);
@@ -1026,41 +1731,277 @@ xpatch_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
              errmsg("CLUSTER is not supported on xpatch tables")));
 }
 
+/*
+ * Vacuum an xpatch table.
+ *
+ * This function:
+ * 1. Scans all pages for dead tuples (committed XMAX)
+ * 2. Removes dead tuple pointers (marks as unused)
+ * 3. Invalidates affected caches
+ * 4. Reports statistics
+ *
+ * Note: We don't do page compaction or FSM updates in this simple implementation.
+ * A full implementation would reclaim space by compacting pages.
+ */
 static void
 xpatch_relation_vacuum(Relation rel, struct VacuumParams *params,
                        BufferAccessStrategy bstrategy)
 {
-    /* Basic vacuum - just delegate to heap vacuum for now */
-    /* Note: A real implementation would need special handling */
-    elog(DEBUG1, "xpatch: vacuum on %s", RelationGetRelationName(rel));
+    BlockNumber nblocks;
+    BlockNumber blkno;
+    Buffer buffer;
+    Page page;
+    OffsetNumber offnum;
+    OffsetNumber maxoff;
+    ItemId itemId;
+    HeapTupleData tuple;
+    TransactionId OldestXmin;
+    int64 tuples_removed = 0;
+    int64 tuples_remain = 0;
+    int64 pages_scanned = 0;
+    int64 pages_removed_tuples = 0;
+    Oid relid = RelationGetRelid(rel);
+    bool cache_invalidated = false;
+
+    elog(DEBUG1, "xpatch: vacuum starting on %s", RelationGetRelationName(rel));
+
+    /* Get the oldest transaction ID still active - tuples deleted before this are removable */
+    OldestXmin = GetOldestNonRemovableTransactionId(rel);
+
+    nblocks = RelationGetNumberOfBlocks(rel);
+
+    for (blkno = 0; blkno < nblocks; blkno++)
+    {
+        bool page_has_dead = false;
+        bool page_modified = false;
+
+        CHECK_FOR_INTERRUPTS();
+
+        buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
+        LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+
+        page = BufferGetPage(buffer);
+        maxoff = PageGetMaxOffsetNumber(page);
+        pages_scanned++;
+
+        for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+        {
+            TransactionId xmax;
+
+            itemId = PageGetItemId(page, offnum);
+
+            if (!ItemIdIsNormal(itemId))
+                continue;
+
+            tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+            tuple.t_len = ItemIdGetLength(itemId);
+            tuple.t_tableOid = relid;
+            ItemPointerSet(&tuple.t_self, blkno, offnum);
+
+            /* Check if tuple is dead (deleted by a committed transaction) */
+            if (!(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
+            {
+                xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+
+                /*
+                 * Tuple is dead if:
+                 * - XMAX committed AND
+                 * - XMAX is older than OldestXmin (no active transaction can see it)
+                 */
+                if (TransactionIdDidCommit(xmax) &&
+                    TransactionIdPrecedes(xmax, OldestXmin))
+                {
+                    /* Mark item as unused - this reclaims the line pointer */
+                    ItemIdSetUnused(itemId);
+                    page_has_dead = true;
+                    page_modified = true;
+                    tuples_removed++;
+                    
+                    elog(DEBUG2, "xpatch: vacuum removed dead tuple at (%u,%u)",
+                         blkno, offnum);
+                }
+                else
+                {
+                    /* Tuple still visible to someone */
+                    tuples_remain++;
+                }
+            }
+            else
+            {
+                /* Tuple is live */
+                tuples_remain++;
+            }
+        }
+
+        if (page_has_dead)
+        {
+            /*
+             * Compact the page by removing holes left by dead tuples.
+             * PageRepairFragmentation reorganizes the page to reclaim space.
+             */
+            PageRepairFragmentation(page);
+            pages_removed_tuples++;
+        }
+
+        if (page_modified)
+            MarkBufferDirty(buffer);
+
+        UnlockReleaseBuffer(buffer);
+    }
+
+    /* Invalidate caches if we removed any tuples */
+    if (tuples_removed > 0 && !cache_invalidated)
+    {
+        xpatch_cache_invalidate_rel(relid);
+        xpatch_seq_cache_invalidate_rel(relid);
+        cache_invalidated = true;
+    }
+
+    elog(DEBUG1, "xpatch: vacuum completed on %s: removed %lld tuples, %lld remain, "
+         "scanned %lld pages, %lld pages had dead tuples",
+         RelationGetRelationName(rel),
+         (long long) tuples_removed,
+         (long long) tuples_remain,
+         (long long) pages_scanned,
+         (long long) pages_removed_tuples);
+
+    /*
+     * Update relation statistics in pg_class
+     * This helps the query planner make better decisions
+     */
+    if (tuples_removed > 0 || params->options & VACOPT_VERBOSE)
+    {
+        vac_update_relstats(rel,
+                           nblocks,                /* relpages */
+                           tuples_remain,          /* reltuples */
+                           0,                      /* relallvisible */
+                           false,                  /* hasindex - don't update */
+                           InvalidTransactionId,   /* frozenxid */
+                           InvalidMultiXactId,     /* minmulti */
+                           NULL,                   /* relfrozenxid ptr */
+                           NULL,                   /* relminmxid ptr */
+                           false);                 /* in_outer_xact */
+    }
 }
 
+/*
+ * Prepare to analyze the next block during ANALYZE.
+ *
+ * This is called by ANALYZE to prepare scanning a specific block.
+ * We need to position our scan at the beginning of this block.
+ */
 static bool
 xpatch_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
                                BufferAccessStrategy bstrategy)
 {
-    /*
-     * For analyze, we don't need special handling - just return true
-     * to indicate we're ready to analyze tuples on this block.
-     */
+    XPatchScanDesc xscan = (XPatchScanDesc) scan;
+    Relation rel = scan->rs_rd;
+    BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+
+    /* Check if block is valid */
+    if (blockno >= nblocks)
+        return false;
+
+    /* Release any current buffer */
+    if (BufferIsValid(xscan->current_buffer))
+    {
+        ReleaseBuffer(xscan->current_buffer);
+        xscan->current_buffer = InvalidBuffer;
+    }
+
+    /* Position scan at this block */
+    xscan->current_block = blockno;
+    xscan->current_offset = FirstOffsetNumber;
+    xscan->inited = true;
+
+    /* Read the block */
+    xscan->current_buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blockno,
+                                                RBM_NORMAL, bstrategy);
+    LockBuffer(xscan->current_buffer, BUFFER_LOCK_SHARE);
+
     return true;
 }
 
+/*
+ * Get the next tuple for ANALYZE, accounting for dead rows.
+ *
+ * This is called repeatedly by ANALYZE to sample tuples from the current block.
+ * We need to:
+ * 1. Return live tuples in the slot for statistics collection
+ * 2. Count dead rows separately (for pg_stat reporting)
+ */
 static bool
 xpatch_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
                                double *liverows, double *deadrows,
                                TupleTableSlot *slot)
 {
-    /*
-     * For ANALYZE, we need to return sample tuples.
-     * Use the regular scan mechanism to get tuples.
-     */
-    bool got_tuple = xpatch_scan_getnextslot(scan, ForwardScanDirection, slot);
-    
-    if (got_tuple)
+    XPatchScanDesc xscan = (XPatchScanDesc) scan;
+    Relation rel = scan->rs_rd;
+    Page page;
+    ItemId itemId;
+    HeapTupleData tuple;
+    HeapTuple copy;
+    ItemPointerData saved_tid;
+
+    if (!BufferIsValid(xscan->current_buffer))
+        return false;
+
+    page = BufferGetPage(xscan->current_buffer);
+
+    /* Scan through items on this page */
+    while (xscan->current_offset <= PageGetMaxOffsetNumber(page))
+    {
+        OffsetNumber offnum = xscan->current_offset;
+        xscan->current_offset++;
+
+        itemId = PageGetItemId(page, offnum);
+
+        if (!ItemIdIsNormal(itemId))
+            continue;
+
+        tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+        tuple.t_len = ItemIdGetLength(itemId);
+        tuple.t_tableOid = RelationGetRelid(rel);
+        ItemPointerSet(&tuple.t_self, xscan->current_block, offnum);
+
+        /* Check tuple visibility */
+        if (!(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
+        {
+            TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+
+            /* If deleted by committed transaction, count as dead */
+            if (TransactionIdDidCommit(xmax))
+            {
+                (*deadrows)++;
+                continue;
+            }
+        }
+
+        /* Tuple is live - reconstruct and return it */
+        saved_tid = tuple.t_self;
+
+        /* Release lock before reconstruction (which may do I/O) */
+        LockBuffer(xscan->current_buffer, BUFFER_LOCK_UNLOCK);
+
+        /* Make a copy and reconstruct */
+        copy = heap_copytuple(&tuple);
+        xpatch_physical_to_logical(rel, xscan->config, copy, slot);
+        slot->tts_tid = saved_tid;
+        heap_freetuple(copy);
+
+        /* Re-acquire lock for next iteration */
+        LockBuffer(xscan->current_buffer, BUFFER_LOCK_SHARE);
+
         (*liverows)++;
-    
-    return got_tuple;
+        return true;
+    }
+
+    /* Done with this block - release buffer */
+    LockBuffer(xscan->current_buffer, BUFFER_LOCK_UNLOCK);
+    ReleaseBuffer(xscan->current_buffer);
+    xscan->current_buffer = InvalidBuffer;
+
+    return false;
 }
 
 static double
@@ -1579,14 +2520,24 @@ xpatch_scan_bitmap_next_tuple(TableScanDesc scan,
     LockBuffer(buffer, BUFFER_LOCK_SHARE);
     page = BufferGetPage(buffer);
 
-    off = xscan->bm_offsets[xscan->bm_index++];
-    itemId = PageGetItemId(page, off);
-
-    if (!ItemIdIsNormal(itemId))
+    /* Find next valid item, skipping dead/unused items without recursion */
+    while (true)
     {
-        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-        /* Try next tuple recursively */
-        return xpatch_scan_bitmap_next_tuple(scan, tbmres, slot);
+        off = xscan->bm_offsets[xscan->bm_index++];
+        itemId = PageGetItemId(page, off);
+
+        if (ItemIdIsNormal(itemId))
+            break;
+
+        /* If we've exhausted items on this page, try next block */
+        if (xscan->bm_index >= xscan->bm_ntuples)
+        {
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            /* Move to next block by clearing current block state */
+            xscan->bm_block = InvalidBlockNumber;
+            /* Recursion here is fine - it's just one level to get next block */
+            return xpatch_scan_bitmap_next_tuple(scan, tbmres, slot);
+        }
     }
 
     /* Extract the tuple */

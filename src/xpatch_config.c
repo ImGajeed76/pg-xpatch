@@ -102,6 +102,7 @@ resolve_column_name(Relation rel, const char *colname)
 
 /*
  * Auto-detect order_by column: last INTEGER/BIGINT/TIMESTAMP column
+ * (excluding the internal _xp_seq column)
  */
 static void
 auto_detect_order_by(Relation rel, XPatchConfig *config)
@@ -113,6 +114,10 @@ auto_detect_order_by(Relation rel, XPatchConfig *config)
     {
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
         if (attr->attisdropped)
+            continue;
+
+        /* Skip the internal _xp_seq column */
+        if (strcmp(NameStr(attr->attname), "_xp_seq") == 0)
             continue;
 
         if (attr->atttypid == INT2OID || attr->atttypid == INT4OID ||
@@ -194,6 +199,7 @@ auto_detect_delta_columns(Relation rel, XPatchConfig *config)
 
 /*
  * Try to read configuration from xpatch.table_config catalog table.
+ * First tries by OID, then falls back to schema.table name lookup.
  * Returns true if config was found, false otherwise.
  */
 static bool
@@ -204,6 +210,7 @@ read_config_from_catalog(Oid relid, XPatchConfig *config)
     Oid argtypes[1] = { OIDOID };
     Datum values[1];
     char nulls[1] = { ' ' };
+    volatile bool spi_connected = false;
 
     values[0] = ObjectIdGetDatum(relid);
 
@@ -212,84 +219,124 @@ read_config_from_catalog(Oid relid, XPatchConfig *config)
         elog(DEBUG1, "xpatch: SPI_connect failed, using auto-detection");
         return false;
     }
+    spi_connected = true;
 
-    ret = SPI_execute_with_args(
-        "SELECT group_by, order_by, delta_columns, keyframe_every, compress_depth, enable_zstd "
-        "FROM xpatch.table_config WHERE relid = $1",
-        1, argtypes, values, nulls, true, 1);
-
-    if (ret == SPI_OK_SELECT && SPI_processed > 0)
+    PG_TRY();
     {
-        HeapTuple tuple = SPI_tuptable->vals[0];
-        TupleDesc tupdesc = SPI_tuptable->tupdesc;
-        bool isnull;
-        Datum datum;
-        MemoryContext oldcxt;
-
-        found = true;
-        oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-
-        /* group_by (can be NULL) */
-        datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
-        if (!isnull)
-            config->group_by = pstrdup(TextDatumGetCString(datum));
-
-        /* order_by (NULL means auto-detect) */
-        datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
-        if (!isnull)
+        /* First try by OID (fastest) */
+        ret = SPI_execute_with_args(
+            "SELECT group_by, order_by, delta_columns, keyframe_every, compress_depth, enable_zstd "
+            "FROM xpatch.table_config WHERE relid = $1",
+            1, argtypes, values, nulls, true, 1);
+        
+        /* If not found by OID, try by schema.table name (handles pg_restore) */
+        if (ret == SPI_OK_SELECT && SPI_processed == 0)
         {
-            config->order_by = pstrdup(TextDatumGetCString(datum));
-        }
-
-        /* delta_columns (can be NULL for auto-detect) */
-        datum = SPI_getbinval(tuple, tupdesc, 3, &isnull);
-        if (!isnull)
-        {
-            ArrayType *arr = DatumGetArrayTypeP(datum);
-            Datum *elems;
-            bool *elem_nulls;
-            int nelems;
-            int16 typlen;
-            bool typbyval;
-            char typalign;
-
-            get_typlenbyvalalign(TEXTOID, &typlen, &typbyval, &typalign);
-            deconstruct_array(arr, TEXTOID, typlen, typbyval, typalign,
-                              &elems, &elem_nulls, &nelems);
-
-            if (nelems > 0)
+            ret = SPI_execute_with_args(
+                "SELECT tc.group_by, tc.order_by, tc.delta_columns, tc.keyframe_every, "
+                "       tc.compress_depth, tc.enable_zstd "
+                "FROM xpatch.table_config tc "
+                "JOIN pg_class c ON tc.schema_name = (SELECT nspname FROM pg_namespace WHERE oid = c.relnamespace) "
+                "                AND tc.table_name = c.relname "
+                "WHERE c.oid = $1",
+                1, argtypes, values, nulls, true, 1);
+            
+            if (ret == SPI_OK_SELECT && SPI_processed > 0)
             {
-                config->delta_columns = palloc(nelems * sizeof(char *));
-                config->delta_attnums = palloc(nelems * sizeof(AttrNumber));
-                config->num_delta_columns = nelems;
-
-                for (int i = 0; i < nelems; i++)
-                {
-                    if (!elem_nulls[i])
-                        config->delta_columns[i] = pstrdup(TextDatumGetCString(elems[i]));
-                    else
-                        config->delta_columns[i] = NULL;
-                }
+                /* Found by name - update the relid in the config table for next time */
+                SPI_execute_with_args(
+                    "UPDATE xpatch.table_config SET relid = $1 "
+                    "WHERE (schema_name, table_name) = ("
+                    "  SELECT n.nspname, c.relname FROM pg_class c "
+                    "  JOIN pg_namespace n ON c.relnamespace = n.oid WHERE c.oid = $1"
+                    ")",
+                    1, argtypes, values, nulls, false, 0);
+                
+                elog(DEBUG1, "xpatch: found config by table name, updated OID");
             }
         }
 
-        /* keyframe_every */
-        datum = SPI_getbinval(tuple, tupdesc, 4, &isnull);
-        if (!isnull)
-            config->keyframe_every = DatumGetInt32(datum);
+        if (ret == SPI_OK_SELECT && SPI_processed > 0)
+        {
+            HeapTuple tuple = SPI_tuptable->vals[0];
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+            bool isnull;
+            Datum datum;
+            MemoryContext oldcxt;
 
-        /* compress_depth */
-        datum = SPI_getbinval(tuple, tupdesc, 5, &isnull);
-        if (!isnull)
-            config->compress_depth = DatumGetInt32(datum);
+            found = true;
+            oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
-        /* enable_zstd */
-        datum = SPI_getbinval(tuple, tupdesc, 6, &isnull);
-        if (!isnull)
-            config->enable_zstd = DatumGetBool(datum);
+            /* group_by (can be NULL) */
+            datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+            if (!isnull)
+                config->group_by = pstrdup(TextDatumGetCString(datum));
 
-        MemoryContextSwitchTo(oldcxt);
+            /* order_by (NULL means auto-detect) */
+            datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
+            if (!isnull)
+            {
+                config->order_by = pstrdup(TextDatumGetCString(datum));
+            }
+
+            /* delta_columns (can be NULL for auto-detect) */
+            datum = SPI_getbinval(tuple, tupdesc, 3, &isnull);
+            if (!isnull)
+            {
+                ArrayType *arr = DatumGetArrayTypeP(datum);
+                Datum *elems;
+                bool *elem_nulls;
+                int nelems;
+                int16 typlen;
+                bool typbyval;
+                char typalign;
+
+                get_typlenbyvalalign(TEXTOID, &typlen, &typbyval, &typalign);
+                deconstruct_array(arr, TEXTOID, typlen, typbyval, typalign,
+                                  &elems, &elem_nulls, &nelems);
+
+                if (nelems > 0)
+                {
+                    config->delta_columns = palloc(nelems * sizeof(char *));
+                    config->delta_attnums = palloc(nelems * sizeof(AttrNumber));
+                    config->num_delta_columns = nelems;
+
+                    for (int i = 0; i < nelems; i++)
+                    {
+                        if (!elem_nulls[i])
+                            config->delta_columns[i] = pstrdup(TextDatumGetCString(elems[i]));
+                        else
+                            config->delta_columns[i] = NULL;
+                    }
+                }
+            }
+
+            /* keyframe_every */
+            datum = SPI_getbinval(tuple, tupdesc, 4, &isnull);
+            if (!isnull)
+                config->keyframe_every = DatumGetInt32(datum);
+
+            /* compress_depth */
+            datum = SPI_getbinval(tuple, tupdesc, 5, &isnull);
+            if (!isnull)
+                config->compress_depth = DatumGetInt32(datum);
+
+            /* enable_zstd */
+            datum = SPI_getbinval(tuple, tupdesc, 6, &isnull);
+            if (!isnull)
+                config->enable_zstd = DatumGetBool(datum);
+
+            MemoryContextSwitchTo(oldcxt);
+        }
     }
+    PG_CATCH();
+    {
+        /* Ensure SPI is disconnected even on error */
+        if (spi_connected)
+            SPI_finish();
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
 
     SPI_finish();
     return found;
@@ -352,12 +399,41 @@ xpatch_parse_reloptions(Relation rel)
     if (config->group_by)
         config->group_by_attnum = resolve_column_name(rel, config->group_by);
 
-    elog(DEBUG1, "xpatch: config for %s - order_by=%s, group_by=%s, delta_cols=%d, keyframe=%d",
+    /* Look for _xp_seq column */
+    {
+        TupleDesc tupdesc = RelationGetDescr(rel);
+        int natts = tupdesc->natts;
+        
+        config->xp_seq_attnum = InvalidAttrNumber;
+        
+        for (int i = 0; i < natts; i++)
+        {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+            if (attr->attisdropped)
+                continue;
+            
+            if (strcmp(NameStr(attr->attname), "_xp_seq") == 0)
+            {
+                if (attr->atttypid != INT4OID)
+                {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_DATATYPE_MISMATCH),
+                             errmsg("xpatch: _xp_seq column must be INT (int4), found type %u",
+                                    attr->atttypid)));
+                }
+                config->xp_seq_attnum = attr->attnum;
+                break;
+            }
+        }
+    }
+
+    elog(DEBUG1, "xpatch: config for %s - order_by=%s, group_by=%s, delta_cols=%d, keyframe=%d, xp_seq_attnum=%d",
          RelationGetRelationName(rel),
          config->order_by ? config->order_by : "(null)",
          config->group_by ? config->group_by : "(none)",
          config->num_delta_columns,
-         config->keyframe_every);
+         config->keyframe_every,
+         config->xp_seq_attnum);
 
     return config;
 }

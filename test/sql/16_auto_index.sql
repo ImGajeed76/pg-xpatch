@@ -1,0 +1,150 @@
+-- Test 16: Automatic Index Creation
+-- Tests automatic index creation on table creation and configuration
+
+-- Suppress NOTICE messages for cleaner test output
+SET client_min_messages = warning;
+
+-- Clean up from previous runs
+DROP TABLE IF EXISTS test_idx_basic;
+DROP TABLE IF EXISTS test_idx_configured;
+DROP TABLE IF EXISTS test_idx_existing;
+
+-- ================================================================
+-- Test 1: Basic index created on table creation
+-- ================================================================
+
+CREATE TABLE test_idx_basic (
+    id INT,
+    version INT,
+    data TEXT
+) USING xpatch;
+
+-- Check that _xp_seq index was created automatically
+SELECT 
+    CASE WHEN COUNT(*) = 1 
+         THEN 'PASS: Basic index created' 
+         ELSE 'FAIL: Basic index not created' 
+    END as result
+FROM pg_indexes 
+WHERE tablename = 'test_idx_basic' AND indexname LIKE '%xp_seq%';
+
+-- Show the index name
+SELECT indexname FROM pg_indexes WHERE tablename = 'test_idx_basic';
+
+-- ================================================================
+-- Test 2: Composite index created on configure with group_by
+-- ================================================================
+
+CREATE TABLE test_idx_configured (
+    doc_id INT,
+    version INT,
+    content TEXT
+) USING xpatch;
+
+-- Before configure: should have basic _xp_seq index
+SELECT indexname FROM pg_indexes WHERE tablename = 'test_idx_configured';
+
+-- Configure with group_by
+SELECT xpatch.configure('test_idx_configured', group_by => 'doc_id');
+
+-- After configure: should have composite index, basic one dropped
+SELECT 
+    CASE WHEN indexname LIKE '%group_seq%' 
+         THEN 'PASS: Composite index created' 
+         ELSE 'FAIL: Composite index not created' 
+    END as result
+FROM pg_indexes 
+WHERE tablename = 'test_idx_configured';
+
+-- Verify basic index was dropped
+SELECT 
+    CASE WHEN COUNT(*) = 0 
+         THEN 'PASS: Basic index dropped' 
+         ELSE 'FAIL: Basic index not dropped' 
+    END as result
+FROM pg_indexes 
+WHERE tablename = 'test_idx_configured' AND indexname LIKE '%xp_seq_idx';
+
+-- ================================================================
+-- Test 3: Index on table with existing data
+-- Note: We configure first, then insert, because without group_by
+-- all rows would be in the same version chain (invalid)
+-- ================================================================
+
+CREATE TABLE test_idx_existing (
+    id INT,
+    ver INT,
+    data TEXT
+) USING xpatch;
+
+-- Configure FIRST so we can have multiple groups
+SELECT xpatch.configure('test_idx_existing', group_by => 'id');
+
+-- Drop the composite index so we can test re-creation
+DROP INDEX test_idx_existing_xp_group_seq_idx;
+
+-- Insert data (now properly grouped)
+INSERT INTO test_idx_existing SELECT d, v, 'Data ' || d || '-' || v 
+FROM generate_series(1, 10) AS d, generate_series(1, 5) AS v
+ORDER BY d, v;
+
+-- Re-run configure to create index on existing data
+SELECT xpatch.configure('test_idx_existing', group_by => 'id');
+
+-- Verify composite index exists
+SELECT 
+    CASE WHEN COUNT(*) = 1 
+         THEN 'PASS: Index created on existing data' 
+         ELSE 'FAIL: Index not created on existing data' 
+    END as result
+FROM pg_indexes 
+WHERE tablename = 'test_idx_existing' AND indexname LIKE '%group_seq%';
+
+-- Verify data is still accessible
+SELECT 
+    CASE WHEN COUNT(*) = 50 
+         THEN 'PASS: Data accessible after index creation' 
+         ELSE 'FAIL: Data not accessible' 
+    END as result
+FROM test_idx_existing;
+
+-- ================================================================
+-- Test 4: Index survives TRUNCATE
+-- ================================================================
+
+-- Check index before truncate
+SELECT indexname FROM pg_indexes WHERE tablename = 'test_idx_existing';
+
+TRUNCATE test_idx_existing;
+
+-- Check index after truncate
+SELECT 
+    CASE WHEN COUNT(*) = 1 
+         THEN 'PASS: Index survives TRUNCATE' 
+         ELSE 'FAIL: Index lost after TRUNCATE' 
+    END as result
+FROM pg_indexes 
+WHERE tablename = 'test_idx_existing' AND indexname LIKE '%group_seq%';
+
+-- ================================================================
+-- Test 5: Index is used by query planner
+-- ================================================================
+
+-- Re-insert data
+INSERT INTO test_idx_existing SELECT d, v, 'Data ' || d || '-' || v 
+FROM generate_series(1, 100) AS d, generate_series(1, 10) AS v;
+
+ANALYZE test_idx_existing;
+
+-- Force index usage
+SET enable_seqscan = off;
+
+-- Check that index is used
+EXPLAIN (COSTS OFF) SELECT * FROM test_idx_existing WHERE id = 50;
+
+SET enable_seqscan = on;
+
+-- Clean up
+DROP TABLE test_idx_basic;
+DROP TABLE test_idx_configured;
+DROP TABLE test_idx_existing;
