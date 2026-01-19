@@ -1,0 +1,49 @@
+SET
+CREATE TABLE
+ configure 
+-----------
+ 
+(1 row)
+
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ version |            content             
+---------+--------------------------------
+       1 | First version of the document
+       2 | Second version of the document
+       3 | Third version of the document
+       4 | Fourth version of the document
+       5 | Fifth version of the document
+(5 rows)
+
+ total 
+-------
+     5
+(1 row)
+
+ version |            content             
+---------+--------------------------------
+       3 | Third version of the document
+       4 | Fourth version of the document
+       5 | Fifth version of the document
+(3 rows)
+
+ total_rows | total_groups | keyframe_count | delta_count 
+------------+--------------+----------------+-------------
+          5 |            1 |              1 |           4
+(1 row)
+
+ version |            content            
+---------+-------------------------------
+       5 | Fifth version of the document
+(1 row)
+
+ latest_version | total_versions 
+----------------+----------------
+              5 |              5
+(1 row)
+
+DROP TABLE

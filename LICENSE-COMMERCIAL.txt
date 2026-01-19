@@ -1,0 +1,20 @@
+COMMERCIAL LICENSE TERMS FOR XPATCH
+
+Copyright (c) 2025 Oliver Seifert
+
+Commercial License Grant:
+Subject to payment of applicable fees, you are granted a non-exclusive,
+non-transferable license to use, modify, and distribute xpatch in binary
+and/or source code form within your proprietary applications.
+
+Pricing: Contact xpatch-commercial@alias.oseifert.ch for commercial licensing terms.
+Pricing is flexible based on company size and use case.
+
+RESTRICTIONS:
+- You may not redistribute the source code except as integrated into your
+  proprietary application
+- Modifications must be clearly marked as your own
+- This license does not grant you rights to the xpatch trademark
+
+CONTACT:
+For commercial licensing inquiries: xpatch-commercial@alias.oseifert.ch

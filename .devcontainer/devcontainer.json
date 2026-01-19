@@ -1,0 +1,37 @@
+{
+    "name": "pg-xpatch",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "rust-lang.rust-analyzer"
+            ],
+            "settings": {
+                "C_Cpp.default.includePath": [
+                    "${workspaceFolder}/src",
+                    "${workspaceFolder}/lib",
+                    "/usr/include/postgresql/16/server"
+                ],
+                "C_Cpp.default.defines": [],
+                "C_Cpp.default.compilerPath": "/usr/bin/gcc",
+                "C_Cpp.default.cStandard": "c11",
+                "files.associations": {
+                    "*.h": "c"
+                }
+            }
+        }
+    },
+    "workspaceFolder": "/workspace",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "postCreateCommand": "pg-start",
+    "postStartCommand": "pg-start",
+    "remoteUser": "root",
+    "mounts": [
+        "source=pg-xpatch-pgdata,target=/var/lib/postgresql/data,type=volume"
+    ],
+    "containerName": "pg-xpatch-dev"
+}

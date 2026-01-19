@@ -1,0 +1,88 @@
+SET
+CREATE TABLE
+ configure 
+-----------
+ 
+(1 row)
+
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+ANALYZE
+SET
+                    QUERY PLAN                    
+--------------------------------------------------
+ Index Scan using idx_test_doc_id on test_indexes
+   Index Cond: (doc_id = 2)
+(2 rows)
+
+ doc_id | version | title |   content    
+--------+---------+-------+--------------
+      2 |       1 | Doc B | Content B v1
+      2 |       2 | Doc B | Content B v2
+(2 rows)
+
+                    QUERY PLAN                     
+---------------------------------------------------
+ Index Scan using idx_test_version on test_indexes
+   Index Cond: (version = 1)
+(2 rows)
+
+ doc_id | title 
+--------+-------
+      1 | Doc A
+      2 | Doc B
+      3 | Doc C
+      4 | Doc D
+(4 rows)
+
+                   QUERY PLAN                    
+-------------------------------------------------
+ Index Scan using idx_test_title on test_indexes
+   Index Cond: (title = 'Doc B'::text)
+(2 rows)
+
+ doc_id | version | title |   content    
+--------+---------+-------+--------------
+      2 |       1 | Doc B | Content B v1
+      2 |       2 | Doc B | Content B v2
+(2 rows)
+
+CREATE INDEX
+ANALYZE
+                    QUERY PLAN                     
+---------------------------------------------------
+ Index Scan using idx_test_content on test_indexes
+   Index Cond: (content = 'Content B v1'::text)
+(2 rows)
+
+ doc_id | version |   content    
+--------+---------+--------------
+      2 |       1 | Content B v1
+(1 row)
+
+SET
+CREATE INDEX
+ANALYZE
+SET
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Index Scan using idx_test_composite on test_indexes
+   Index Cond: ((doc_id = 1) AND (version = 2))
+(2 rows)
+
+ doc_id | version | title |   content    
+--------+---------+-------+--------------
+      1 |       2 | Doc A | Content A v2
+(1 row)
+
+SET
+DROP TABLE

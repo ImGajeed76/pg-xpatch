@@ -1,0 +1,1068 @@
+/*
+ * pg-xpatch - PostgreSQL Table Access Method for delta-compressed data
+ * Copyright (c) 2025 Oliver Seifert
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Commercial License Option:
+ * For commercial use in proprietary software, a commercial license is
+ * available. Contact xpatch-commercial@alias.oseifert.ch for details.
+ */
+
+/*
+ * xpatch_storage.c - Physical tuple handling with delta compression
+ *
+ * This file implements the core compression and reconstruction logic.
+ * 
+ * Physical Storage Format:
+ * - We store tuples with delta-compressed content in the delta columns
+ * - Keyframes are encoded with empty base (full content)
+ * - Deltas reference previous versions via tag (tag=0 means previous row)
+ * 
+ * IMPORTANT: We cannot use heap_beginscan on xpatch tables because that
+ * requires heap AM. Instead, we use direct buffer access.
+ */
+
+#include "xpatch_storage.h"
+#include "xpatch_compress.h"
+#include "xpatch_cache.h"
+#include "xpatch_seq_cache.h"
+
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/tableam.h"
+#include "catalog/pg_type.h"
+#include "executor/tuptable.h"
+#include "storage/bufmgr.h"
+#include "utils/builtins.h"
+#include "utils/datum.h"
+#include "utils/lsyscache.h"
+#include "utils/typcache.h"
+#include "funcapi.h"
+
+/* Forward declarations */
+static bytea *datum_to_bytea(Datum value, Oid typid, bool isnull);
+
+/*
+ * Convert a Datum of various varlena types to bytea for compression.
+ * 
+ * All supported delta column types (TEXT, VARCHAR, BYTEA, JSON, JSONB) are
+ * varlena types - they have a varlena header followed by raw bytes. We simply
+ * treat them all as raw bytes for delta encoding. This is simpler and faster
+ * than type-specific conversions.
+ * 
+ * The xpatch library doesn't care about the semantic meaning of the bytes -
+ * it just compresses/decompresses byte arrays. We preserve the exact binary
+ * representation so reconstruction is lossless.
+ */
+static bytea *
+datum_to_bytea(Datum value, Oid typid, bool isnull)
+{
+    struct varlena *src;
+    bytea *result;
+    Size len;
+    
+    if (isnull)
+        return NULL;
+    
+    /* 
+     * All our supported types are varlena. Get the detoasted value
+     * to ensure we have the full data (not compressed or out-of-line).
+     */
+    switch (typid)
+    {
+        case BYTEAOID:
+        case TEXTOID:
+        case VARCHAROID:
+        case JSONOID:
+        case JSONBOID:
+            /* All varlena types - treat uniformly as raw bytes */
+            src = (struct varlena *) PG_DETOAST_DATUM(value);
+            len = VARSIZE_ANY(src);
+            result = (bytea *) palloc(len);
+            memcpy(result, src, len);
+            
+            /* Free detoasted copy if it was created */
+            if ((Pointer) src != DatumGetPointer(value))
+                pfree(src);
+            
+            return result;
+            
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("unsupported delta column type: %u", typid)));
+            return NULL;
+    }
+}
+
+/*
+ * Convert bytea back to original Datum type.
+ * 
+ * Since we stored the raw varlena bytes in datum_to_bytea, we just need to
+ * return a copy of those bytes. The data already has the correct varlena
+ * header and binary format for its type.
+ * 
+ * We always return a fresh copy to ensure the caller owns the memory and
+ * it won't be unexpectedly freed (important for tuple materialization in Sort).
+ */
+/*
+ * Convert bytea back to original Datum type.
+ * Exported for use by xpatch_tam.c for lazy reconstruction.
+ */
+Datum
+bytea_to_datum(bytea *data, Oid typid)
+{
+    Size len;
+    void *copy;
+    
+    if (data == NULL)
+        return (Datum) 0;
+    
+    switch (typid)
+    {
+        case BYTEAOID:
+        case TEXTOID:
+        case VARCHAROID:
+        case JSONOID:
+        case JSONBOID:
+            /* 
+             * All varlena types - the data already contains the complete
+             * varlena representation (header + content). Just copy it.
+             */
+            len = VARSIZE_ANY(data);
+            copy = palloc(len);
+            memcpy(copy, data, len);
+            return PointerGetDatum(copy);
+            
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("unsupported delta column type: %u", typid)));
+            return (Datum) 0;
+    }
+}
+
+/*
+ * Scan the table using direct buffer access to find the maximum sequence number.
+ * Returns 0 if the group is empty.
+ * 
+ * OPTIMIZATION: First checks the seq cache for O(1) lookup via hash table.
+ * On cache miss, performs a full table scan and populates the cache.
+ * 
+ * This function is called during INSERT to:
+ * 1. Determine the next sequence number for a new version
+ * 2. Find base versions for delta compression
+ * 
+ * After the first call for a group, subsequent calls hit the cache and return
+ * immediately without scanning.
+ */
+int32
+xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
+{
+    int32 max_seq = 0;
+    bool found;
+    TupleDesc tupdesc;
+    BlockNumber nblocks;
+    BlockNumber blkno;
+    Buffer buffer;
+    Page page;
+    OffsetNumber offnum;
+    OffsetNumber maxoff;
+    ItemId itemId;
+    HeapTupleData tuple;
+    Form_pg_attribute attr;
+    Datum tuple_group;
+    bool group_isnull;
+    
+    /* Try cache first - O(1) lookup */
+    max_seq = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel), group_value, &found);
+    if (found)
+    {
+        elog(DEBUG1, "xpatch: get_max_seq cache hit for group, max_seq=%d", max_seq);
+        return max_seq;
+    }
+    
+    elog(DEBUG1, "xpatch: get_max_seq cache miss, scanning table");
+    
+    /* Cache miss - scan the table */
+    max_seq = 0;
+    tupdesc = RelationGetDescr(rel);
+    nblocks = RelationGetNumberOfBlocks(rel);
+    
+    /* Scan all blocks */
+    for (blkno = 0; blkno < nblocks; blkno++)
+    {
+        buffer = ReadBuffer(rel, blkno);
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        
+        page = BufferGetPage(buffer);
+        maxoff = PageGetMaxOffsetNumber(page);
+        
+        for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+        {
+            itemId = PageGetItemId(page, offnum);
+            
+            if (!ItemIdIsNormal(itemId))
+                continue;
+            
+            tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+            tuple.t_len = ItemIdGetLength(itemId);
+            tuple.t_tableOid = RelationGetRelid(rel);
+            ItemPointerSet(&tuple.t_self, blkno, offnum);
+            
+            /* If we have group_by, check if this tuple matches */
+            if (config->group_by_attnum != InvalidAttrNumber)
+            {
+                tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
+                
+                if (!group_isnull)
+                {
+                    attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+                    if (!datumIsEqual(group_value, tuple_group, attr->attbyval, attr->attlen))
+                        continue;
+                }
+            }
+            
+            max_seq++;
+        }
+        
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+    }
+    
+    /* Populate the cache for future lookups */
+    xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value, max_seq);
+    
+    return max_seq;
+}
+
+/*
+ * Get the maximum version value for a group using direct buffer access.
+ */
+Datum
+xpatch_get_max_version(Relation rel, XPatchConfig *config,
+                       Datum group_value, bool *is_null)
+{
+    Datum max_version = (Datum) 0;
+    bool found = false;
+    TupleDesc tupdesc;
+    BlockNumber nblocks;
+    BlockNumber blkno;
+    Buffer buffer;
+    Page page;
+    OffsetNumber offnum;
+    OffsetNumber maxoff;
+    ItemId itemId;
+    HeapTupleData tuple;
+    bool isnull;
+    Datum version_datum;
+    Datum tuple_group;
+    bool group_isnull;
+    Form_pg_attribute attr;
+    Form_pg_attribute order_attr;
+    Oid typid;
+    int cmp;
+    int64 v1, v2;
+    Timestamp t1, t2;
+    
+    tupdesc = RelationGetDescr(rel);
+    nblocks = RelationGetNumberOfBlocks(rel);
+    
+    /* Scan all blocks */
+    for (blkno = 0; blkno < nblocks; blkno++)
+    {
+        buffer = ReadBuffer(rel, blkno);
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        
+        page = BufferGetPage(buffer);
+        maxoff = PageGetMaxOffsetNumber(page);
+        
+        for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+        {
+            itemId = PageGetItemId(page, offnum);
+            
+            if (!ItemIdIsNormal(itemId))
+                continue;
+            
+            tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+            tuple.t_len = ItemIdGetLength(itemId);
+            tuple.t_tableOid = RelationGetRelid(rel);
+            ItemPointerSet(&tuple.t_self, blkno, offnum);
+            
+            version_datum = heap_getattr(&tuple, config->order_by_attnum, tupdesc, &isnull);
+            
+            if (isnull)
+                continue;
+            
+            /* If group_by is specified, check if this tuple matches */
+            if (config->group_by_attnum != InvalidAttrNumber)
+            {
+                tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
+                
+                if (group_isnull)
+                    continue;
+                
+                attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+                if (!datumIsEqual(group_value, tuple_group, attr->attbyval, attr->attlen))
+                    continue;
+            }
+            
+            if (!found)
+            {
+                max_version = version_datum;
+                found = true;
+            }
+            else
+            {
+                /* Compare versions based on type */
+                order_attr = TupleDescAttr(tupdesc, config->order_by_attnum - 1);
+                typid = order_attr->atttypid;
+                cmp = 0;
+                
+                switch (typid)
+                {
+                    case INT2OID:
+                        cmp = DatumGetInt16(version_datum) - DatumGetInt16(max_version);
+                        break;
+                    case INT4OID:
+                        cmp = DatumGetInt32(version_datum) - DatumGetInt32(max_version);
+                        break;
+                    case INT8OID:
+                        v1 = DatumGetInt64(version_datum);
+                        v2 = DatumGetInt64(max_version);
+                        cmp = (v1 > v2) ? 1 : ((v1 < v2) ? -1 : 0);
+                        break;
+                    case TIMESTAMPOID:
+                    case TIMESTAMPTZOID:
+                        t1 = DatumGetTimestamp(version_datum);
+                        t2 = DatumGetTimestamp(max_version);
+                        cmp = (t1 > t2) ? 1 : ((t1 < t2) ? -1 : 0);
+                        break;
+                    default:
+                        cmp = 0;
+                }
+                
+                if (cmp > 0)
+                    max_version = version_datum;
+            }
+        }
+        
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+    }
+    
+    *is_null = !found;
+    return max_version;
+}
+
+/*
+ * Fetch a physical row by group and sequence number using direct buffer access.
+ */
+HeapTuple
+xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
+                    Datum group_value, int32 target_seq)
+{
+    HeapTuple result = NULL;
+    TupleDesc tupdesc;
+    BlockNumber nblocks;
+    BlockNumber blkno;
+    Buffer buffer;
+    Page page;
+    OffsetNumber offnum;
+    OffsetNumber maxoff;
+    ItemId itemId;
+    HeapTupleData tuple;
+    int32 current_seq = 0;
+    Datum tuple_group;
+    bool group_isnull;
+    Form_pg_attribute attr;
+    
+    tupdesc = RelationGetDescr(rel);
+    nblocks = RelationGetNumberOfBlocks(rel);
+    
+    /* Scan all blocks */
+    for (blkno = 0; blkno < nblocks && result == NULL; blkno++)
+    {
+        buffer = ReadBuffer(rel, blkno);
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        
+        page = BufferGetPage(buffer);
+        maxoff = PageGetMaxOffsetNumber(page);
+        
+        for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+        {
+            itemId = PageGetItemId(page, offnum);
+            
+            if (!ItemIdIsNormal(itemId))
+                continue;
+            
+            tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+            tuple.t_len = ItemIdGetLength(itemId);
+            tuple.t_tableOid = RelationGetRelid(rel);
+            ItemPointerSet(&tuple.t_self, blkno, offnum);
+            
+            /* Check group if specified */
+            if (config->group_by_attnum != InvalidAttrNumber)
+            {
+                tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
+                
+                if (group_isnull)
+                    continue;
+                
+                attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+                if (!datumIsEqual(group_value, tuple_group, attr->attbyval, attr->attlen))
+                    continue;
+            }
+            
+            current_seq++;
+            
+            if (current_seq == target_seq)
+            {
+                result = heap_copytuple(&tuple);
+                break;
+            }
+        }
+        
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+    }
+    
+    return result;
+}
+
+/*
+ * Internal: Reconstruct a delta column given its compressed bytea directly.
+ * This avoids re-fetching the tuple when we already have the compressed data.
+ * 
+ * This is a helper function used by both reconstruction paths:
+ * 1. xpatch_reconstruct_column_with_tuple() - scan fast path (already has tuple)
+ * 2. xpatch_reconstruct_column() - recursive base lookup (fetches by seq)
+ * 
+ * The function handles two cases:
+ * - Keyframe (tag=0xFF...): Decode against empty base (full content stored)
+ * - Delta (tag=1,2,3...): Recursively fetch base version and decode against it
+ * 
+ * Results are cached in the LRU content cache to avoid redundant decompression.
+ */
+static bytea *
+xpatch_reconstruct_from_delta(Relation rel, XPatchConfig *config,
+                              Datum group_value, int32 seq,
+                              int delta_col_index, bytea *delta_bytea)
+{
+    bytea *result;
+    size_t tag;
+    const char *err;
+    bytea *base_content;
+    int32 base_seq;
+    AttrNumber attnum;
+    
+    attnum = config->delta_attnums[delta_col_index];
+    
+    /* Extract tag to determine if this is a keyframe or delta */
+    err = xpatch_get_delta_tag((uint8 *) VARDATA_ANY(delta_bytea),
+                               VARSIZE_ANY_EXHDR(delta_bytea),
+                               &tag);
+    if (err != NULL)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("xpatch: failed to extract tag: %s", err)));
+    }
+    
+    if (tag == XPATCH_KEYFRAME_TAG)
+    {
+        /* Keyframe: decode against empty base */
+        result = xpatch_decode_delta(NULL, 0,
+                                     (uint8 *) VARDATA_ANY(delta_bytea),
+                                     VARSIZE_ANY_EXHDR(delta_bytea));
+    }
+    else
+    {
+        /* Delta: calculate base sequence from tag */
+        base_seq = seq - tag;
+        
+        if (base_seq < 1)
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_CORRUPTED),
+                     errmsg("xpatch: invalid base sequence %d (tag=%zu, seq=%d)",
+                            base_seq, tag, seq)));
+        }
+        
+        /* Recursively get base content (will hit cache if previously decoded) */
+        base_content = xpatch_reconstruct_column(rel, config, group_value,
+                                                  base_seq, delta_col_index);
+        
+        /* Decode this delta against the base */
+        if (base_content == NULL)
+        {
+            result = xpatch_decode_delta(NULL, 0,
+                                         (uint8 *) VARDATA_ANY(delta_bytea),
+                                         VARSIZE_ANY_EXHDR(delta_bytea));
+        }
+        else
+        {
+            result = xpatch_decode_delta((uint8 *) VARDATA_ANY(base_content),
+                                         VARSIZE_ANY_EXHDR(base_content),
+                                         (uint8 *) VARDATA_ANY(delta_bytea),
+                                         VARSIZE_ANY_EXHDR(delta_bytea));
+            pfree(base_content);
+        }
+    }
+    
+    /* Cache the result */
+    if (result != NULL)
+    {
+        xpatch_cache_put(RelationGetRelid(rel), group_value, seq, attnum, result);
+    }
+    
+    return result;
+}
+
+/*
+ * Reconstruct the content of a delta column for a specific version.
+ * 
+ * This version fetches the tuple by sequence number - used for:
+ * 1. Recursive base lookups during delta reconstruction
+ * 2. INSERT operations that need to compare with previous versions
+ * 
+ * For scan operations, use xpatch_reconstruct_column_with_tuple() instead,
+ * which avoids re-fetching the tuple you already have (12x faster).
+ * 
+ * Reconstruction flow:
+ * 1. Check LRU cache - O(1) hash lookup
+ * 2. On miss: Fetch physical tuple by sequence - O(n) scan
+ * 3. Extract compressed data from tuple
+ * 4. If delta: recursively get base (may hit cache)
+ * 5. Decode and cache result
+ */
+bytea *
+xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
+                          Datum group_value, int32 seq,
+                          int delta_col_index)
+{
+    HeapTuple physical_tuple;
+    TupleDesc tupdesc;
+    AttrNumber attnum;
+    Form_pg_attribute attr;
+    Oid typid;
+    bool isnull;
+    Datum delta_datum;
+    bytea *delta_bytea;
+    bytea *result;
+    
+    tupdesc = RelationGetDescr(rel);
+    attnum = config->delta_attnums[delta_col_index];
+    attr = TupleDescAttr(tupdesc, attnum - 1);
+    typid = attr->atttypid;
+    
+    /* 1. Check LRU cache first - O(1) hash lookup */
+    result = xpatch_cache_get(RelationGetRelid(rel), group_value, seq, attnum);
+    if (result != NULL)
+        return result;
+    
+    /* 2. Fetch the physical tuple for this sequence */
+    physical_tuple = xpatch_fetch_by_seq(rel, config, group_value, seq);
+    if (physical_tuple == NULL)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("xpatch: could not find row with sequence %d", seq)));
+    }
+    
+    /* 3. Get the delta/compressed value from the tuple */
+    delta_datum = heap_getattr(physical_tuple, attnum, tupdesc, &isnull);
+    
+    if (isnull)
+    {
+        heap_freetuple(physical_tuple);
+        return NULL;
+    }
+    
+    /* Convert to bytea and reconstruct */
+    delta_bytea = datum_to_bytea(delta_datum, typid, false);
+    result = xpatch_reconstruct_from_delta(rel, config, group_value, seq,
+                                           delta_col_index, delta_bytea);
+    
+    heap_freetuple(physical_tuple);
+    pfree(delta_bytea);
+    
+    return result;
+}
+
+/*
+ * Reconstruct a delta column when we already have the physical tuple.
+ * 
+ * PERFORMANCE CRITICAL: This is the fast path for scan operations.
+ * 
+ * During sequential scans, we already have the physical tuple in memory
+ * from reading the page. The naive approach would be to:
+ *   1. Look up the tuple's sequence number
+ *   2. Call xpatch_reconstruct_column() 
+ *   3. Have it call xpatch_fetch_by_seq() to re-fetch the SAME tuple
+ *   4. Do an O(n) scan to find it again
+ * 
+ * This function bypasses that wasteful re-fetch by accepting the tuple
+ * we already have, providing a massive performance improvement for scans.
+ * With this optimization, count(*) on 10k rows: 11ms vs 135ms (12x faster).
+ */
+bytea *
+xpatch_reconstruct_column_with_tuple(Relation rel, XPatchConfig *config,
+                                     HeapTuple physical_tuple,
+                                     Datum group_value, int32 seq,
+                                     int delta_col_index)
+{
+    TupleDesc tupdesc;
+    AttrNumber attnum;
+    Form_pg_attribute attr;
+    Oid typid;
+    bool isnull;
+    Datum delta_datum;
+    bytea *delta_bytea;
+    bytea *result;
+    
+    tupdesc = RelationGetDescr(rel);
+    attnum = config->delta_attnums[delta_col_index];
+    attr = TupleDescAttr(tupdesc, attnum - 1);
+    typid = attr->atttypid;
+    
+    /* Check LRU cache first */
+    result = xpatch_cache_get(RelationGetRelid(rel), group_value, seq, attnum);
+    if (result != NULL)
+        return result;
+    
+    /* Get the delta/compressed value from the tuple we already have */
+    delta_datum = heap_getattr(physical_tuple, attnum, tupdesc, &isnull);
+    
+    if (isnull)
+        return NULL;
+    
+    /* Convert to bytea and reconstruct */
+    delta_bytea = datum_to_bytea(delta_datum, typid, false);
+    result = xpatch_reconstruct_from_delta(rel, config, group_value, seq,
+                                           delta_col_index, delta_bytea);
+    pfree(delta_bytea);
+    
+    return result;
+}
+
+/*
+ * Convert a logical tuple (from user INSERT) to physical format.
+ * This performs delta compression on configured columns.
+ */
+HeapTuple
+xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
+                           TupleTableSlot *slot)
+{
+    TupleDesc tupdesc;
+    int natts;
+    Datum *values;
+    bool *nulls;
+    HeapTuple result;
+    int32 new_seq;
+    bool is_keyframe;
+    Datum group_value = (Datum) 0;
+    bool isnull;
+    int i, j;
+    AttrNumber attnum;
+    bool is_delta_col;
+    int delta_col_index;
+    Form_pg_attribute attr;
+    Oid typid;
+    bytea *raw_content;
+    bytea *compressed;
+    bytea *best_delta;
+    Size best_size;
+    int best_tag;
+    int tag;
+    int32 base_seq;
+    bytea *base_content;
+    bytea *candidate;
+    Size candidate_size;
+    bytea *cache_content;
+    
+    tupdesc = RelationGetDescr(rel);
+    natts = tupdesc->natts;
+    
+    /* Get group value if configured */
+    if (config->group_by_attnum != InvalidAttrNumber)
+    {
+        group_value = slot_getattr(slot, config->group_by_attnum, &isnull);
+        if (isnull)
+            group_value = (Datum) 0;
+    }
+    
+    /* 
+     * Calculate sequence number using the seq cache.
+     * xpatch_seq_cache_next_seq() atomically increments and returns the new seq.
+     * If the group isn't in the cache, it returns 0 and we fall back to a scan.
+     */
+    new_seq = xpatch_seq_cache_next_seq(RelationGetRelid(rel), group_value);
+    
+    if (new_seq == 0)
+    {
+        /* Cache miss or cache full - fall back to scan (populates cache) */
+        new_seq = xpatch_get_max_seq(rel, config, group_value) + 1;
+        /* Update the cache with the new seq */
+        xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value, new_seq);
+    }
+    
+    /* Determine if this is a keyframe */
+    is_keyframe = (new_seq == 1) || (new_seq % config->keyframe_every == 1);
+    
+    elog(DEBUG1, "xpatch: inserting seq %d, is_keyframe=%d", new_seq, is_keyframe);
+    
+    /* Ensure slot is materialized */
+    slot_getallattrs(slot);
+    
+    /* Allocate arrays for physical tuple */
+    values = palloc(natts * sizeof(Datum));
+    nulls = palloc(natts * sizeof(bool));
+    
+    /* Copy all attributes, compressing delta columns */
+    for (i = 0; i < natts; i++)
+    {
+        attnum = i + 1;
+        is_delta_col = false;
+        delta_col_index = -1;
+        
+        /* Check if this is a delta column */
+        for (j = 0; j < config->num_delta_columns; j++)
+        {
+            if (config->delta_attnums[j] == attnum)
+            {
+                is_delta_col = true;
+                delta_col_index = j;
+                break;
+            }
+        }
+        
+        values[i] = slot_getattr(slot, attnum, &nulls[i]);
+        
+        if (is_delta_col && !nulls[i])
+        {
+            attr = TupleDescAttr(tupdesc, i);
+            typid = attr->atttypid;
+            
+            /* Convert to bytea */
+            raw_content = datum_to_bytea(values[i], typid, false);
+            
+            if (is_keyframe)
+            {
+                /* Keyframe: encode against empty base with reserved tag */
+                compressed = xpatch_encode_delta(XPATCH_KEYFRAME_TAG,
+                                                  NULL, 0,
+                                                  (uint8 *) VARDATA_ANY(raw_content),
+                                                  VARSIZE_ANY_EXHDR(raw_content),
+                                                  config->enable_zstd);
+                
+                elog(DEBUG1, "xpatch: keyframe col %d: raw=%zu compressed=%zu",
+                     delta_col_index,
+                     VARSIZE_ANY_EXHDR(raw_content),
+                     compressed ? VARSIZE_ANY_EXHDR(compressed) : 0);
+            }
+            else
+            {
+                /* Delta: try compress_depth previous versions and pick best
+                 * Tag convention: tag=N means delta against N rows back
+                 *   tag=1: previous row
+                 *   tag=2: 2 rows back
+                 *   etc.
+                 */
+                best_delta = NULL;
+                best_size = SIZE_MAX;
+                best_tag = 1;
+                
+                for (tag = 1; tag <= config->compress_depth; tag++)
+                {
+                    base_seq = new_seq - tag;
+                    
+                    if (base_seq < 1)
+                        break;
+                    
+                    /* Get base content (may trigger reconstruction) */
+                    base_content = xpatch_reconstruct_column(rel, config, group_value,
+                                                              base_seq, delta_col_index);
+                    
+                    /* Encode delta against this base */
+                    if (base_content == NULL)
+                    {
+                        candidate = xpatch_encode_delta(tag,
+                                                        NULL, 0,
+                                                        (uint8 *) VARDATA_ANY(raw_content),
+                                                        VARSIZE_ANY_EXHDR(raw_content),
+                                                        config->enable_zstd);
+                    }
+                    else
+                    {
+                        candidate = xpatch_encode_delta(tag,
+                                                        (uint8 *) VARDATA_ANY(base_content),
+                                                        VARSIZE_ANY_EXHDR(base_content),
+                                                        (uint8 *) VARDATA_ANY(raw_content),
+                                                        VARSIZE_ANY_EXHDR(raw_content),
+                                                        config->enable_zstd);
+                        pfree(base_content);
+                    }
+                    
+                    if (candidate != NULL)
+                    {
+                        candidate_size = VARSIZE(candidate);
+                        
+                        if (candidate_size < best_size)
+                        {
+                            if (best_delta != NULL)
+                                pfree(best_delta);
+                            best_delta = candidate;
+                            best_size = candidate_size;
+                            best_tag = tag;
+                        }
+                        else
+                        {
+                            pfree(candidate);
+                        }
+                    }
+                }
+                
+                compressed = best_delta;
+                
+                elog(DEBUG1, "xpatch: delta col %d: raw=%zu compressed=%zu tag=%d",
+                     delta_col_index,
+                     VARSIZE_ANY_EXHDR(raw_content),
+                     compressed ? VARSIZE_ANY_EXHDR(compressed) : 0,
+                     best_tag);
+            }
+            
+            if (compressed == NULL)
+            {
+                pfree(raw_content);
+                ereport(ERROR,
+                        (errcode(ERRCODE_INTERNAL_ERROR),
+                         errmsg("xpatch: compression failed for column %s",
+                                config->delta_columns[delta_col_index])));
+            }
+            
+            /* 
+             * Store compressed data directly as the column value.
+             * For TEXT/BYTEA/VARCHAR, the compressed bytea is compatible.
+             * For JSONB, we stored it as text, so the compressed data is 
+             * just compressed text bytes - we need to store as-is.
+             * The type conversion happens during reconstruction in physical_to_logical.
+             */
+            values[i] = PointerGetDatum(compressed);
+            
+            /* Cache the original content for future delta encoding */
+            cache_content = datum_to_bytea(slot_getattr(slot, attnum, &isnull), typid, false);
+            xpatch_cache_put(RelationGetRelid(rel), group_value, new_seq, attnum, cache_content);
+            pfree(cache_content);
+            
+            pfree(raw_content);
+        }
+    }
+    
+    /* Build the physical tuple */
+    result = heap_form_tuple(tupdesc, values, nulls);
+    
+    pfree(values);
+    pfree(nulls);
+    
+    return result;
+}
+
+/*
+ * Convert a physical tuple to logical format using direct buffer access.
+ * 
+ * This is the core reconstruction function called during scans and fetches.
+ * It takes a physical tuple (with delta-compressed columns) and reconstructs
+ * the full logical tuple (with decompressed content).
+ * 
+ * Process:
+ * 1. Extract all attributes from physical tuple into slot
+ * 2. Determine sequence number via TID->seq cache (O(1) hash lookup)
+ * 3. On cache miss: Scan group to build TID->seq mappings (O(n) but rare)
+ * 4. For each delta column: Reconstruct using fast path (tuple already available)
+ * 
+ * IMPORTANT: Uses xpatch_reconstruct_column_with_tuple() to avoid redundant
+ * tuple fetches. This optimization provides 12x speedup vs naive approach.
+ */
+void
+xpatch_physical_to_logical(Relation rel, XPatchConfig *config,
+                           HeapTuple physical_tuple,
+                           TupleTableSlot *slot)
+{
+    TupleDesc tupdesc;
+    int natts;
+    Datum group_value = (Datum) 0;
+    int32 seq = 0;
+    int i, j;
+    ItemPointer tid;
+    BlockNumber nblocks;
+    BlockNumber blkno;
+    Buffer buffer;
+    Page page;
+    OffsetNumber offnum;
+    OffsetNumber maxoff;
+    ItemId itemId;
+    HeapTupleData tuple;
+    int32 count = 0;
+    Datum tuple_group;
+    bool group_isnull;
+    Form_pg_attribute grp_attr;
+    AttrNumber attnum;
+    Form_pg_attribute attr;
+    Oid typid;
+    bytea *reconstructed;
+    bool found_tid = false;
+    
+    tupdesc = RelationGetDescr(rel);
+    natts = tupdesc->natts;
+    
+    /* Clear the slot first - this also resets tts_values/tts_isnull */
+    ExecClearTuple(slot);
+    
+    /* 
+     * Extract all attributes directly into slot's arrays.
+     * For pass-by-reference types, we must copy the datum because the source
+     * tuple may be freed after this function returns.
+     */
+    for (i = 0; i < natts; i++)
+    {
+        Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+        Datum val = heap_getattr(physical_tuple, i + 1, tupdesc, &slot->tts_isnull[i]);
+        
+        if (slot->tts_isnull[i])
+        {
+            slot->tts_values[i] = (Datum) 0;
+        }
+        else if (att->attbyval)
+        {
+            slot->tts_values[i] = val;
+        }
+        else
+        {
+            slot->tts_values[i] = datumCopy(val, att->attbyval, att->attlen);
+        }
+    }
+    
+    /* Get group value if configured */
+    if (config->group_by_attnum != InvalidAttrNumber)
+    {
+        group_value = slot->tts_values[config->group_by_attnum - 1];
+        if (slot->tts_isnull[config->group_by_attnum - 1])
+            group_value = (Datum) 0;
+    }
+    
+    /* Find this tuple's sequence number - try TID cache first */
+    tid = &physical_tuple->t_self;
+    
+    seq = xpatch_seq_cache_get_tid_seq(RelationGetRelid(rel), tid, &found_tid);
+    
+    if (!found_tid)
+    {
+        /*
+         * TID cache miss - scan the group to find seq and populate the cache.
+         * This is a one-time cost per group; subsequent reads will hit the cache.
+         */
+        nblocks = RelationGetNumberOfBlocks(rel);
+        count = 0;
+        
+        for (blkno = 0; blkno < nblocks; blkno++)
+        {
+            buffer = ReadBuffer(rel, blkno);
+            LockBuffer(buffer, BUFFER_LOCK_SHARE);
+            
+            page = BufferGetPage(buffer);
+            maxoff = PageGetMaxOffsetNumber(page);
+            
+            for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+            {
+                itemId = PageGetItemId(page, offnum);
+                
+                if (!ItemIdIsNormal(itemId))
+                    continue;
+                
+                tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+                tuple.t_len = ItemIdGetLength(itemId);
+                tuple.t_tableOid = RelationGetRelid(rel);
+                ItemPointerSet(&tuple.t_self, blkno, offnum);
+                
+                /* Check group if specified */
+                if (config->group_by_attnum != InvalidAttrNumber)
+                {
+                    tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
+                    
+                    if (!group_isnull)
+                    {
+                        grp_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+                        if (!datumIsEqual(group_value, tuple_group, grp_attr->attbyval, grp_attr->attlen))
+                            continue;
+                    }
+                }
+                
+                count++;
+                
+                /* Cache this TID -> seq mapping */
+                xpatch_seq_cache_set_tid_seq(RelationGetRelid(rel), &tuple.t_self, count);
+                
+                if (ItemPointerEquals(&tuple.t_self, tid))
+                {
+                    seq = count;
+                    found_tid = true;
+                    /* Don't break - continue to populate cache for rest of group */
+                }
+            }
+            
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
+        }
+        
+        /* If we still didn't find the tuple, use count as seq (shouldn't happen) */
+        if (seq == 0)
+            seq = count > 0 ? count : 1;
+    }
+
+    /* Reconstruct delta columns - replace compressed data with decompressed */
+    for (j = 0; j < config->num_delta_columns; j++)
+    {
+        attnum = config->delta_attnums[j];
+        i = attnum - 1;
+        
+        if (!slot->tts_isnull[i])
+        {
+            attr = TupleDescAttr(tupdesc, i);
+            typid = attr->atttypid;
+            
+            /* Reconstruct using the tuple we already have - avoids re-fetch! */
+            reconstructed = xpatch_reconstruct_column_with_tuple(rel, config,
+                                                                  physical_tuple,
+                                                                  group_value, seq, j);
+            
+            if (reconstructed != NULL)
+            {
+                /* Free old compressed value if pass-by-ref */
+                if (!attr->attbyval && DatumGetPointer(slot->tts_values[i]) != NULL)
+                    pfree(DatumGetPointer(slot->tts_values[i]));
+                
+                slot->tts_values[i] = bytea_to_datum(reconstructed, typid);
+            }
+            else
+            {
+                slot->tts_isnull[i] = true;
+            }
+        }
+    }
+    
+    /* Mark slot as containing a valid virtual tuple */
+    ExecStoreVirtualTuple(slot);
+}

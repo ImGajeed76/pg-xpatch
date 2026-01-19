@@ -1,0 +1,41 @@
+SET
+DROP EXTENSION
+CREATE EXTENSION
+SET
+  extname  | extversion 
+-----------+------------
+ pg_xpatch | 0.1.0
+(1 row)
+
+ amname | amtype 
+--------+--------
+ xpatch | t
+(1 row)
+
+ version_ok 
+------------
+ t
+(1 row)
+
+      proname       
+--------------------
+ xpatch_cache_stats
+ xpatch_inspect
+ xpatch_stats
+(3 rows)
+
+ nspname 
+---------
+ xpatch
+(1 row)
+
+  tablename   
+--------------
+ table_config
+(1 row)
+
+  proname  
+-----------
+ configure
+(1 row)
+

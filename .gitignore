@@ -1,0 +1,44 @@
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.bc
+
+# PGXS generated files
+results/
+regression.diffs
+regression.out
+
+# Library files (built from Rust)
+lib/libxpatch_c.a
+lib/xpatch.h
+
+# Rust build artifacts
+tmp/xpatch/target/
+
+# Keep ALL tmp files out of git
+tmp/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test output
+test/results/
+test/regression.diffs
+test/regression.out
+
+# Temporary files
+*.log
+*.tmp
+
+# Debian packages
+*.deb

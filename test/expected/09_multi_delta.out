@@ -1,0 +1,84 @@
+SET
+CREATE TABLE
+ configure 
+-----------
+ 
+(1 row)
+
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ doc_id | version |   title    |          content          |      summary       |            metadata             
+--------+---------+------------+---------------------------+--------------------+---------------------------------
+      1 |       1 | Document 1 | Initial content for doc 1 | Short summary v1   | {"tags": ["draft"]}
+      1 |       2 | Document 1 | Updated content for doc 1 | Short summary v1   | {"tags": ["draft"]}
+      1 |       3 | Document 1 | Updated content for doc 1 | Updated summary v3 | {"tags": ["draft", "reviewed"]}
+      1 |       4 | Document 1 | Final content for doc 1   | Final summary v4   | {"tags": ["published"]}
+      2 |       1 | Document 2 | Content A                 | Summary A          | {"author": "alice"}
+      2 |       2 | Document 2 | Content B                 | Summary B          | {"author": "bob"}
+(6 rows)
+
+ doc_id | version |          content          
+--------+---------+---------------------------
+      1 |       1 | Initial content for doc 1
+      1 |       2 | Updated content for doc 1
+      1 |       3 | Updated content for doc 1
+      1 |       4 | Final content for doc 1
+(4 rows)
+
+ doc_id | version |      summary       
+--------+---------+--------------------
+      1 |       1 | Short summary v1
+      1 |       2 | Short summary v1
+      1 |       3 | Updated summary v3
+      1 |       4 | Final summary v4
+(4 rows)
+
+ doc_id | version |            metadata             
+--------+---------+---------------------------------
+      1 |       1 | {"tags": ["draft"]}
+      1 |       2 | {"tags": ["draft"]}
+      1 |       3 | {"tags": ["draft", "reviewed"]}
+      1 |       4 | {"tags": ["published"]}
+(4 rows)
+
+ doc_id | version 
+--------+---------
+      1 |       4
+(1 row)
+
+ doc_id | version 
+--------+---------
+      1 |       3
+(1 row)
+
+ doc_id | version 
+--------+---------
+      1 |       4
+(1 row)
+
+ total_rows | keyframe_count | delta_count 
+------------+----------------+-------------
+          6 |              2 |           4
+(1 row)
+
+ version | seq | is_keyframe | column_name | delta_size_bytes 
+---------+-----+-------------+-------------+------------------
+       1 |   0 | t           | content     |               15
+       1 |   0 | t           | metadata    |               31
+       1 |   0 | t           | summary     |               18
+       2 |   1 | f           | content     |               12
+       2 |   1 | f           | metadata    |                2
+       2 |   1 | f           | summary     |                2
+       3 |   2 | f           | content     |                2
+       3 |   2 | f           | metadata    |               44
+       3 |   2 | f           | summary     |               15
+       4 |   3 | f           | content     |               10
+       4 |   3 | f           | metadata    |               36
+       4 |   3 | f           | summary     |               14
+(12 rows)
+
+DROP TABLE

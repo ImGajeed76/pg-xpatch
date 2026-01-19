@@ -1,0 +1,52 @@
+SET
+CREATE TABLE
+ configure 
+-----------
+ 
+(1 row)
+
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ id | version | data_len 
+----+---------+----------
+  1 |       1 |     1300
+  1 |       2 |     1312
+  1 |       3 |     1323
+(3 rows)
+
+ total_rows | is_compressed 
+------------+---------------
+          3 | t
+(1 row)
+
+CREATE TABLE
+ configure 
+-----------
+ 
+(1 row)
+
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ doc_id | version | name | count 
+--------+---------+------+-------
+      1 |       1 | Test | 1
+      1 |       2 | Test | 2
+      1 |       3 | Test | 3
+(3 rows)
+
+ version 
+---------
+       2
+(1 row)
+
+ version 
+---------
+       1
+       2
+       3
+(3 rows)
+
+DROP TABLE
+DROP TABLE

@@ -1,0 +1,76 @@
+SET
+CREATE TABLE
+ configure 
+-----------
+ 
+(1 row)
+
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ seq |          data_preview          
+-----+--------------------------------
+   1 | Version 1 - should be keyframe
+   2 | Version 2 - delta
+   3 | Version 3 - delta
+   4 | Version 4 - delta
+   5 | Version 5 - delta
+   6 | Version 6 - should be keyframe
+   7 | Version 7 - delta
+   8 | Version 8 - delta
+   9 | Version 9 - delta
+  10 | Version 10 - delta
+  11 | Version 11 - should be keyfram
+  12 | Version 12 - delta
+(12 rows)
+
+ total_rows 
+------------
+         12
+(1 row)
+
+ seq | is_keyframe | delta_size_bytes 
+-----+-------------+------------------
+   0 | t           |               21
+   1 | f           |               20
+   2 | f           |               20
+   3 | f           |               20
+   4 | f           |               20
+   5 | t           |               22
+   6 | f           |               20
+   7 | f           |               20
+   8 | f           |               20
+   9 | f           |               21
+  10 | t           |               22
+  11 | f           |               21
+(12 rows)
+
+CREATE TABLE
+ configure 
+-----------
+ 
+(1 row)
+
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ version |  content   
+---------+------------
+       1 | AAAAAAAAAA
+       2 | AAAAAAAAAB
+       3 | AAAAAAAAAC
+       4 | AAAAAAAAAB
+(4 rows)
+
+DROP TABLE
+DROP TABLE
