@@ -42,3 +42,20 @@ Initial release.
 - Append-only (no UPDATE support - by design)
 - Basic MVCC only
 - PostgreSQL 16 only
+
+## [0.1.1] - 2025-01-20
+
+### Fixed
+
+- **pg_dump/pg_restore data corruption**: Fixed critical bug where data was corrupted after pg_restore. The `xpatch.table_config` table data was not included in dumps, causing configuration loss and incorrect delta reconstruction.
+- **pg_dump/pg_restore crash**: Fixed segfault when accessing restored tables. The SPI result was invalidated during OID update, causing crash on first table access after restore.
+
+### Changed
+
+- Added `pg_extension_config_dump()` call to ensure `xpatch.table_config` data is included in database dumps
+- Existing installations can upgrade with: `ALTER EXTENSION pg_xpatch UPDATE TO '0.1.1';`
+
+### Documentation
+
+- Added comprehensive stress testing documentation (240 tests covering data types, transactions, concurrency, crash recovery, adversarial inputs, edge cases, and backup/restore)
+
