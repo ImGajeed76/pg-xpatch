@@ -38,7 +38,7 @@ jobs:
           mkdir -p dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64
           cp pg_xpatch.so dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/
           cp pg_xpatch.control dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/
-          cp sql/pg_xpatch--0.1.0.sql dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/
+          cp sql/*.sql dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/
           cp README.md dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/
           cat > dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/INSTALL.md << 'EOF'
           # Installation
@@ -46,7 +46,7 @@ jobs:
           1. Copy files to PostgreSQL directories:
              ```bash
              sudo cp pg_xpatch.so $(pg_config --pkglibdir)/
-             sudo cp pg_xpatch.control pg_xpatch--0.1.0.sql $(pg_config --sharedir)/extension/
+             sudo cp pg_xpatch.control sql/*.sql $(pg_config --sharedir)/extension/
              ```
           
           2. (Optional) Enable shared memory cache in postgresql.conf:
@@ -135,7 +135,7 @@ jobs:
             tar -xzf pg_xpatch-*.tar.gz
             cd pg_xpatch-*
             sudo cp pg_xpatch.so $(pg_config --pkglibdir)/
-            sudo cp pg_xpatch.control pg_xpatch--0.1.0.sql $(pg_config --sharedir)/extension/
+            sudo cp pg_xpatch.control *.sql $(pg_config --sharedir)/extension/
             # Restart PostgreSQL, then:
             psql -c "CREATE EXTENSION pg_xpatch;"
             ```
