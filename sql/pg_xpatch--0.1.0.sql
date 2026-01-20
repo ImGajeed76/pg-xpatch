@@ -29,6 +29,10 @@ CREATE TABLE xpatch.table_config (
 -- Index for lookup by name (used during restore)
 CREATE INDEX ON xpatch.table_config (schema_name, table_name);
 
+-- CRITICAL: Tell pg_dump to include this table's data in dumps
+-- Without this, xpatch table configurations are lost on pg_dump/pg_restore
+SELECT pg_extension_config_dump('xpatch.table_config', '');
+
 COMMENT ON TABLE xpatch.table_config IS 
     'Configuration for xpatch tables. Most tables work with auto-detection; explicit config is needed when: (1) you want a group_by column, (2) auto-detected order_by is wrong, or (3) you need custom keyframe/compression settings.';
 

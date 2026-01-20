@@ -243,6 +243,13 @@ read_config_from_catalog(Oid relid, XPatchConfig *config)
             
             if (ret == SPI_OK_SELECT && SPI_processed > 0)
             {
+                SPITupleTable *saved_tuptable;
+                uint64 saved_processed;
+                
+                /* Save the SELECT result before UPDATE invalidates SPI_tuptable */
+                saved_tuptable = SPI_tuptable;
+                saved_processed = SPI_processed;
+                
                 /* Found by name - update the relid in the config table for next time */
                 SPI_execute_with_args(
                     "UPDATE xpatch.table_config SET relid = $1 "
@@ -251,6 +258,10 @@ read_config_from_catalog(Oid relid, XPatchConfig *config)
                     "  JOIN pg_namespace n ON c.relnamespace = n.oid WHERE c.oid = $1"
                     ")",
                     1, argtypes, values, nulls, false, 0);
+                
+                /* Restore the SELECT result for processing below */
+                SPI_tuptable = saved_tuptable;
+                SPI_processed = saved_processed;
                 
                 elog(DEBUG1, "xpatch: found config by table name, updated OID");
             }
