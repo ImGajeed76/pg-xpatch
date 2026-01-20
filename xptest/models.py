@@ -60,7 +60,7 @@ class BenchmarkStats:
 @dataclass
 class RunConfig:
     """Configuration for a test run."""
-    max_workers: int = 4
+    max_workers: int = 32  # Support 32 parallel tests by default
     fail_fast: bool = False
     verbose: bool = False
     timeout_multiplier: float = 1.0

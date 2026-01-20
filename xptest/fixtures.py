@@ -3,6 +3,13 @@ Fixture system for xptest.
 
 Fixtures provide reusable setup/teardown logic at different scopes.
 They are injected into test functions based on parameter names.
+
+Thread Safety for 32+ Parallel Tests:
+- Each test gets its own FixtureManager instance with isolated state
+- The 'db' fixture creates a unique database per test (UUID-based naming)
+- Built-in fixtures are NOT in the global registry - they're created per-manager
+- Global fixture registry is only for user-defined fixtures
+- Session/module caches are protected by locks
 """
 
 import uuid
@@ -52,16 +59,22 @@ class FixtureValue:
     scope: Scope = Scope.FUNCTION
 
 
-# Global registry of fixture definitions
-_fixture_registry: Dict[str, FixtureDefinition] = {}
+# Global registry for USER-DEFINED fixtures only (not built-ins)
+# Protected by lock for thread-safe registration
+_user_fixture_registry: Dict[str, FixtureDefinition] = {}
+_user_fixture_registry_lock = threading.Lock()
 
-# Cache for session-scoped fixtures
+# Cache for session-scoped fixtures (shared across all tests)
 _session_cache: Dict[str, FixtureValue] = {}
 _session_cache_lock = threading.Lock()
 
 # Cache for module-scoped fixtures (keyed by module name)
 _module_cache: Dict[str, Dict[str, FixtureValue]] = {}
 _module_cache_lock = threading.Lock()
+
+# Flag to track if built-ins were initialized (for first FixtureManager only)
+_builtins_initialized = False
+_builtins_init_lock = threading.Lock()
 
 
 def pg_fixture(
@@ -77,17 +90,13 @@ def pg_fixture(
     
     Example:
         @pg_fixture(scope=Scope.FUNCTION)
-        def db():
-            # Setup
-            conn = create_test_database(f"xptest_{uuid.uuid4().hex[:8]}")
-            yield conn
-            # Teardown
-            conn.close()
-            drop_test_database(conn.db_name)
+        def my_fixture():
+            yield some_value
+            # cleanup
         
         @pg_fixture(scope=Scope.SESSION)
-        def container_name():
-            return "pg-xpatch-dev"
+        def shared_resource():
+            return expensive_setup()
     """
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         fixture_name = name or func.__name__
@@ -110,7 +119,9 @@ def pg_fixture(
             dependencies=dependencies,
         )
         
-        _fixture_registry[fixture_name] = fixture_def
+        # Thread-safe registration
+        with _user_fixture_registry_lock:
+            _user_fixture_registry[fixture_name] = fixture_def
         
         # Mark the function as a fixture for introspection
         func._pg_fixture_def = fixture_def  # type: ignore
@@ -121,22 +132,38 @@ def pg_fixture(
 
 
 def get_fixture_registry() -> Dict[str, FixtureDefinition]:
-    """Get the global fixture registry."""
-    return _fixture_registry
+    """Get the user-defined fixture registry (for introspection)."""
+    with _user_fixture_registry_lock:
+        return dict(_user_fixture_registry)
 
 
 def clear_fixture_registry() -> None:
     """Clear all fixture registrations and caches."""
-    _fixture_registry.clear()
-    _session_cache.clear()
-    _module_cache.clear()
+    global _builtins_initialized
+    with _user_fixture_registry_lock:
+        _user_fixture_registry.clear()
+    with _session_cache_lock:
+        _session_cache.clear()
+    with _module_cache_lock:
+        _module_cache.clear()
+    with _builtins_init_lock:
+        _builtins_initialized = False
 
 
 class FixtureManager:
     """
-    Manages fixture resolution and lifecycle for a test run.
+    Manages fixture resolution and lifecycle for a SINGLE TEST.
     
-    Handles dependency resolution, caching, and cleanup.
+    Thread Safety:
+    - Each test creates its own FixtureManager instance
+    - Built-in fixtures (db, xpatch_table) are created per-instance, not shared
+    - This ensures 32+ parallel tests can run without interference
+    - Each test gets its own database with a unique UUID-based name
+    
+    Handles:
+    - Dependency resolution
+    - Scope-based caching (function, module, session)
+    - Cleanup on test completion
     """
     
     def __init__(
@@ -153,60 +180,143 @@ class FixtureManager:
         self.password = password
         self.container = container
         
-        # Track active fixtures for cleanup
+        # Per-instance fixture registry (includes built-ins + user fixtures)
+        # This is the KEY change - each manager has its own registry copy
+        self._local_registry: Dict[str, FixtureDefinition] = {}
+        
+        # Track active fixtures for cleanup (per-instance, not shared)
         self._active_fixtures: Dict[str, FixtureValue] = {}
         self._cleanup_stack: List[Tuple[str, Callable[[], None]]] = []
         
-        # Register built-in fixtures
-        self._register_builtin_fixtures()
+        # Build local registry with built-in fixtures
+        self._init_local_registry()
     
-    def _register_builtin_fixtures(self) -> None:
-        """Register built-in fixtures if not already registered."""
-        if "db" not in _fixture_registry:
-            self._register_db_fixture()
-        if "xpatch_table" not in _fixture_registry:
-            self._register_xpatch_table_fixture()
-        if "container_name" not in _fixture_registry:
-            self._register_container_fixture()
+    def _init_local_registry(self) -> None:
+        """
+        Initialize local registry with built-in fixtures.
+        
+        Each FixtureManager gets its own copy of built-in fixture definitions
+        that capture THIS manager's connection settings.
+        """
+        # Copy user-defined fixtures
+        with _user_fixture_registry_lock:
+            self._local_registry = dict(_user_fixture_registry)
+        
+        # Add built-in fixtures that capture THIS manager's settings
+        self._register_db_fixture()
+        self._register_xpatch_table_fixture()
+        self._register_container_fixture()
     
     def _register_db_fixture(self) -> None:
-        """Register the built-in 'db' fixture."""
-        manager = self  # Capture for closure
+        """
+        Register the 'db' fixture for THIS manager instance.
+        
+        Creates a fresh database per test with:
+        - Unique UUID-based name (xptest_XXXXXXXX)
+        - Automatic cleanup after test
+        - pg_xpatch extension pre-installed
+        """
+        # Capture connection settings for this manager
+        host = self.host
+        port = self.port
+        user = self.user
+        password = self.password
         
         def db_fixture() -> Generator[DatabaseConnection, None, None]:
             """
-            Provides a fresh database connection for each test.
-            Database is created before test and dropped after.
+            Provides a fresh, isolated database connection for each test.
+            
+            The database is:
+            - Created with a unique name (UUID-based)
+            - Has pg_xpatch extension installed
+            - Dropped after test completion
             """
-            db_name = f"xptest_{uuid.uuid4().hex[:8]}"
+            # Generate unique database name for this test
+            db_name = f"xptest_{uuid.uuid4().hex[:12]}"
+            
             conn = create_test_database(
                 db_name,
-                host=manager.host,
-                port=manager.port,
-                user=manager.user,
-                password=manager.password,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
             )
             try:
                 yield conn
             finally:
-                conn.close()
-                drop_test_database(
-                    db_name,
-                    host=manager.host,
-                    port=manager.port,
-                    user=manager.user,
-                    password=manager.password,
-                )
+                # Always cleanup: close connection and drop database
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    drop_test_database(
+                        db_name,
+                        host=host,
+                        port=port,
+                        user=user,
+                        password=password,
+                    )
+                except Exception:
+                    pass  # Best effort cleanup
         
-        _fixture_registry["db"] = FixtureDefinition(
+        self._local_registry["db"] = FixtureDefinition(
             name="db",
             func=db_fixture,
             scope=Scope.FUNCTION,
             dependencies=[],
         )
+        
+        # Also register db2 fixture for multi-connection tests
+        self._register_db2_fixture()
+    
+    def _register_db2_fixture(self) -> None:
+        """
+        Register the 'db2' fixture for tests requiring multiple connections.
+        
+        This creates a second connection to the SAME database as 'db',
+        useful for testing transaction isolation and concurrency.
+        """
+        host = self.host
+        port = self.port
+        user = self.user
+        password = self.password
+        
+        def db2_fixture(db: DatabaseConnection) -> Generator[DatabaseConnection, None, None]:
+            """
+            Provides a second connection to the same database as 'db'.
+            
+            Useful for:
+            - Testing transaction isolation (visibility across connections)
+            - Testing concurrent operations
+            - Testing locking behavior
+            """
+            # Create a new connection to the SAME database
+            conn2 = DatabaseConnection(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                db_name=db.db_name,  # Same database as db
+            )
+            conn2.connect()
+            try:
+                yield conn2
+            finally:
+                try:
+                    conn2.close()
+                except Exception:
+                    pass
+        
+        self._local_registry["db2"] = FixtureDefinition(
+            name="db2",
+            func=db2_fixture,
+            scope=Scope.FUNCTION,
+            dependencies=["db"],  # Depends on db to get the database name
+        )
     
     def _register_xpatch_table_fixture(self) -> None:
-        """Register the built-in 'xpatch_table' fixture."""
+        """Register the 'xpatch_table' fixture."""
         def xpatch_table_fixture(db: DatabaseConnection) -> Generator[str, None, None]:
             """
             Creates a pre-configured xpatch table for testing.
@@ -232,7 +342,7 @@ class FixtureManager:
                 except Exception:
                     pass  # Ignore cleanup errors
         
-        _fixture_registry["xpatch_table"] = FixtureDefinition(
+        self._local_registry["xpatch_table"] = FixtureDefinition(
             name="xpatch_table",
             func=xpatch_table_fixture,
             scope=Scope.FUNCTION,
@@ -240,14 +350,14 @@ class FixtureManager:
         )
     
     def _register_container_fixture(self) -> None:
-        """Register the built-in 'container_name' fixture."""
-        manager = self
+        """Register the 'container_name' fixture."""
+        container = self.container
         
         def container_name_fixture() -> str:
             """Returns the docker container name."""
-            return manager.container
+            return container
         
-        _fixture_registry["container_name"] = FixtureDefinition(
+        self._local_registry["container_name"] = FixtureDefinition(
             name="container_name",
             func=container_name_fixture,
             scope=Scope.SESSION,
@@ -298,11 +408,11 @@ class FixtureManager:
         if name in resolved:
             return resolved[name]
         
-        # Get fixture definition
-        if name not in _fixture_registry:
+        # Get fixture definition from LOCAL registry (not global)
+        if name not in self._local_registry:
             raise ValueError(f"Unknown fixture: {name}")
         
-        fixture_def = _fixture_registry[name]
+        fixture_def = self._local_registry[name]
         
         # Check cache based on scope
         cached = self._get_cached_fixture(name, fixture_def.scope, module_name)
@@ -349,7 +459,8 @@ class FixtureManager:
                 module_fixtures = _module_cache.get(module_name, {})
                 return module_fixtures.get(name)
         
-        # FUNCTION and DATABASE scopes are not cached across calls
+        # FUNCTION and DATABASE scopes are NOT cached globally
+        # They're only tracked in this manager's _active_fixtures for cleanup
         return self._active_fixtures.get(name)
     
     def _cache_fixture(
@@ -364,16 +475,20 @@ class FixtureManager:
         
         if scope == Scope.SESSION:
             with _session_cache_lock:
-                _session_cache[name] = fixture_value
+                # Only cache if not already cached (first one wins)
+                if name not in _session_cache:
+                    _session_cache[name] = fixture_value
         
         elif scope == Scope.MODULE and module_name:
             with _module_cache_lock:
                 if module_name not in _module_cache:
                     _module_cache[module_name] = {}
-                _module_cache[module_name][name] = fixture_value
+                # Only cache if not already cached
+                if name not in _module_cache[module_name]:
+                    _module_cache[module_name][name] = fixture_value
         
         else:
-            # FUNCTION/DATABASE scope - track for cleanup
+            # FUNCTION/DATABASE scope - track for cleanup in THIS manager only
             self._active_fixtures[name] = fixture_value
             if fixture_value.cleanup:
                 self._cleanup_stack.append((name, fixture_value.cleanup))
@@ -396,32 +511,52 @@ class FixtureManager:
                 value = e.value
                 result = None
             
-            # Create cleanup function to run generator to completion
+            # Capture generator in closure for cleanup
+            gen = result
+            
             def cleanup():
-                if result is not None:
+                if gen is not None:
                     try:
-                        next(result)
+                        next(gen)
                     except StopIteration:
                         pass
+                    except Exception:
+                        pass  # Swallow cleanup errors
             
-            return FixtureValue(value=value, cleanup=cleanup if result else None)
+            return FixtureValue(value=value, cleanup=cleanup if gen else None)
         
         # Regular function return
         return FixtureValue(value=result, cleanup=None)
     
     def cleanup_function_fixtures(self) -> None:
-        """Clean up function-scoped fixtures (called after each test)."""
+        """
+        Clean up function-scoped fixtures (called after each test).
+        
+        Runs cleanups in reverse order (LIFO) to handle dependencies correctly.
+        """
+        errors = []
+        
         # Run cleanups in reverse order
         while self._cleanup_stack:
             name, cleanup_func = self._cleanup_stack.pop()
             try:
                 cleanup_func()
             except Exception as e:
-                # Log but don't fail on cleanup errors
-                print(f"Warning: Fixture cleanup error for '{name}': {e}")
+                # Collect errors but continue cleanup
+                errors.append(f"Fixture '{name}': {e}")
             
             # Remove from active fixtures
             self._active_fixtures.pop(name, None)
+        
+        # Clear any remaining active fixtures
+        self._active_fixtures.clear()
+        
+        # Log errors if any (but don't fail)
+        if errors:
+            import sys
+            print(f"Warning: {len(errors)} fixture cleanup error(s):", file=sys.stderr)
+            for err in errors:
+                print(f"  - {err}", file=sys.stderr)
     
     def cleanup_module_fixtures(self, module_name: str) -> None:
         """Clean up module-scoped fixtures (called after all tests in module)."""
@@ -433,7 +568,9 @@ class FixtureManager:
                 try:
                     fixture_value.cleanup()
                 except Exception as e:
-                    print(f"Warning: Module fixture cleanup error for '{name}': {e}")
+                    import sys
+                    print(f"Warning: Module fixture cleanup error for '{name}': {e}", 
+                          file=sys.stderr)
     
     @classmethod
     def cleanup_session_fixtures(cls) -> None:
@@ -447,7 +584,9 @@ class FixtureManager:
                 try:
                     fixture_value.cleanup()
                 except Exception as e:
-                    print(f"Warning: Session fixture cleanup error for '{name}': {e}")
+                    import sys
+                    print(f"Warning: Session fixture cleanup error for '{name}': {e}",
+                          file=sys.stderr)
 
 
 def resolve_fixtures_for_test(
@@ -460,7 +599,7 @@ def resolve_fixtures_for_test(
     
     Args:
         func: Test function to resolve fixtures for
-        manager: FixtureManager instance
+        manager: FixtureManager instance (should be unique per test)
         module_name: Module name for module-scoped fixtures
     
     Returns:

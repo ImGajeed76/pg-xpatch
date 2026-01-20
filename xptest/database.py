@@ -81,7 +81,8 @@ class DatabaseConnection:
         Execute SQL statement(s) without returning results.
         
         Handles multi-statement SQL by splitting on semicolons when needed.
-        Auto-commits after successful execution.
+        Auto-commits after successful execution UNLESS in explicit transaction
+        (i.e., after BEGIN or inside a savepoint).
         """
         if not self._conn:
             raise DatabaseError("Not connected to database")
@@ -92,7 +93,22 @@ class DatabaseConnection:
                     cur.execute(sql, params)
                 else:
                     cur.execute(sql)
-            self._conn.commit()
+            # Only auto-commit if not in an explicit transaction
+            if not self._in_transaction():
+                self._conn.commit()
+    
+    def _in_transaction(self) -> bool:
+        """Check if we're inside an explicit transaction (BEGIN/SAVEPOINT)."""
+        if not self._conn:
+            return False
+        # psycopg3: check transaction status
+        # IDLE = no transaction, INTRANS = in transaction, INERROR = in failed transaction
+        try:
+            status = self._conn.info.transaction_status
+            # 0 = IDLE, 1 = ACTIVE, 2 = INTRANS, 3 = INERROR, 4 = UNKNOWN
+            return status in (1, 2, 3)  # ACTIVE, INTRANS, or INERROR
+        except Exception:
+            return False
     
     def execute_many(self, sql: str, params_seq: List[tuple]) -> None:
         """Execute SQL with multiple parameter sets."""
@@ -124,7 +140,8 @@ class DatabaseConnection:
                 else:
                     cur.execute(sql)
                 result = cur.fetchone()
-            self._conn.commit()
+            if not self._in_transaction():
+                self._conn.commit()
         return result
     
     def fetchall(
@@ -147,7 +164,8 @@ class DatabaseConnection:
                 else:
                     cur.execute(sql)
                 result = cur.fetchall()
-            self._conn.commit()
+            if not self._in_transaction():
+                self._conn.commit()
         return result
     
     def fetchval(

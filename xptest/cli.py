@@ -100,9 +100,9 @@ if CLICK_AVAILABLE:
     )
     @click.option(
         "-j", "--jobs",
-        default=4,
+        default=32,
         type=int,
-        help="Number of parallel workers (default: 4)",
+        help="Number of parallel workers (default: 32)",
     )
     @click.option(
         "--fail-fast",
