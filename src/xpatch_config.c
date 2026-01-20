@@ -141,6 +141,7 @@ auto_detect_order_by(Relation rel, XPatchConfig *config)
 
 /*
  * Auto-detect delta_columns: all BYTEA, TEXT, VARCHAR, JSON, JSONB columns
+ * EXCEPT for the group_by and order_by columns which should not be delta-compressed.
  */
 static void
 auto_detect_delta_columns(Relation rel, XPatchConfig *config)
@@ -149,6 +150,7 @@ auto_detect_delta_columns(Relation rel, XPatchConfig *config)
     int natts = tupdesc->natts;
     int capacity = 8;
     int count = 0;
+    const char *colname;
 
     config->delta_columns = MemoryContextAlloc(TopMemoryContext, capacity * sizeof(char *));
     config->delta_attnums = MemoryContextAlloc(TopMemoryContext, capacity * sizeof(AttrNumber));
@@ -159,6 +161,20 @@ auto_detect_delta_columns(Relation rel, XPatchConfig *config)
         Oid typid;
 
         if (attr->attisdropped)
+            continue;
+
+        colname = NameStr(attr->attname);
+
+        /* Skip the group_by column - it's used for grouping, not delta compression */
+        if (config->group_by != NULL && strcmp(colname, config->group_by) == 0)
+            continue;
+
+        /* Skip the order_by column - it's used for ordering, not delta compression */
+        if (config->order_by != NULL && strcmp(colname, config->order_by) == 0)
+            continue;
+
+        /* Skip the internal _xp_seq column */
+        if (strcmp(colname, "_xp_seq") == 0)
             continue;
 
         typid = attr->atttypid;
@@ -173,7 +189,7 @@ auto_detect_delta_columns(Relation rel, XPatchConfig *config)
                 config->delta_attnums = repalloc(config->delta_attnums,
                                                  capacity * sizeof(AttrNumber));
             }
-            config->delta_columns[count] = MemoryContextStrdup(TopMemoryContext, NameStr(attr->attname));
+            config->delta_columns[count] = MemoryContextStrdup(TopMemoryContext, colname);
             config->delta_attnums[count] = attr->attnum;
             count++;
         }

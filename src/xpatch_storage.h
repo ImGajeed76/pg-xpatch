@@ -99,4 +99,14 @@ bytea *xpatch_reconstruct_column_with_tuple(Relation rel, XPatchConfig *config,
  */
 Datum bytea_to_datum(bytea *data, Oid typid);
 
+/*
+ * Compare two Datums for equality using the type's equality operator.
+ * This handles collation-sensitive types like TEXT correctly.
+ * typid is the OID of the type being compared.
+ * collation is the collation OID (use DEFAULT_COLLATION_OID if unknown).
+ *
+ * Returns true if values are equal, false otherwise.
+ */
+bool xpatch_datums_equal(Datum d1, Datum d2, Oid typid, Oid collation);
+
 #endif /* XPATCH_STORAGE_H */

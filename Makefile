@@ -49,7 +49,8 @@ endif
 SHLIB_LINK_INTERNAL = $(BLAKE3_ASM_OBJS)
 
 # Extension data files
-DATA = sql/pg_xpatch--0.1.0.sql sql/pg_xpatch--0.1.1.sql sql/pg_xpatch--0.1.0--0.1.1.sql
+DATA = sql/pg_xpatch--0.1.0.sql sql/pg_xpatch--0.1.1.sql sql/pg_xpatch--0.2.0.sql \
+       sql/pg_xpatch--0.1.0--0.1.1.sql sql/pg_xpatch--0.1.1--0.2.0.sql
 EXTRA_CLEAN = lib/libxpatch_c.a lib/xpatch.h lib/blake3/*.o
 
 # Regression tests

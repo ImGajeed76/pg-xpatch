@@ -43,6 +43,31 @@ Initial release.
 - Basic MVCC only
 - PostgreSQL 16 only
 
+## [0.2.0] - 2025-01-20
+
+### Added
+
+- **TEXT/VARCHAR group column support**: Tables can now use TEXT or VARCHAR columns as the `group_by` column, not just INT/BIGINT. This enables grouping by string identifiers like UUIDs, slugs, or names.
+- **`xpatch.physical()` function**: New function to access raw physical delta storage, returning delta bytes and metadata for debugging and advanced use cases.
+- **Comprehensive TEXT group tests**: Added 10 new stress tests specifically for TEXT group column functionality.
+
+### Fixed
+
+- **TEXT group column crash**: Fixed critical bug where tables with TEXT group columns would crash on SELECT. The auto-detection was incorrectly including the group_by column as a delta column, causing corruption.
+- **Datum comparison for varlena types**: Fixed incorrect comparison of TEXT/VARCHAR values in group matching. Now uses `TypeCacheEntry` and `FunctionCall2Coll` for proper collation-aware comparison instead of simple pointer comparison.
+- **`xpatch_inspect()` with TEXT groups**: Fixed group filtering to work correctly with TEXT/VARCHAR group values.
+
+### Changed
+
+- `auto_detect_delta_columns()` now excludes `group_by`, `order_by`, and `_xp_seq` columns from delta compression
+- Added `xpatch_datums_equal()` helper function for type-safe datum comparison across the codebase
+- Existing installations can upgrade with: `ALTER EXTENSION pg_xpatch UPDATE TO '0.2.0';`
+
+### Technical Details
+
+- Modified files: `xpatch_config.c`, `xpatch_storage.c`, `xpatch_storage.h`, `xpatch_tam.c`, `xpatch_utils.c`
+- All 337 tests pass (42 functional + 49 stress + 101 comprehensive + 54 adversarial + 57 edge case + 18 final + 10 concurrency + 6 concurrent)
+
 ## [0.1.1] - 2025-01-20
 
 ### Fixed

@@ -1,5 +1,5 @@
 -- pg_xpatch extension SQL definitions
--- Version 0.1.1
+-- Version 0.2.0
 
 -- Complain if script is sourced in psql rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_xpatch" to load this file. \quit

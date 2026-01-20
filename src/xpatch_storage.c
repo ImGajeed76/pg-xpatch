@@ -57,6 +57,40 @@ static bytea *datum_to_bytea(Datum value, Oid typid, bool isnull);
 static Oid get_group_column_typid(Relation rel, XPatchConfig *config);
 
 /*
+ * Compare two Datums for equality using the type's equality operator.
+ * This handles collation-sensitive types like TEXT correctly.
+ *
+ * Uses TypeCacheEntry to get the proper equality function for the type,
+ * and FunctionCall2Coll to invoke it with the correct collation.
+ *
+ * This is the correct way to compare datums - datumIsEqual only works
+ * for pass-by-value types or simple byte-wise comparison of fixed-length
+ * types, and fails for varlena types like TEXT where it just compares pointers.
+ */
+bool
+xpatch_datums_equal(Datum d1, Datum d2, Oid typid, Oid collation)
+{
+    TypeCacheEntry *typcache;
+
+    /* Get equality function from type cache */
+    typcache = lookup_type_cache(typid, TYPECACHE_EQ_OPR_FINFO);
+
+    if (!OidIsValid(typcache->eq_opr_finfo.fn_oid))
+    {
+        /* Fallback for types without equality operator - byte-wise compare */
+        int16 typlen;
+        bool typbyval;
+
+        get_typlenbyval(typid, &typlen, &typbyval);
+        return datumIsEqual(d1, d2, typbyval, typlen);
+    }
+
+    /* Use the type's equality function with proper collation */
+    return DatumGetBool(FunctionCall2Coll(&typcache->eq_opr_finfo,
+                                          collation, d1, d2));
+}
+
+/*
  * Convert a Datum of various varlena types to bytea for compression.
  * 
  * All supported delta column types (TEXT, VARCHAR, BYTEA, JSON, JSONB) are
@@ -290,7 +324,7 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
                 if (!group_isnull)
                 {
                     attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
-                    if (!datumIsEqual(group_value, tuple_group, attr->attbyval, attr->attlen))
+                    if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
                         continue;
                 }
             }
@@ -408,7 +442,7 @@ xpatch_get_max_version(Relation rel, XPatchConfig *config,
                     continue;
                 
                 attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
-                if (!datumIsEqual(group_value, tuple_group, attr->attbyval, attr->attlen))
+                if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
                     continue;
             }
             
@@ -523,7 +557,7 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
                     continue;
                 
                 attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
-                if (!datumIsEqual(group_value, tuple_group, attr->attbyval, attr->attlen))
+                if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
                     continue;
             }
             

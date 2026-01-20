@@ -63,6 +63,7 @@
 #include "utils/datum.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/typcache.h"
 
 /*
  * compute_infobits - compute infomask bits for WAL records
@@ -1246,7 +1247,7 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
                     continue;
                 
                 attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
-                if (!datumIsEqual(group_value, tuple_group, attr->attbyval, attr->attlen))
+                if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
                     continue;
             }
             
@@ -1318,7 +1319,7 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
                     continue;
                 
                 attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
-                if (!datumIsEqual(group_value, tuple_group, attr->attbyval, attr->attlen))
+                if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
                     continue;
             }
             

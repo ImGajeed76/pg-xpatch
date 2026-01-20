@@ -32,12 +32,21 @@
 #include "xpatch_compress.h"
 #include "xpatch_storage.h"
 
+#include "access/amapi.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_collation_d.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
+#include "utils/typcache.h"
+
+/* Forward declaration for datums_equal helper */
+static bool datums_equal(Datum d1, Datum d2, FmgrInfo *eq_finfo, Oid collation);
 
 /* Structure for tracking sequence per group in xpatch_stats */
 typedef struct {
@@ -295,6 +304,11 @@ typedef struct XPatchInspectContext
     OffsetNumber    current_offset;
     int             current_delta_col; /* Which delta column in current row */
     int64           current_seq;       /* Sequence counter */
+    /* Group comparison support for TEXT and other types */
+    Oid             group_type;        /* Group column type OID */
+    Oid             group_collation;   /* Group column collation */
+    FmgrInfo        group_eq_finfo;    /* Equality function info */
+    bool            group_eq_valid;    /* Is group_eq_finfo initialized? */
 } XPatchInspectContext;
 
 /*
@@ -350,6 +364,29 @@ xpatch_inspect(PG_FUNCTION_ARGS)
             ctx->filter_group = PG_GETARG_DATUM(1);
         }
 
+        /* Cache group column type, collation, and equality function */
+        ctx->group_eq_valid = false;
+        ctx->group_collation = DEFAULT_COLLATION_OID;
+        if (ctx->config->group_by_attnum != InvalidAttrNumber)
+        {
+            TupleDesc rel_tupdesc = RelationGetDescr(ctx->rel);
+            Form_pg_attribute attr = TupleDescAttr(rel_tupdesc,
+                                                   ctx->config->group_by_attnum - 1);
+            TypeCacheEntry *typcache;
+
+            ctx->group_type = attr->atttypid;
+            ctx->group_collation = attr->attcollation;
+
+            /* Get equality function from type cache */
+            typcache = lookup_type_cache(ctx->group_type, TYPECACHE_EQ_OPR_FINFO);
+            if (OidIsValid(typcache->eq_opr_finfo.fn_oid))
+            {
+                fmgr_info_copy(&ctx->group_eq_finfo, &typcache->eq_opr_finfo,
+                               funcctx->multi_call_memory_ctx);
+                ctx->group_eq_valid = true;
+            }
+        }
+
         ctx->current_block = 0;
         ctx->current_offset = FirstOffsetNumber;
         ctx->current_delta_col = 0;
@@ -403,9 +440,13 @@ xpatch_inspect(PG_FUNCTION_ARGS)
                 group_val = heap_getattr(&tuple, ctx->config->group_by_attnum,
                                          rel_tupdesc, &is_null);
 
-                /* Simple comparison - works for integer types */
-                if (is_null || group_val != ctx->filter_group)
+                if (is_null)
                     match_group = false;
+                else if (ctx->group_eq_valid)
+                    match_group = datums_equal(group_val, ctx->filter_group,
+                                               &ctx->group_eq_finfo, ctx->group_collation);
+                else
+                    match_group = (group_val == ctx->filter_group);  /* Fallback for simple types */
             }
 
             if (match_group)
@@ -540,4 +581,367 @@ xpatch_invalidate_config_fn(PG_FUNCTION_ARGS)
     xpatch_invalidate_config(relid);
     
     PG_RETURN_VOID();
+}
+
+/*
+ * xpatch_physical context - stored across SRF calls
+ */
+typedef struct XPatchPhysicalContext
+{
+    Relation        rel;
+    XPatchConfig   *config;
+    TupleDesc       rel_tupdesc;
+    Oid             group_type;        /* Type OID of group_by column */
+    Oid             group_collation;   /* Collation for group_by column */
+    FmgrInfo        group_eq_finfo;    /* Equality function for group type */
+    bool            group_eq_valid;    /* True if group_eq_finfo is initialized */
+    Datum           filter_group;      /* Group value to filter by */
+    bool            filter_group_null; /* True if filtering all groups */
+    int32           from_seq;          /* Filter: return rows with seq > from_seq */
+    bool            from_seq_null;     /* True if no seq filtering */
+    BlockNumber     current_block;
+    OffsetNumber    current_offset;
+    int             current_delta_col;
+    int64           current_seq;       /* 0-based sequence counter */
+} XPatchPhysicalContext;
+
+/*
+ * Compare two Datums for equality using the type's equality operator.
+ * Uses default collation for collation-sensitive types like TEXT.
+ */
+static bool
+datums_equal(Datum d1, Datum d2, FmgrInfo *eq_finfo, Oid collation)
+{
+    return DatumGetBool(FunctionCall2Coll(eq_finfo, collation, d1, d2));
+}
+
+/*
+ * Convert a Datum to TEXT representation based on its type.
+ * Returns a palloc'd text datum.
+ */
+static Datum
+datum_to_text(Datum value, Oid typid)
+{
+    Oid         typoutput;
+    bool        typIsVarlena;
+    char       *str;
+
+    getTypeOutputInfo(typid, &typoutput, &typIsVarlena);
+    str = OidOutputFunctionCall(typoutput, value);
+    return CStringGetTextDatum(str);
+}
+
+/*
+ * Convert a Datum to int64 for numeric types.
+ * Handles INT2, INT4, INT8.
+ */
+static int64
+datum_to_int64(Datum value, Oid typid)
+{
+    switch (typid)
+    {
+        case INT2OID:
+            return (int64) DatumGetInt16(value);
+        case INT4OID:
+            return (int64) DatumGetInt32(value);
+        case INT8OID:
+            return DatumGetInt64(value);
+        default:
+            /* For other types, try int64 and hope for the best */
+            return DatumGetInt64(value);
+    }
+}
+
+/*
+ * xpatch_physical(regclass, anyelement, int) - Access raw physical delta storage
+ *
+ * Returns raw delta bytes and metadata for each row/column in a table.
+ * This function directly reads physical storage pages to access the
+ * compressed delta data before TAM reconstruction.
+ *
+ * Parameters:
+ *   tbl          - Table to inspect (must use xpatch access method)
+ *   group_filter - Filter by specific group value, or NULL for all groups
+ *   from_seq     - Only return rows with seq > from_seq, or NULL for all
+ *
+ * Returns a set of rows with:
+ *   group_value  - Group column value as TEXT (NULL if no grouping)
+ *   version      - Order-by column value as BIGINT
+ *   seq          - 1-based sequence number within group
+ *   is_keyframe  - True if this row stores a keyframe (tag=0)
+ *   tag          - Delta tag (0=keyframe, 1+=reference to N rows back)
+ *   delta_column - Name of the delta column
+ *   delta_bytes  - Raw compressed delta data
+ *   delta_size   - Size of delta_bytes in bytes
+ */
+PG_FUNCTION_INFO_V1(xpatch_physical);
+Datum
+xpatch_physical(PG_FUNCTION_ARGS)
+{
+    FuncCallContext *funcctx;
+    XPatchPhysicalContext *ctx;
+    MemoryContext oldcontext;
+
+    if (SRF_IS_FIRSTCALL())
+    {
+        Oid         relid = PG_GETARG_OID(0);
+        TupleDesc   tupdesc;
+        Oid         amoid;
+
+        funcctx = SRF_FIRSTCALL_INIT();
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        /* Build result tuple descriptor */
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("function returning record called in context "
+                            "that cannot accept type record")));
+
+        funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+        ctx = (XPatchPhysicalContext *) palloc0(sizeof(XPatchPhysicalContext));
+
+        /* Open relation and verify it uses xpatch access method */
+        ctx->rel = table_open(relid, AccessShareLock);
+
+        amoid = ctx->rel->rd_rel->relam;
+        if (amoid == InvalidOid || strcmp(get_am_name(amoid), "xpatch") != 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                     errmsg("table \"%s\" does not use the xpatch access method",
+                            RelationGetRelationName(ctx->rel))));
+
+        ctx->config = xpatch_get_config(ctx->rel);
+        ctx->rel_tupdesc = RelationGetDescr(ctx->rel);
+
+        /* Cache group column type, collation, and equality function */
+        ctx->group_eq_valid = false;
+        ctx->group_collation = DEFAULT_COLLATION_OID;
+        if (ctx->config->group_by_attnum != InvalidAttrNumber)
+        {
+            Form_pg_attribute attr = TupleDescAttr(ctx->rel_tupdesc,
+                                                   ctx->config->group_by_attnum - 1);
+            TypeCacheEntry *typcache;
+
+            ctx->group_type = attr->atttypid;
+            ctx->group_collation = attr->attcollation;
+
+            /* Get equality function from type cache */
+            typcache = lookup_type_cache(ctx->group_type, TYPECACHE_EQ_OPR_FINFO);
+            if (OidIsValid(typcache->eq_opr_finfo.fn_oid))
+            {
+                fmgr_info_copy(&ctx->group_eq_finfo, &typcache->eq_opr_finfo,
+                               funcctx->multi_call_memory_ctx);
+                ctx->group_eq_valid = true;
+            }
+        }
+        else
+        {
+            ctx->group_type = InvalidOid;
+        }
+
+        /* Get group filter value */
+        if (PG_ARGISNULL(1))
+        {
+            ctx->filter_group_null = true;
+            ctx->filter_group = (Datum) 0;
+        }
+        else
+        {
+            ctx->filter_group_null = false;
+            ctx->filter_group = PG_GETARG_DATUM(1);
+        }
+
+        /* Get from_seq filter */
+        if (PG_ARGISNULL(2))
+        {
+            ctx->from_seq_null = true;
+            ctx->from_seq = 0;
+        }
+        else
+        {
+            ctx->from_seq_null = false;
+            ctx->from_seq = PG_GETARG_INT32(2);
+        }
+
+        ctx->current_block = 0;
+        ctx->current_offset = FirstOffsetNumber;
+        ctx->current_delta_col = 0;
+        ctx->current_seq = 0;
+
+        funcctx->user_fctx = ctx;
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    ctx = (XPatchPhysicalContext *) funcctx->user_fctx;
+
+    /* Scan pages looking for matching rows */
+    while (ctx->current_block < RelationGetNumberOfBlocks(ctx->rel))
+    {
+        Buffer          buffer;
+        Page            page;
+        OffsetNumber    maxoff;
+
+        buffer = ReadBuffer(ctx->rel, ctx->current_block);
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buffer);
+        maxoff = PageGetMaxOffsetNumber(page);
+
+        while (ctx->current_offset <= maxoff)
+        {
+            ItemId          itemId;
+            HeapTupleData   tuple;
+            bool            is_null;
+            Datum           group_val = (Datum) 0;
+            bool            match_group = true;
+
+            itemId = PageGetItemId(page, ctx->current_offset);
+            if (!ItemIdIsNormal(itemId))
+            {
+                ctx->current_offset++;
+                continue;
+            }
+
+            tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+            tuple.t_len = ItemIdGetLength(itemId);
+            tuple.t_tableOid = RelationGetRelid(ctx->rel);
+
+            /* Apply group filter if specified */
+            if (!ctx->filter_group_null && ctx->config->group_by_attnum != InvalidAttrNumber)
+            {
+                group_val = heap_getattr(&tuple, ctx->config->group_by_attnum,
+                                         ctx->rel_tupdesc, &is_null);
+                if (is_null)
+                    match_group = false;
+                else if (ctx->group_eq_valid)
+                    match_group = datums_equal(group_val, ctx->filter_group,
+                                               &ctx->group_eq_finfo, ctx->group_collation);
+                else
+                    match_group = (group_val == ctx->filter_group);  /* Fallback for simple types */
+            }
+
+            if (match_group)
+            {
+                /* All declarations at top of block for C90 compatibility */
+                Datum       group_text_datum = (Datum) 0;
+                bool        group_is_null = true;
+                Datum       version_datum;
+                Oid         version_type;
+                int64       version;
+                int32       output_seq;
+
+                /* Convert group value to text for output */
+                if (ctx->config->group_by_attnum != InvalidAttrNumber)
+                {
+                    group_val = heap_getattr(&tuple, ctx->config->group_by_attnum,
+                                             ctx->rel_tupdesc, &is_null);
+                    if (!is_null)
+                    {
+                        group_text_datum = datum_to_text(group_val, ctx->group_type);
+                        group_is_null = false;
+                    }
+                }
+
+                /* Get version (order_by) value */
+                {
+                    Form_pg_attribute attr = TupleDescAttr(ctx->rel_tupdesc,
+                                                           ctx->config->order_by_attnum - 1);
+                    version_type = attr->atttypid;
+                }
+                version_datum = heap_getattr(&tuple, ctx->config->order_by_attnum,
+                                             ctx->rel_tupdesc, &is_null);
+                version = is_null ? 0 : datum_to_int64(version_datum, version_type);
+
+                /* Apply seq filter (1-based comparison) */
+                output_seq = ctx->current_seq + 1;
+                if (!ctx->from_seq_null && output_seq <= ctx->from_seq)
+                {
+                    ctx->current_offset++;
+                    ctx->current_delta_col = 0;
+                    ctx->current_seq++;
+                    continue;
+                }
+
+                /* Iterate through delta columns */
+                while (ctx->current_delta_col < ctx->config->num_delta_columns)
+                {
+                    AttrNumber  attnum;
+                    Datum       col_datum;
+
+                    attnum = ctx->config->delta_attnums[ctx->current_delta_col];
+                    col_datum = heap_getattr(&tuple, attnum, ctx->rel_tupdesc, &is_null);
+
+                    if (!is_null)
+                    {
+                        bytea      *data;
+                        int         data_len;
+                        size_t      tag = 0;
+                        bool        is_keyframe = false;
+                        Datum       values[8];
+                        bool        nulls[8];
+                        HeapTuple   result_tuple;
+
+                        data = DatumGetByteaP(col_datum);
+                        data_len = VARSIZE(data) - VARHDRSZ;
+
+                        /* Extract tag from delta header */
+                        if (data_len > 0)
+                        {
+                            const char *err;
+                            err = xpatch_get_delta_tag((uint8 *) VARDATA(data), data_len, &tag);
+                            if (err == NULL)
+                                is_keyframe = (tag == XPATCH_KEYFRAME_TAG);
+                        }
+
+                        /* Build result tuple */
+                        memset(nulls, 0, sizeof(nulls));
+
+                        if (group_is_null)
+                        {
+                            nulls[0] = true;
+                            values[0] = (Datum) 0;
+                        }
+                        else
+                        {
+                            values[0] = group_text_datum;
+                        }
+
+                        values[1] = Int64GetDatum(version);
+                        values[2] = Int32GetDatum(output_seq);
+                        values[3] = BoolGetDatum(is_keyframe);
+                        values[4] = Int32GetDatum((int32) tag);
+                        values[5] = CStringGetTextDatum(ctx->config->delta_columns[ctx->current_delta_col]);
+                        values[6] = PointerGetDatum(data);
+                        values[7] = Int32GetDatum(data_len);
+
+                        result_tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+                        ctx->current_delta_col++;
+
+                        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+                        ReleaseBuffer(buffer);
+
+                        SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(result_tuple));
+                    }
+
+                    ctx->current_delta_col++;
+                }
+
+                ctx->current_seq++;
+            }
+
+            ctx->current_offset++;
+            ctx->current_delta_col = 0;
+        }
+
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+
+        ctx->current_block++;
+        ctx->current_offset = FirstOffsetNumber;
+    }
+
+    table_close(ctx->rel, AccessShareLock);
+    SRF_RETURN_DONE(funcctx);
 }
