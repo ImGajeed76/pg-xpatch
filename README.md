@@ -218,8 +218,8 @@ docker exec -u postgres pg-xpatch-dev psql -c "CREATE EXTENSION pg_xpatch;"
 
 For most tables, xpatch auto-detects the configuration:
 - **group_by**: Not set (whole table is one version chain) or explicitly configured
-- **order_by**: Last INT/BIGINT column before `_xp_seq`
-- **delta_columns**: All TEXT, BYTEA, JSON, JSONB columns
+- **order_by**: Last INT/SMALLINT/BIGINT/TIMESTAMP/TIMESTAMPTZ column before `_xp_seq`
+- **delta_columns**: All TEXT, VARCHAR, BYTEA, JSON, JSONB columns
 
 ### Explicit Configuration
 
@@ -320,15 +320,9 @@ The test suite covers:
 
 These issues exist in the current implementation and may be addressed in future versions:
 
-- **WAL critical sections**: INSERT and DELETE WAL logging don't use `START_CRIT_SECTION()`/`END_CRIT_SECTION()`. In rare crash scenarios during these operations, data corruption is theoretically possible. For most use cases (non-critical data, infrequent crashes), this is acceptable.
+- **MVCC for reconstructed tuples**: The `xpatch_tuple_satisfies_snapshot()` function uses proper MVCC checks for buffer-backed tuples, but trusts that virtual tuples (created during delta reconstruction) were built from visible source tuples. This is correct behavior but means visibility is checked at reconstruction time, not query time.
 
-- **MVCC visibility simplified**: The `xpatch_tuple_satisfies_snapshot()` function currently returns true for all tuples. This means concurrent transactions may see uncommitted data in rare edge cases. Full MVCC semantics would require significant additional complexity.
-
-- **Hash table after eviction**: The LRU cache uses linear probing for collision resolution. When entries are evicted, this can theoretically break probe chains, causing cache misses for entries that exist. In practice, the cache is effective enough that this rarely impacts performance.
-
-- **SPI connection error handling**: The config loading code uses SPI without full PG_TRY/PG_CATCH wrapping. An error during config load could theoretically leave SPI in an inconsistent state, though this would only affect the current transaction.
-
-These issues are documented for transparency. For typical workloads (versioned document storage, audit logs), they don't cause problems. If you're using pg-xpatch in a high-concurrency, mission-critical environment, be aware of these limitations.
+These issues are documented for transparency. For typical workloads (versioned document storage, audit logs), they don't cause problems.
 
 ### PostgreSQL Version
 
