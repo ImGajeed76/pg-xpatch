@@ -169,13 +169,13 @@ psql -h localhost -U postgres -c "CREATE EXTENSION pg_xpatch;"
 Download from [GitHub Releases](https://github.com/ImGajeed76/pg-xpatch/releases):
 
 ```bash
-# Download and extract
-tar -xzf pg_xpatch-v0.1.0-pg16-linux-amd64.tar.gz
-cd pg_xpatch-v0.1.0-pg16-linux-amd64
+# Download and extract (replace VERSION with actual version, e.g., v0.1.1)
+tar -xzf pg_xpatch-VERSION-pg16-linux-amd64.tar.gz
+cd pg_xpatch-VERSION-pg16-linux-amd64
 
 # Install
 sudo cp pg_xpatch.so $(pg_config --pkglibdir)/
-sudo cp pg_xpatch.control pg_xpatch--0.1.0.sql $(pg_config --sharedir)/extension/
+sudo cp pg_xpatch.control *.sql $(pg_config --sharedir)/extension/
 
 # (Optional) Enable shared memory cache - add to postgresql.conf:
 # shared_preload_libraries = 'pg_xpatch'
