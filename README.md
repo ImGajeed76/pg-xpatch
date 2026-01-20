@@ -151,26 +151,50 @@ shared_preload_libraries = 'pg_xpatch'
 
 ## Installation
 
-### Requirements
+### Docker (Easiest)
 
-- PostgreSQL 16+
-- Rust 1.70+ (for building the xpatch library)
-- cbindgen (for generating C headers from Rust)
-- Git
+```bash
+# Run PostgreSQL with pg-xpatch pre-installed
+docker run -d --name pg-xpatch \
+  -p 5432:5432 \
+  -e POSTGRES_PASSWORD=secret \
+  ghcr.io/imgajeed76/pg-xpatch:latest
 
-### Building
+# Connect and enable the extension
+psql -h localhost -U postgres -c "CREATE EXTENSION pg_xpatch;"
+```
+
+### Pre-built Binaries
+
+Download from [GitHub Releases](https://github.com/ImGajeed76/pg-xpatch/releases):
+
+```bash
+# Download and extract
+tar -xzf pg_xpatch-v0.1.0-pg16-linux-amd64.tar.gz
+cd pg_xpatch-v0.1.0-pg16-linux-amd64
+
+# Install
+sudo cp pg_xpatch.so $(pg_config --pkglibdir)/
+sudo cp pg_xpatch.control pg_xpatch--0.1.0.sql $(pg_config --sharedir)/extension/
+
+# (Optional) Enable shared memory cache - add to postgresql.conf:
+# shared_preload_libraries = 'pg_xpatch'
+
+# Restart PostgreSQL, then:
+psql -c "CREATE EXTENSION pg_xpatch;"
+```
+
+### Building from Source
+
+Requirements:
+- PostgreSQL 16+ (with dev headers)
+- Rust 1.70+
+- cbindgen (`cargo install cbindgen`)
 
 ```bash
 git clone https://github.com/ImGajeed76/pg-xpatch
 cd pg-xpatch
-
-# Build (automatically clones xpatch library if needed)
 make clean && make && make install
-
-# Restart PostgreSQL if using shared memory cache
-# Add to postgresql.conf: shared_preload_libraries = 'pg_xpatch'
-
-# Enable the extension
 psql -c "CREATE EXTENSION pg_xpatch;"
 ```
 

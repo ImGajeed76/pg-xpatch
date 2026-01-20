@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pg_version: [16]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install PostgreSQL dev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg_version }} clang
+      
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+      
+      - name: Install cbindgen
+        run: cargo install cbindgen
+      
+      - name: Build extension
+        run: make clean && make
+      
+      - name: Package binaries
+        run: |
+          mkdir -p dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64
+          cp pg_xpatch.so dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/
+          cp pg_xpatch.control dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/
+          cp sql/pg_xpatch--0.1.0.sql dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/
+          cp README.md dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/
+          cat > dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64/INSTALL.md << 'EOF'
+          # Installation
+          
+          1. Copy files to PostgreSQL directories:
+             ```bash
+             sudo cp pg_xpatch.so $(pg_config --pkglibdir)/
+             sudo cp pg_xpatch.control pg_xpatch--0.1.0.sql $(pg_config --sharedir)/extension/
+             ```
+          
+          2. (Optional) Enable shared memory cache in postgresql.conf:
+             ```
+             shared_preload_libraries = 'pg_xpatch'
+             ```
+          
+          3. Restart PostgreSQL and create extension:
+             ```sql
+             CREATE EXTENSION pg_xpatch;
+             ```
+          EOF
+          cd dist && tar -czvf pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64.tar.gz pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-amd64
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg_xpatch-pg${{ matrix.pg_version }}-linux-amd64
+          path: dist/*.tar.gz
+
+  build-docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  release:
+    needs: [build-binaries, build-docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true
+          body: |
+            ## Installation
+            
+            ### Docker (Easiest)
+            ```bash
+            docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=secret ghcr.io/imgajeed76/pg-xpatch:${{ github.ref_name }}
+            psql -h localhost -U postgres -c "CREATE EXTENSION pg_xpatch;"
+            ```
+            
+            ### Binary Installation
+            Download the tarball for your PostgreSQL version and platform, then:
+            ```bash
+            tar -xzf pg_xpatch-*.tar.gz
+            cd pg_xpatch-*
+            sudo cp pg_xpatch.so $(pg_config --pkglibdir)/
+            sudo cp pg_xpatch.control pg_xpatch--0.1.0.sql $(pg_config --sharedir)/extension/
+            # Restart PostgreSQL, then:
+            psql -c "CREATE EXTENSION pg_xpatch;"
+            ```

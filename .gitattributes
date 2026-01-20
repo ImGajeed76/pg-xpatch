@@ -1,0 +1,7 @@
+# Mark vendored/generated code
+lib/blake3/*.S linguist-vendored
+lib/blake3/*.c linguist-vendored
+lib/blake3/*.h linguist-vendored
+
+# Mark test files
+tmp/ linguist-vendored
