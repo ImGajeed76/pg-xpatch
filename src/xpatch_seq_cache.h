@@ -96,6 +96,22 @@ void xpatch_seq_cache_set_max_seq(Oid relid, Datum group_value, Oid typid, int32
  */
 int32 xpatch_seq_cache_next_seq(Oid relid, Datum group_value, Oid typid);
 
+/*
+ * Rollback a sequence number allocation after a failed insert.
+ * Decrements max_seq by 1 if the current value equals expected_seq.
+ * This is used for atomic rollback when an INSERT fails after
+ * allocating a sequence number.
+ *
+ * Parameters:
+ *   relid        - Relation OID
+ *   group_value  - Group column value (use 0 if no group_by)
+ *   typid        - Type OID of the group column (for proper hashing)
+ *   expected_seq - The sequence that was allocated and needs rollback
+ *
+ * Returns true if rollback succeeded, false if seq changed (concurrent insert).
+ */
+bool xpatch_seq_cache_rollback_seq(Oid relid, Datum group_value, Oid typid, int32 expected_seq);
+
 /* ================================================================
  * TID Seq Cache - for READ optimization
  * ================================================================ */

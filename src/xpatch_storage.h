@@ -38,9 +38,13 @@
  * This performs delta compression on configured columns.
  *
  * Returns a HeapTuple that must be freed with heap_freetuple().
+ *
+ * If out_seq is not NULL, the allocated sequence number is returned.
+ * The caller can use this for rollback if the insert fails:
+ *   xpatch_seq_cache_rollback_seq(relid, group_value, typid, *out_seq)
  */
 HeapTuple xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
-                                     TupleTableSlot *slot);
+                                     TupleTableSlot *slot, int32 *out_seq);
 
 /*
  * Convert a physical tuple to logical format.
