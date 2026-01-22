@@ -1172,6 +1172,53 @@ xpatch_seq_cache_next_seq(Oid relid, Datum group_value, Oid typid)
     return new_seq;
 }
 
+bool
+xpatch_seq_cache_rollback_seq(Oid relid, Datum group_value, Oid typid, int32 expected_seq)
+{
+    int32 idx;
+    int32 slot;
+    bool success = false;
+    GroupSeqEntry *entries;
+    XPatchGroupHash group_hash;
+    
+    if (!seq_cache_initialized || group_cache == NULL)
+        return false;  /* Cache not available - can't rollback */
+    
+    /* Compute hash outside the lock */
+    group_hash = xpatch_compute_group_hash(group_value, typid, false);
+    
+    LWLockAcquire(group_cache->lock, LW_EXCLUSIVE);
+    
+    entries = group_cache_entries(group_cache);
+    
+    /* Find the entry */
+    idx = group_cache_find(relid, group_hash, &slot);
+    
+    if (idx >= 0)
+    {
+        /*
+         * Only rollback if the current value matches what we expect.
+         * This handles the case where another concurrent insert succeeded
+         * after our failed one - we shouldn't decrement in that case.
+         */
+        if (entries[idx].max_seq == expected_seq)
+        {
+            entries[idx].max_seq--;
+            success = true;
+            elog(DEBUG1, "xpatch: rolled back seq %d for group", expected_seq);
+        }
+        else
+        {
+            elog(DEBUG1, "xpatch: seq rollback skipped - current %d != expected %d",
+                 entries[idx].max_seq, expected_seq);
+        }
+    }
+    
+    LWLockRelease(group_cache->lock);
+    
+    return success;
+}
+
 /* ================================================================
  * TID Seq Cache Operations
  * ================================================================ */

@@ -1042,9 +1042,17 @@ xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
     physical_tuple = xpatch_fetch_by_seq(rel, config, group_value, seq);
     if (physical_tuple == NULL)
     {
-        ereport(ERROR,
-                (errcode(ERRCODE_DATA_CORRUPTED),
-                 errmsg("xpatch: could not find row with sequence %d", seq)));
+        /*
+         * Row not found - this could happen if:
+         * 1. A previous INSERT failed after allocating a sequence number
+         * 2. The row was deleted (which shouldn't normally happen in xpatch)
+         * 3. Data corruption
+         *
+         * We return NULL here instead of throwing an error so callers can
+         * handle this gracefully (e.g., by falling back to keyframe encoding).
+         */
+        elog(WARNING, "xpatch: could not find row with sequence %d (gap in chain?)", seq);
+        return NULL;
     }
     
     /* 3. Get the delta/compressed value from the tuple */
@@ -1136,7 +1144,7 @@ xpatch_reconstruct_column_with_tuple(Relation rel, XPatchConfig *config,
  */
 HeapTuple
 xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
-                           TupleTableSlot *slot)
+                           TupleTableSlot *slot, int32 *out_seq)
 {
     TupleDesc tupdesc;
     int natts;
@@ -1167,6 +1175,10 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     bool restore_mode = false;
     int32 user_seq = 0;
     Oid group_typid = InvalidOid;
+    
+    /* Initialize out_seq to 0 (will be set later if allocation succeeds) */
+    if (out_seq)
+        *out_seq = 0;
     
     tupdesc = RelationGetDescr(rel);
     natts = tupdesc->natts;
@@ -1242,6 +1254,14 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
         }
     }
     
+    /* 
+     * Output the allocated sequence so caller can rollback on failure.
+     * This must be done BEFORE any operation that might fail, so the
+     * caller knows which sequence to rollback.
+     */
+    if (out_seq && !restore_mode)
+        *out_seq = new_seq;
+    
     /* Determine if this is a keyframe */
     is_keyframe = (new_seq == 1) || (new_seq % config->keyframe_every == 1);
     
@@ -1309,6 +1329,10 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                  *   tag=1: previous row
                  *   tag=2: 2 rows back
                  *   etc.
+                 *
+                 * ROBUSTNESS: If a base row is missing (due to a previous failed
+                 * insert creating a gap), we skip that base and try earlier ones.
+                 * If ALL bases are missing, we fall back to keyframe encoding.
                  */
                 best_delta = NULL;
                 best_size = SIZE_MAX;
@@ -1321,29 +1345,35 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                     if (base_seq < 1)
                         break;
                     
-                    /* Get base content (may trigger reconstruction) */
+                    /* 
+                     * Get base content (may trigger reconstruction).
+                     * Returns NULL if:
+                     * 1. The column value is NULL (valid case)
+                     * 2. The row doesn't exist (gap in sequence - skip this base)
+                     */
                     base_content = xpatch_reconstruct_column(rel, config, group_value,
                                                               base_seq, delta_col_index);
                     
-                    /* Encode delta against this base */
+                    /* 
+                     * If base_content is NULL, it could be either a NULL column value
+                     * or a missing row. We check if the row exists to differentiate.
+                     * For simplicity, we just skip this base and try the next one.
+                     * If no valid base is found, we'll fall back to keyframe below.
+                     */
                     if (base_content == NULL)
                     {
-                        candidate = xpatch_encode_delta(tag,
-                                                        NULL, 0,
-                                                        (uint8 *) VARDATA_ANY(raw_content),
-                                                        VARSIZE_ANY_EXHDR(raw_content),
-                                                        config->enable_zstd);
+                        /* Skip this base - either NULL value or missing row */
+                        continue;
                     }
-                    else
-                    {
-                        candidate = xpatch_encode_delta(tag,
-                                                        (uint8 *) VARDATA_ANY(base_content),
-                                                        VARSIZE_ANY_EXHDR(base_content),
-                                                        (uint8 *) VARDATA_ANY(raw_content),
-                                                        VARSIZE_ANY_EXHDR(raw_content),
-                                                        config->enable_zstd);
-                        pfree(base_content);
-                    }
+                    
+                    /* Encode delta against this valid base */
+                    candidate = xpatch_encode_delta(tag,
+                                                    (uint8 *) VARDATA_ANY(base_content),
+                                                    VARSIZE_ANY_EXHDR(base_content),
+                                                    (uint8 *) VARDATA_ANY(raw_content),
+                                                    VARSIZE_ANY_EXHDR(raw_content),
+                                                    config->enable_zstd);
+                    pfree(base_content);
                     
                     if (candidate != NULL)
                     {
@@ -1365,6 +1395,24 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                 }
                 
                 compressed = best_delta;
+                
+                /*
+                 * If no valid delta was found (all bases missing or compression failed),
+                 * fall back to keyframe encoding. This makes xpatch self-healing for
+                 * gaps created by failed inserts.
+                 */
+                if (compressed == NULL)
+                {
+                    elog(DEBUG1, "xpatch: no valid base found for delta, falling back to keyframe for col %d",
+                         delta_col_index);
+                    
+                    compressed = xpatch_encode_delta(XPATCH_KEYFRAME_TAG,
+                                                      NULL, 0,
+                                                      (uint8 *) VARDATA_ANY(raw_content),
+                                                      VARSIZE_ANY_EXHDR(raw_content),
+                                                      config->enable_zstd);
+                    best_tag = XPATCH_KEYFRAME_TAG;
+                }
                 
                 elog(DEBUG1, "xpatch: delta col %d: raw=%zu compressed=%zu tag=%d",
                      delta_col_index,
