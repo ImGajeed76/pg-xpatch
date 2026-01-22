@@ -1678,6 +1678,15 @@ xpatch_relation_set_new_filelocator(Relation rel,
                                     MultiXactId *minmulti)
 {
     SMgrRelation srel;
+    Oid relid = RelationGetRelid(rel);
+
+    /*
+     * Invalidate caches for this relation.
+     * This is called during TRUNCATE (which replaces the file) and during
+     * CREATE TABLE (which has no cache entries yet - safe to call).
+     */
+    xpatch_cache_invalidate_rel(relid);      /* Content cache */
+    xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
 
     /*
      * Initialize the physical storage for the new relation.
