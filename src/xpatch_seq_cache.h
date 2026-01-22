@@ -127,6 +127,31 @@ void xpatch_seq_cache_populate_group_tids(Oid relid, Datum group_value,
                                           int count);
 
 /* ================================================================
+ * Seq-to-TID Cache - for fetch_by_seq optimization
+ * ================================================================ */
+
+/*
+ * Get the TID for a tuple by its (group, seq) key.
+ * Returns true if found (and populates *tid), false if cache miss.
+ *
+ * Parameters:
+ *   relid       - Relation OID
+ *   group_value - Group column value (use 0 if no group_by)
+ *   typid       - Type OID of the group column (for proper hashing)
+ *   seq         - Sequence number within group
+ *   tid         - Output: TID if found
+ */
+bool xpatch_seq_cache_get_seq_tid(Oid relid, Datum group_value, Oid typid,
+                                  int32 seq, ItemPointer tid);
+
+/*
+ * Set the TID for a (group, seq) key.
+ * Called after finding a tuple to cache its location for future lookups.
+ */
+void xpatch_seq_cache_set_seq_tid(Oid relid, Datum group_value, Oid typid,
+                                  int32 seq, ItemPointer tid);
+
+/* ================================================================
  * Cache Invalidation
  * ================================================================ */
 
@@ -147,11 +172,17 @@ typedef struct XPatchSeqCacheStats
     int64       group_cache_hits;
     int64       group_cache_misses;
     
-    /* TID Seq Cache stats */
+    /* TID Seq Cache stats (TID -> seq) */
     int64       tid_cache_entries;
     int64       tid_cache_max;
     int64       tid_cache_hits;
     int64       tid_cache_misses;
+    
+    /* Seq TID Cache stats (group+seq -> TID) - for fetch_by_seq optimization */
+    int64       seq_tid_cache_entries;
+    int64       seq_tid_cache_max;
+    int64       seq_tid_cache_hits;
+    int64       seq_tid_cache_misses;
 } XPatchSeqCacheStats;
 
 void xpatch_seq_cache_get_stats(XPatchSeqCacheStats *stats);

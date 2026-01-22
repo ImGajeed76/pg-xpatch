@@ -40,15 +40,21 @@
 #include "xpatch_cache.h"
 #include "xpatch_seq_cache.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
+#include "catalog/index.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "executor/tuptable.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/typcache.h"
 #include "funcapi.h"
 
@@ -503,8 +509,265 @@ xpatch_get_max_version(Relation rel, XPatchConfig *config,
 }
 
 /*
- * Fetch a physical row by group and sequence number using direct buffer access.
- * Searches for tuple where _xp_seq = target_seq.
+ * Helper: Fetch tuple by TID with visibility check.
+ * Returns a palloc'd HeapTuple if the tuple at the given TID is valid and visible,
+ * NULL otherwise.
+ */
+static HeapTuple
+fetch_tuple_by_tid(Relation rel, ItemPointer tid)
+{
+    Buffer buffer;
+    Page page;
+    ItemId itemId;
+    HeapTupleData tuple;
+    HeapTuple result = NULL;
+    BlockNumber blkno;
+    OffsetNumber offnum;
+    
+    blkno = ItemPointerGetBlockNumber(tid);
+    offnum = ItemPointerGetOffsetNumber(tid);
+    
+    /* Check block number is valid */
+    if (blkno >= RelationGetNumberOfBlocks(rel))
+        return NULL;
+    
+    buffer = ReadBuffer(rel, blkno);
+    LockBuffer(buffer, BUFFER_LOCK_SHARE);
+    
+    page = BufferGetPage(buffer);
+    
+    /* Check offset is valid */
+    if (offnum > PageGetMaxOffsetNumber(page))
+    {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+        return NULL;
+    }
+    
+    itemId = PageGetItemId(page, offnum);
+    
+    if (ItemIdIsNormal(itemId))
+    {
+        tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+        tuple.t_len = ItemIdGetLength(itemId);
+        tuple.t_tableOid = RelationGetRelid(rel);
+        ItemPointerCopy(tid, &tuple.t_self);
+        
+        /* MVCC visibility check */
+        {
+            TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple.t_data);
+            
+            /* Skip if inserter hasn't committed and isn't us */
+            if (TransactionIdIsCurrentTransactionId(xmin) ||
+                TransactionIdDidCommit(xmin))
+            {
+                /* Check if tuple is deleted */
+                if ((tuple.t_data->t_infomask & HEAP_XMAX_INVALID) ||
+                    !TransactionIdDidCommit(HeapTupleHeaderGetRawXmax(tuple.t_data)))
+                {
+                    result = heap_copytuple(&tuple);
+                }
+            }
+        }
+    }
+    
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+    ReleaseBuffer(buffer);
+    
+    return result;
+}
+
+/*
+ * Helper: Find index OID for the _xp_seq index on a table.
+ * Returns the OID of the index, or InvalidOid if not found.
+ * 
+ * Looks for either:
+ * - <tablename>_xp_seq_idx (basic index on _xp_seq)
+ * - <tablename>_xp_group_seq_idx (composite index on (group_by, _xp_seq))
+ */
+static Oid
+find_xp_seq_index(Relation rel, XPatchConfig *config)
+{
+    List *indexList;
+    ListCell *lc;
+    Oid result = InvalidOid;
+    const char *relname = RelationGetRelationName(rel);
+    char basic_idx_name[NAMEDATALEN];
+    char composite_idx_name[NAMEDATALEN];
+    
+    snprintf(basic_idx_name, NAMEDATALEN, "%s_xp_seq_idx", relname);
+    snprintf(composite_idx_name, NAMEDATALEN, "%s_xp_group_seq_idx", relname);
+    
+    indexList = RelationGetIndexList(rel);
+    
+    foreach(lc, indexList)
+    {
+        Oid indexOid = lfirst_oid(lc);
+        Relation indexRel = index_open(indexOid, AccessShareLock);
+        const char *indexName = RelationGetRelationName(indexRel);
+        
+        /* Prefer composite index if group_by is configured */
+        if (config->group_by_attnum != InvalidAttrNumber &&
+            strcmp(indexName, composite_idx_name) == 0)
+        {
+            result = indexOid;
+            index_close(indexRel, AccessShareLock);
+            break;
+        }
+        
+        /* Fall back to basic index */
+        if (strcmp(indexName, basic_idx_name) == 0)
+        {
+            result = indexOid;
+        }
+        
+        index_close(indexRel, AccessShareLock);
+    }
+    
+    list_free(indexList);
+    return result;
+}
+
+/*
+ * Helper: Fetch tuple using index scan on _xp_seq.
+ * This is O(log n) compared to O(n) for full table scan.
+ */
+static HeapTuple
+fetch_by_seq_using_index(Relation rel, XPatchConfig *config,
+                         Datum group_value, int32 target_seq, ItemPointer out_tid)
+{
+    Oid indexOid;
+    Relation indexRel;
+    IndexScanDesc scan;
+    ScanKeyData scankeys[2];
+    int nkeys;
+    HeapTuple result = NULL;
+    TupleDesc tupdesc;
+    
+    indexOid = find_xp_seq_index(rel, config);
+    if (!OidIsValid(indexOid))
+    {
+        elog(DEBUG1, "xpatch: no _xp_seq index found, falling back to sequential scan");
+        return NULL;  /* No index - caller will fall back to seq scan */
+    }
+    
+    tupdesc = RelationGetDescr(rel);
+    indexRel = index_open(indexOid, AccessShareLock);
+    
+    /* Set up scan keys */
+    nkeys = 0;
+    
+    /* If we have a composite index (group_by, _xp_seq), use both keys */
+    if (config->group_by_attnum != InvalidAttrNumber)
+    {
+        Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+        Oid eqop = InvalidOid;
+        
+        /* Get equality operator for the group column type */
+        eqop = OpernameGetOprid(list_make1(makeString("=")), 
+                                group_attr->atttypid, group_attr->atttypid);
+        
+        if (OidIsValid(eqop))
+        {
+            ScanKeyInit(&scankeys[nkeys],
+                        1,  /* First column in composite index is group_by */
+                        BTEqualStrategyNumber,
+                        get_opcode(eqop),
+                        group_value);
+            nkeys++;
+            
+            ScanKeyInit(&scankeys[nkeys],
+                        2,  /* Second column is _xp_seq */
+                        BTEqualStrategyNumber,
+                        F_INT4EQ,
+                        Int32GetDatum(target_seq));
+            nkeys++;
+        }
+    }
+    else
+    {
+        /* Basic index on just _xp_seq */
+        ScanKeyInit(&scankeys[nkeys],
+                    1,  /* First (and only) column is _xp_seq */
+                    BTEqualStrategyNumber,
+                    F_INT4EQ,
+                    Int32GetDatum(target_seq));
+        nkeys++;
+    }
+    
+    /* Start index scan */
+    scan = index_beginscan(rel, indexRel, GetActiveSnapshot(), nkeys, 0);
+    index_rescan(scan, scankeys, nkeys, NULL, 0);
+    
+    /* Fetch the tuple using index_getnext_tid + heap fetch */
+    while (true)
+    {
+        ItemPointer tid;
+        HeapTupleData tuple;
+        Buffer buffer;
+        bool found;
+        
+        tid = index_getnext_tid(scan, ForwardScanDirection);
+        if (tid == NULL)
+            break;
+        
+        /* Fetch the heap tuple */
+        tuple.t_self = *tid;
+        found = heap_fetch(rel, GetActiveSnapshot(), &tuple, &buffer, false);
+        
+        if (!found)
+            continue;
+        
+        /* For composite index, we've already filtered by group, so this is our tuple */
+        /* For basic index, we need to verify the group matches */
+        if (config->group_by_attnum != InvalidAttrNumber && nkeys == 1)
+        {
+            /* Basic index only - need to check group manually */
+            bool group_isnull;
+            Datum tuple_group;
+            Form_pg_attribute attr;
+            
+            tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
+            
+            if (group_isnull)
+            {
+                ReleaseBuffer(buffer);
+                continue;
+            }
+            
+            attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+            if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
+            {
+                ReleaseBuffer(buffer);
+                continue;
+            }
+        }
+        
+        /* Found it! Copy the TID for caching */
+        if (out_tid)
+            ItemPointerCopy(tid, out_tid);
+        
+        result = heap_copytuple(&tuple);
+        ReleaseBuffer(buffer);
+        break;
+    }
+    
+    index_endscan(scan);
+    index_close(indexRel, AccessShareLock);
+    
+    return result;
+}
+
+/*
+ * Fetch a physical row by group and sequence number.
+ * 
+ * OPTIMIZED VERSION - uses three strategies in order:
+ * 1. Seq-to-TID cache lookup - O(1) hash table lookup
+ * 2. Index scan on _xp_seq - O(log n) B-tree lookup
+ * 3. Sequential scan as fallback - O(n) if no index exists
+ * 
+ * The seq-to-TID cache is populated on successful lookups to speed up
+ * subsequent requests for the same (group, seq) pair.
  */
 HeapTuple
 xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
@@ -512,69 +775,129 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
 {
     HeapTuple result = NULL;
     TupleDesc tupdesc;
-    BlockNumber nblocks;
-    BlockNumber blkno;
-    Buffer buffer;
-    Page page;
-    OffsetNumber offnum;
-    OffsetNumber maxoff;
-    ItemId itemId;
-    HeapTupleData tuple;
-    Datum tuple_group;
-    bool group_isnull;
-    Form_pg_attribute attr;
+    Oid group_typid = InvalidOid;
+    ItemPointerData cached_tid;
+    ItemPointerData found_tid;
     
     tupdesc = RelationGetDescr(rel);
-    nblocks = RelationGetNumberOfBlocks(rel);
     
-    /* Scan all blocks */
-    for (blkno = 0; blkno < nblocks && result == NULL; blkno++)
+    /* Get group column type for cache operations */
+    if (config->group_by_attnum != InvalidAttrNumber)
     {
-        buffer = ReadBuffer(rel, blkno);
-        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+        group_typid = group_attr->atttypid;
+    }
+    
+    /* Strategy 1: Check seq-to-TID cache for O(1) lookup */
+    if (xpatch_seq_cache_get_seq_tid(RelationGetRelid(rel), group_value, group_typid,
+                                      target_seq, &cached_tid))
+    {
+        elog(DEBUG2, "xpatch: fetch_by_seq cache HIT for seq=%d", target_seq);
         
-        page = BufferGetPage(buffer);
-        maxoff = PageGetMaxOffsetNumber(page);
+        /* Fetch tuple by cached TID */
+        result = fetch_tuple_by_tid(rel, &cached_tid);
         
-        for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+        if (result != NULL)
         {
-            itemId = PageGetItemId(page, offnum);
+            /* Verify the tuple still has the right seq (in case of VACUUM/UPDATE) */
+            bool seq_isnull;
+            Datum seq_datum = heap_getattr(result, config->xp_seq_attnum, tupdesc, &seq_isnull);
             
-            if (!ItemIdIsNormal(itemId))
-                continue;
-            
-            tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
-            tuple.t_len = ItemIdGetLength(itemId);
-            tuple.t_tableOid = RelationGetRelid(rel);
-            ItemPointerSet(&tuple.t_self, blkno, offnum);
-            
-            /* Check group if specified */
-            if (config->group_by_attnum != InvalidAttrNumber)
+            if (!seq_isnull && DatumGetInt32(seq_datum) == target_seq)
             {
-                tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
-                
-                if (group_isnull)
-                    continue;
-                
-                attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
-                if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
-                    continue;
+                /* Cache hit valid - return the tuple */
+                return result;
             }
             
-            /* Check sequence number from _xp_seq column */
+            /* Cache stale - TID no longer points to our seq. Free and continue. */
+            heap_freetuple(result);
+            result = NULL;
+            elog(DEBUG2, "xpatch: fetch_by_seq cache STALE for seq=%d", target_seq);
+        }
+    }
+    
+    /* Strategy 2: Use index scan - O(log n) */
+    ItemPointerSetInvalid(&found_tid);
+    result = fetch_by_seq_using_index(rel, config, group_value, target_seq, &found_tid);
+    
+    if (result != NULL)
+    {
+        /* Populate the cache for future lookups */
+        xpatch_seq_cache_set_seq_tid(RelationGetRelid(rel), group_value, group_typid,
+                                      target_seq, &found_tid);
+        return result;
+    }
+    
+    /* Strategy 3: Fall back to sequential scan - O(n) */
+    elog(DEBUG1, "xpatch: fetch_by_seq falling back to sequential scan for seq=%d", target_seq);
+    {
+        BlockNumber nblocks;
+        BlockNumber blkno;
+        Buffer buffer;
+        Page page;
+        OffsetNumber offnum;
+        OffsetNumber maxoff;
+        ItemId itemId;
+        HeapTupleData tuple;
+        Datum tuple_group;
+        bool group_isnull;
+        Form_pg_attribute attr;
+        
+        nblocks = RelationGetNumberOfBlocks(rel);
+        
+        /* Scan all blocks */
+        for (blkno = 0; blkno < nblocks && result == NULL; blkno++)
+        {
+            buffer = ReadBuffer(rel, blkno);
+            LockBuffer(buffer, BUFFER_LOCK_SHARE);
+            
+            page = BufferGetPage(buffer);
+            maxoff = PageGetMaxOffsetNumber(page);
+            
+            for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
             {
-                bool seq_isnull;
-                Datum seq_datum = heap_getattr(&tuple, config->xp_seq_attnum, tupdesc, &seq_isnull);
-                if (!seq_isnull && DatumGetInt32(seq_datum) == target_seq)
+                itemId = PageGetItemId(page, offnum);
+                
+                if (!ItemIdIsNormal(itemId))
+                    continue;
+                
+                tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+                tuple.t_len = ItemIdGetLength(itemId);
+                tuple.t_tableOid = RelationGetRelid(rel);
+                ItemPointerSet(&tuple.t_self, blkno, offnum);
+                
+                /* Check group if specified */
+                if (config->group_by_attnum != InvalidAttrNumber)
                 {
-                    result = heap_copytuple(&tuple);
-                    break;
+                    tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
+                    
+                    if (group_isnull)
+                        continue;
+                    
+                    attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+                    if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
+                        continue;
+                }
+                
+                /* Check sequence number from _xp_seq column */
+                {
+                    bool seq_isnull;
+                    Datum seq_datum = heap_getattr(&tuple, config->xp_seq_attnum, tupdesc, &seq_isnull);
+                    if (!seq_isnull && DatumGetInt32(seq_datum) == target_seq)
+                    {
+                        result = heap_copytuple(&tuple);
+                        
+                        /* Cache the TID for future lookups */
+                        xpatch_seq_cache_set_seq_tid(RelationGetRelid(rel), group_value, group_typid,
+                                                      target_seq, &tuple.t_self);
+                        break;
+                    }
                 }
             }
+            
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
         }
-        
-        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-        ReleaseBuffer(buffer);
     }
     
     return result;

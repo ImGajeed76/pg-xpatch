@@ -180,7 +180,21 @@ xpatch_stats(PG_FUNCTION_ARGS)
                     total_groups++;
             }
 
-            /* Get/update sequence number for this group */
+            /* Get actual sequence number from the _xp_seq column */
+            {
+                bool seq_is_null;
+                Datum seq_datum = heap_getattr(&tuple, config->xp_seq_attnum, 
+                                               rel_tupdesc, &seq_is_null);
+                if (seq_is_null)
+                {
+                    /* Shouldn't happen - _xp_seq should always be set */
+                    elog(WARNING, "xpatch_stats: NULL _xp_seq value found");
+                    continue;
+                }
+                row_seq = DatumGetInt32(seq_datum);
+            }
+            
+            /* Track sequence per group for consistency checking */
             seq_entry = (GroupSeqEntry *) hash_search(group_seqs, &group_val, 
                                                        HASH_ENTER, &found);
             if (!found)
@@ -189,7 +203,6 @@ xpatch_stats(PG_FUNCTION_ARGS)
                 seq_entry->current_seq = 0;
             }
             seq_entry->current_seq++;
-            row_seq = seq_entry->current_seq;
 
             /*
              * Process each delta column:
