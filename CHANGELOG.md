@@ -43,6 +43,22 @@ Initial release.
 - Basic MVCC only
 - PostgreSQL 16 only
 
+## [0.2.1] - 2025-01-22
+
+### Fixed
+
+- **TOAST support for large tuples**: Fixed "row is too big" error when inserting large content (>8KB). Now properly calls `heap_toast_insert_or_update()` to move large attributes to the TOAST table. Tested with files up to 1MB.
+- **Sequence gap on failed insert**: Fixed critical bug where failed INSERTs would consume sequence numbers, creating gaps in delta chains that caused corruption. Now uses `PG_TRY/CATCH` to rollback sequence allocation on failure.
+- **Keyframe fallback for missing base rows**: Delta encoding now gracefully handles missing base rows (from previous failed inserts) by falling back to keyframe encoding instead of erroring.
+- **O(n²) performance in `fetch_by_seq`**: Optimized from O(n²) sequential scan to O(log n) using index scan + seq-to-TID cache. INSERT speed improved ~18x (90 rows/s → 1600 rows/s).
+- **TRUNCATE cache invalidation**: Fixed cache not being invalidated on TRUNCATE. Added invalidation to `relation_set_new_filelocator()` callback.
+
+### Changed
+
+- `xpatch_logical_to_physical()` now returns allocated sequence via output parameter for rollback support
+- Added `xpatch_seq_cache_rollback_seq()` function to decrement sequence on failed insert
+- `xpatch_reconstruct_column()` now returns NULL instead of ERROR when row is missing
+
 ## [0.2.0] - 2025-01-20
 
 ### Added
