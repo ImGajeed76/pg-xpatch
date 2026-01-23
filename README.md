@@ -149,6 +149,43 @@ To enable the shared memory cache, add to `postgresql.conf`:
 shared_preload_libraries = 'pg_xpatch'
 ```
 
+### Real-World Benchmark: pg-xpatch vs Git
+
+To test pg-xpatch against a real versioning system, we stored the complete file history of the [tokio](https://github.com/tokio-rs/tokio) repository (35,827 file versions across 2,641 files, 296 MB raw content) and compared storage size and random access speed against git's packfile format.
+
+**Setup:**
+- `group_by=path, compress_depth=1000, keyframe_every=100, enable_zstd=true`
+- Each row stores: file path, content, commit message, commit hash, parent hash, timestamp
+- No optimization was done — the schema is a single flat denormalized table with commit metadata repeated per row, no content deduplication, no normalization. Just naive INSERTs and let xpatch handle compression.
+
+**Storage comparison (total on-disk size):**
+
+| Storage Method | Total Size | What's Included |
+|----------------|------------|-----------------|
+| Raw file content | 296 MB | Just the file blobs |
+| Git (normal bare clone) | 18 MB | Packfile + commit/tree objects + refs |
+| Git (`gc --aggressive`) | 11 MB | Same, with aggressive packing |
+| pg-xpatch | 12 MB | Table + TOAST + indexes + per-row metadata |
+
+Git with aggressive packing is slightly smaller (11 MB vs 12 MB), but pg-xpatch provides full SQL queryability over the data. Both systems store more than just file content — git stores commit/tree objects, pg-xpatch stores commit hashes, timestamps, messages, and indexes.
+
+**Internal delta compression:** xpatch's delta engine achieves 42x compression on the content columns alone (296 MB → 7 MB), but the total relation size (12 MB) includes non-delta columns and index overhead.
+
+**Random access performance (100 random point lookups, warmed cache):**
+
+| Method | Median | p95 | Max |
+|--------|--------|-----|-----|
+| pg-xpatch | 0.20 ms | < 1 ms | 22 ms |
+| git (`git show`) | 1.32 ms | 1.47 ms | 1.81 ms |
+
+pg-xpatch is ~6.5x faster on median, with 95% of queries under 1 ms. Git has more consistent latency (tight 1-2 ms range), while pg-xpatch has occasional tail latency spikes from cold chain reconstructions.
+
+**Insert and engine performance:**
+
+The delta engine performs up to **22,000 base comparisons per second** (~45μs per comparison). Each insert compares against up to `compress_depth` previous versions to find the best delta base, so practical insert speed depends on how many comparisons are needed. With `group_by`, chains are short (avg 13.57 versions here), meaning fewer comparisons per insert and higher row throughput — up to 336 rows/s for this dataset.
+
+**Parallel writes:** Since groups are independent, multiple groups can be written concurrently from separate connections with no performance degradation.
+
 ## Installation
 
 ### Docker (Easiest)
