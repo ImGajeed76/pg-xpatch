@@ -13,6 +13,8 @@ OBJS = src/pg_xpatch.o \
        src/xpatch_compress.o \
        src/xpatch_cache.o \
        src/xpatch_seq_cache.o \
+       src/xpatch_insert_cache.o \
+       src/xpatch_encode_pool.o \
        src/xpatch_utils.o \
        lib/blake3/blake3.o \
        lib/blake3/blake3_dispatch.o \

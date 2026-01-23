@@ -33,6 +33,7 @@
 #include "xpatch_compress.h"
 #include "xpatch_cache.h"
 #include "xpatch_seq_cache.h"
+#include "xpatch_insert_cache.h"
 
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
@@ -845,6 +846,7 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
         Datum max_version;
         Datum new_version;
         bool new_is_null;
+        bool auto_seq = false;
 
         new_version = slot_getattr(slot, config->order_by_attnum, &new_is_null);
         
@@ -856,21 +858,37 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
                             config->order_by)));
         }
 
-        max_version = xpatch_get_max_version(relation, config, group_value, &max_is_null);
-
-        if (!max_is_null)
+        /*
+         * Auto-seq sentinel: when order_by IS _xp_seq and the user provides
+         * value 0, this is auto-allocation mode. The value 0 is reserved as
+         * the sentinel — it cannot be a valid sequence number. Skip version
+         * validation because xpatch_logical_to_physical will auto-allocate
+         * the next sequence number for this group.
+         */
+        if (config->order_by_attnum == config->xp_seq_attnum &&
+            DatumGetInt32(new_version) == 0)
         {
-            /* Compare versions using safe comparison (no overflow) */
-            Form_pg_attribute attr = TupleDescAttr(tupdesc, config->order_by_attnum - 1);
-            int cmp = xpatch_compare_versions(new_version, max_version, attr->atttypid);
+            auto_seq = true;
+        }
 
-            if (cmp <= 0)
+        if (!auto_seq)
+        {
+            max_version = xpatch_get_max_version(relation, config, group_value, &max_is_null);
+
+            if (!max_is_null)
             {
-                ereport(ERROR,
-                        (errcode(ERRCODE_CHECK_VIOLATION),
-                         errmsg("xpatch: new version must be greater than existing max version"),
-                         errhint("The order_by column \"%s\" must be strictly increasing within each group.",
-                                 config->order_by)));
+                /* Compare versions using safe comparison (no overflow) */
+                Form_pg_attribute attr = TupleDescAttr(tupdesc, config->order_by_attnum - 1);
+                int cmp = xpatch_compare_versions(new_version, max_version, attr->atttypid);
+
+                if (cmp <= 0)
+                {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_CHECK_VIOLATION),
+                             errmsg("xpatch: new version must be greater than existing max version"),
+                             errhint("The order_by column \"%s\" must be strictly increasing within each group.",
+                                     config->order_by)));
+                }
             }
         }
     }
@@ -1484,6 +1502,7 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
      * Step 5: Invalidate caches
      */
     xpatch_cache_invalidate_rel(relid);
+    xpatch_insert_cache_invalidate_rel(relid);
     
     /*
      * Step 6: Update seq cache - new max_seq is target_seq - 1
@@ -1760,6 +1779,7 @@ xpatch_relation_set_new_filelocator(Relation rel,
      */
     xpatch_cache_invalidate_rel(relid);      /* Content cache */
     xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
+    xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
 
     /*
      * Initialize the physical storage for the new relation.
@@ -1780,6 +1800,7 @@ xpatch_relation_nontransactional_truncate(Relation rel)
     /* Invalidate all cache entries for this relation */
     xpatch_cache_invalidate_rel(relid);      /* Content cache */
     xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
+    xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
 
     /* Delegate to heap */
     RelationTruncate(rel, 0);
@@ -1937,6 +1958,7 @@ xpatch_relation_vacuum(Relation rel, struct VacuumParams *params,
     {
         xpatch_cache_invalidate_rel(relid);
         xpatch_seq_cache_invalidate_rel(relid);
+        xpatch_insert_cache_invalidate_rel(relid);
         cache_invalidated = true;
     }
 

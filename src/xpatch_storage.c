@@ -39,6 +39,8 @@
 #include "xpatch_compress.h"
 #include "xpatch_cache.h"
 #include "xpatch_seq_cache.h"
+#include "xpatch_insert_cache.h"
+#include "xpatch_encode_pool.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -1175,6 +1177,8 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     bool restore_mode = false;
     int32 user_seq = 0;
     Oid group_typid = InvalidOid;
+    int insert_cache_slot = -1;
+    bool insert_cache_is_new = false;
     
     /* Initialize out_seq to 0 (will be set later if allocation succeeds) */
     if (out_seq)
@@ -1268,6 +1272,28 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     elog(DEBUG1, "xpatch: inserting seq %d, is_keyframe=%d%s", new_seq, is_keyframe,
          restore_mode ? " (restore mode)" : "");
     
+    /*
+     * Acquire FIFO insert cache slot for this (table, group) pair.
+     * Needed for both keyframes (to keep FIFO warm) and deltas (to read bases).
+     * Not used in restore mode (bulk restore bypasses FIFO).
+     * On cold start (is_new=true), populate the FIFO with reconstructed content.
+     */
+    if (!restore_mode && config->num_delta_columns > 0)
+    {
+        insert_cache_slot = xpatch_insert_cache_get_slot(
+            RelationGetRelid(rel), group_value, group_typid,
+            config->compress_depth, config->num_delta_columns,
+            &insert_cache_is_new);
+        
+        if (insert_cache_is_new && insert_cache_slot >= 0 && new_seq > 1 && !is_keyframe)
+        {
+            /* Cold start: populate FIFO with previous rows */
+            int32 max_seq_for_populate = new_seq - 1;
+            xpatch_insert_cache_populate(insert_cache_slot, rel, config,
+                                         group_value, max_seq_for_populate);
+        }
+    }
+
     /* Allocate arrays for physical tuple */
     values = palloc(natts * sizeof(Datum));
     nulls = palloc(natts * sizeof(bool));
@@ -1324,78 +1350,157 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
             }
             else
             {
-                /* Delta: try compress_depth previous versions and pick best
+                /*
+                 * Delta encoding: use FIFO insert cache + parallel encoding.
+                 *
+                 * 1. Get bases from the FIFO insert cache (pre-materialized)
+                 * 2. If FIFO is cold, fall back to reconstruction
+                 * 3. Dispatch encoding to thread pool (or sequential if disabled)
+                 * 4. Pick smallest result
+                 *
                  * Tag convention: tag=N means delta against N rows back
                  *   tag=1: previous row
                  *   tag=2: 2 rows back
                  *   etc.
-                 *
-                 * ROBUSTNESS: If a base row is missing (due to a previous failed
-                 * insert creating a gap), we skip that base and try earlier ones.
-                 * If ALL bases are missing, we fall back to keyframe encoding.
                  */
+                InsertCacheBases *fifo_bases;
+                EncodeBatch batch;
+                int best_result_idx = -1;
+
                 best_delta = NULL;
                 best_size = SIZE_MAX;
                 best_tag = 1;
-                
-                for (tag = 1; tag <= config->compress_depth; tag++)
+
+                /* Allocate bases struct sized to actual compress_depth */
+                fifo_bases = InsertCacheBasesAlloc(config->compress_depth);
+
+                /* Try to get bases from FIFO cache first */
+                if (insert_cache_slot >= 0)
                 {
-                    base_seq = new_seq - tag;
-                    
-                    if (base_seq < 1)
-                        break;
-                    
-                    /* 
-                     * Get base content (may trigger reconstruction).
-                     * Returns NULL if:
-                     * 1. The column value is NULL (valid case)
-                     * 2. The row doesn't exist (gap in sequence - skip this base)
+                    xpatch_insert_cache_get_bases(insert_cache_slot, new_seq,
+                                                  delta_col_index, fifo_bases);
+                }
+
+                if (fifo_bases->count > 0)
+                {
+                    /*
+                     * WARM PATH: Bases available from FIFO cache.
+                     * Dispatch parallel encoding via thread pool.
                      */
-                    base_content = xpatch_reconstruct_column(rel, config, group_value,
-                                                              base_seq, delta_col_index);
-                    
-                    /* 
-                     * If base_content is NULL, it could be either a NULL column value
-                     * or a missing row. We check if the row exists to differentiate.
-                     * For simplicity, we just skip this base and try the next one.
-                     * If no valid base is found, we'll fall back to keyframe below.
-                     */
-                    if (base_content == NULL)
+                    memset(&batch, 0, sizeof(batch));
+                    batch.new_data = (const uint8_t *) VARDATA_ANY(raw_content);
+                    batch.new_len = VARSIZE_ANY_EXHDR(raw_content);
+                    batch.enable_zstd = config->enable_zstd;
+                    batch.num_tasks = fifo_bases->count;
+                    batch.capacity = fifo_bases->count;
+                    batch.tasks = palloc0(fifo_bases->count * sizeof(EncodeTask));
+                    batch.results = palloc0(fifo_bases->count * sizeof(EncodeResult));
+
+                    for (tag = 0; tag < fifo_bases->count; tag++)
                     {
-                        /* Skip this base - either NULL value or missing row */
-                        continue;
+                        batch.tasks[tag].tag = fifo_bases->bases[tag].tag;
+                        batch.tasks[tag].base_data = fifo_bases->bases[tag].data;
+                        batch.tasks[tag].base_len = fifo_bases->bases[tag].size;
                     }
-                    
-                    /* Encode delta against this valid base */
-                    candidate = xpatch_encode_delta(tag,
-                                                    (uint8 *) VARDATA_ANY(base_content),
-                                                    VARSIZE_ANY_EXHDR(base_content),
-                                                    (uint8 *) VARDATA_ANY(raw_content),
-                                                    VARSIZE_ANY_EXHDR(raw_content),
-                                                    config->enable_zstd);
-                    pfree(base_content);
-                    
-                    if (candidate != NULL)
+
+                    /* Initialize encode pool on first use if configured */
+                    if (xpatch_encode_threads > 0 && fifo_bases->count > 1)
+                        xpatch_encode_pool_init();
+
+                    /* Execute batch (parallel if pool available, sequential otherwise) */
+                    xpatch_encode_pool_execute(&batch);
+
+                    /* Find smallest result */
+                    for (tag = 0; tag < batch.num_tasks; tag++)
                     {
-                        candidate_size = VARSIZE(candidate);
-                        
-                        if (candidate_size < best_size)
+                        if (batch.results[tag].valid && batch.results[tag].size > 0)
                         {
-                            if (best_delta != NULL)
-                                pfree(best_delta);
-                            best_delta = candidate;
-                            best_size = candidate_size;
-                            best_tag = tag;
+                            if (batch.results[tag].size < best_size)
+                            {
+                                best_size = batch.results[tag].size;
+                                best_tag = batch.results[tag].tag;
+                                best_result_idx = tag;
+                            }
                         }
-                        else
+                    }
+
+                    /* Copy winning result to palloc'd bytea */
+                    if (best_result_idx >= 0)
+                    {
+                        Size total_size = batch.results[best_result_idx].size + VARHDRSZ;
+                        best_delta = (bytea *) palloc(total_size);
+                        SET_VARSIZE(best_delta, total_size);
+                        memcpy(VARDATA(best_delta),
+                               batch.results[best_result_idx].data,
+                               batch.results[best_result_idx].size);
+                    }
+
+                    /* Free all encode results (Rust allocator) */
+                    xpatch_encode_pool_free_results(&batch);
+
+                    /* Free palloc'd task/result arrays */
+                    pfree(batch.tasks);
+                    pfree(batch.results);
+
+                    /* Free palloc'd base copies from FIFO */
+                    for (tag = 0; tag < fifo_bases->count; tag++)
+                    {
+                        if (fifo_bases->bases[tag].data)
+                            pfree((void *) fifo_bases->bases[tag].data);
+                    }
+                }
+                else
+                {
+                    /*
+                     * COLD PATH: No FIFO bases available.
+                     * Fall back to sequential reconstruction (same as before).
+                     * This only happens on cold start before FIFO is populated.
+                     */
+                    for (tag = 1; tag <= config->compress_depth; tag++)
+                    {
+                        base_seq = new_seq - tag;
+
+                        if (base_seq < 1)
+                            break;
+
+                        base_content = xpatch_reconstruct_column(rel, config, group_value,
+                                                                  base_seq, delta_col_index);
+                        if (base_content == NULL)
+                            continue;
+
+                        candidate = xpatch_encode_delta(tag,
+                                                        (uint8 *) VARDATA_ANY(base_content),
+                                                        VARSIZE_ANY_EXHDR(base_content),
+                                                        (uint8 *) VARDATA_ANY(raw_content),
+                                                        VARSIZE_ANY_EXHDR(raw_content),
+                                                        config->enable_zstd);
+                        pfree(base_content);
+
+                        if (candidate != NULL)
                         {
-                            pfree(candidate);
+                            candidate_size = VARSIZE(candidate);
+
+                            if (candidate_size < best_size)
+                            {
+                                if (best_delta != NULL)
+                                    pfree(best_delta);
+                                best_delta = candidate;
+                                best_size = candidate_size;
+                                best_tag = tag;
+                            }
+                            else
+                            {
+                                pfree(candidate);
+                            }
                         }
                     }
                 }
-                
+
+                /* Free the dynamically allocated bases struct */
+                pfree(fifo_bases);
+
                 compressed = best_delta;
-                
+
                 /*
                  * If no valid delta was found (all bases missing or compression failed),
                  * fall back to keyframe encoding. This makes xpatch self-healing for
@@ -1405,7 +1510,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                 {
                     elog(DEBUG1, "xpatch: no valid base found for delta, falling back to keyframe for col %d",
                          delta_col_index);
-                    
+
                     compressed = xpatch_encode_delta(XPATCH_KEYFRAME_TAG,
                                                       NULL, 0,
                                                       (uint8 *) VARDATA_ANY(raw_content),
@@ -1413,7 +1518,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                                                       config->enable_zstd);
                     best_tag = XPATCH_KEYFRAME_TAG;
                 }
-                
+
                 elog(DEBUG1, "xpatch: delta col %d: raw=%zu compressed=%zu tag=%d",
                      delta_col_index,
                      VARSIZE_ANY_EXHDR(raw_content),
@@ -1443,11 +1548,27 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
             {
                 cache_content = datum_to_bytea(slot_getattr(slot, attnum, &isnull), typid, false);
                 xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid, new_seq, attnum, cache_content);
+                
+                /* Push into FIFO insert cache for future inserts */
+                if (insert_cache_slot >= 0)
+                {
+                    xpatch_insert_cache_push(insert_cache_slot, new_seq,
+                                             delta_col_index,
+                                             (const uint8 *) VARDATA_ANY(cache_content),
+                                             VARSIZE_ANY_EXHDR(cache_content));
+                }
+                
                 pfree(cache_content);
             }
             
             pfree(raw_content);
         }
+    }
+    
+    /* Commit the FIFO entry after all delta columns are written */
+    if (insert_cache_slot >= 0 && !restore_mode)
+    {
+        xpatch_insert_cache_commit_entry(insert_cache_slot, new_seq);
     }
     
     /* Build the physical tuple */
