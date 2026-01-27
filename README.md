@@ -121,6 +121,12 @@ Benchmark setup: 10,100 rows (101 documents x 100 versions), incremental text da
 - **Cache helps** but doesn't eliminate the reconstruction cost
 - **Indexed lookups** are faster than full scans but still have overhead
 
+> **A note on write performance:**
+> 
+> "100x slower" sounds alarming, but look at the absolute numbers: **33ms for 100 rows is ~0.33ms per row**. For versioned document storage, audit logs, or real-time collaboration (saving state every few seconds), sub-millisecond writes are more than fast enough.
+> 
+> Also remember that **writes parallelize across groups**. If you have 50 users editing 50 different documents, all 50 writes happen concurrently. Sequential writes only apply *within* a single group's version chain—which is inherent to delta compression, not a limitation.
+
 **When to use xpatch:**
 - Storage cost is a primary concern (95% space savings)
 - Data is written once and read occasionally
