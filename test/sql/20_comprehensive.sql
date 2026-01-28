@@ -566,20 +566,18 @@ SELECT xpatch.configure('test_errors',
 INSERT INTO test_errors VALUES (1, 1, 'first');
 INSERT INTO test_errors VALUES (1, 2, 'second');
 
--- Test: INSERT with duplicate/lower version should fail
-\set ON_ERROR_STOP off
-INSERT INTO test_errors VALUES (1, 1, 'duplicate'); -- Should fail
-INSERT INTO test_errors VALUES (1, 0, 'lower'); -- Should fail
-\set ON_ERROR_STOP on
+-- Duplicate/lower version values are now allowed (auto-seq handles ordering)
+INSERT INTO test_errors VALUES (1, 1, 'duplicate version value');
+INSERT INTO test_errors VALUES (1, 0, 'lower version value');
 
 -- Test: UPDATE should fail
 \set ON_ERROR_STOP off
 UPDATE test_errors SET data = 'modified' WHERE id = 1 AND version = 1; -- Should fail
 \set ON_ERROR_STOP on
 
--- Verify table is still intact
-SELECT 'Table still intact after errors:' as test;
-SELECT * FROM test_errors ORDER BY version;
+-- Verify table has all 4 rows
+SELECT 'Table has all rows:' as test;
+SELECT id, version, data FROM test_errors ORDER BY _xp_seq;
 
 DROP TABLE test_errors;
 

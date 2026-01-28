@@ -115,6 +115,10 @@ jobs:
         with:
           path: artifacts
       
+      - name: Get version without v prefix
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+      
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -125,7 +129,7 @@ jobs:
             
             ### Docker (Easiest)
             ```bash
-            docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=secret ghcr.io/imgajeed76/pg-xpatch:${{ github.ref_name }}
+            docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=secret ghcr.io/imgajeed76/pg-xpatch:${{ steps.version.outputs.VERSION }}
             psql -h localhost -U postgres -c "CREATE EXTENSION pg_xpatch;"
             ```
             

@@ -1206,8 +1206,9 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     }
     
     /*
-     * Check for restore mode: if user explicitly provides _xp_seq, use it.
+     * Restore mode: if user explicitly provides _xp_seq > 0, use it.
      * This enables pg_restore / COPY FROM with explicit sequence numbers.
+     * Normal inserts (without explicit _xp_seq) auto-allocate.
      */
     if (config->xp_seq_attnum != InvalidAttrNumber)
     {
@@ -1220,19 +1221,19 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                 restore_mode = true;
                 new_seq = user_seq;
                 elog(DEBUG1, "xpatch: restore mode - using explicit _xp_seq=%d", new_seq);
-                
+
                 /*
                  * Update the seq cache if this seq is higher than what we have.
                  * This ensures subsequent auto-generated inserts continue correctly.
                  */
                 {
                     bool cache_found;
-                    int32 cached_max = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel), 
+                    int32 cached_max = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel),
                                                                      group_value, group_typid,
                                                                      &cache_found);
                     if (!cache_found || new_seq > cached_max)
                     {
-                        xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value, 
+                        xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value,
                                                      group_typid, new_seq);
                     }
                 }

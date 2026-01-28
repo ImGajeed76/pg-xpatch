@@ -2,6 +2,40 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
+## [0.3.0] - 2025-01-28
+
+### Added
+
+- **FIFO insert cache**: DSA-backed per-group ring buffer that caches the last `compress_depth` reconstructed row contents, eliminating O(depth) reconstruction on the warm INSERT path. Configurable via `pg_xpatch.insert_cache_slots` GUC (default 16).
+
+- **Lock-free encode thread pool**: Persistent pthread pool for parallelizing `xpatch_encode()` FFI calls with lock-free task dispatch via atomic fetch-add. Configurable via `pg_xpatch.encode_threads` GUC (default 0, opt-in).
+
+### Performance
+
+- **10.7x INSERT speedup** at depth=1000, 2KB payloads:
+  - v0.2.1 baseline: 16.3s for 1000 inserts
+  - Warm path sequential: 4.6s (3.5x faster)
+  - Warm path with encode_threads=4: 1.5s (10.7x faster)
+
+### Changed
+
+- **Removed version validation**: The `order_by` column is no longer enforced to be strictly increasing. Previously, inserting a duplicate or lower version number would error. Now, the user's version column is treated as regular data, and `_xp_seq` handles all internal ordering. This simplifies the insert path and removes the overhead of version checking.
+
+- **Simplified restore mode**: Explicit `_xp_seq` values are now always honored when provided (value > 0). The `pg_xpatch.restore_mode` GUC has been removed. This makes `pg_dump`/`pg_restore` work out of the box without any special configuration.
+
+- **Auto-seq mode**: Using `_xp_seq=0` as sentinel now skips version validation and enables warm insert path.
+
+### Fixed
+
+- **CI/CD release notes**: Docker image tag in release notes now correctly shows version without `v` prefix (e.g., `0.3.0` instead of `v0.3.0`).
+
+- **Cache invalidation**: Added insert cache invalidation to DELETE/TRUNCATE/VACUUM paths.
+
+### Removed
+
+- `pg_xpatch.restore_mode` GUC - no longer needed, restore mode is automatic when `_xp_seq` is explicitly provided
+- `xpatch_compare_versions()` internal function - version comparison no longer performed
+
 ## [0.1.0] - 2025-01-19
 
 Initial release.

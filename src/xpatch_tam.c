@@ -732,46 +732,6 @@ xpatch_compute_group_lock_id(Oid relid, Datum group_value)
     return h;
 }
 
-/*
- * Compare two version datums safely without integer overflow.
- * Returns: negative if v1 < v2, zero if v1 == v2, positive if v1 > v2
- */
-static int
-xpatch_compare_versions(Datum v1, Datum v2, Oid typid)
-{
-    switch (typid)
-    {
-        case INT2OID:
-            {
-                int16 a = DatumGetInt16(v1);
-                int16 b = DatumGetInt16(v2);
-                return (a > b) ? 1 : ((a < b) ? -1 : 0);
-            }
-        case INT4OID:
-            {
-                int32 a = DatumGetInt32(v1);
-                int32 b = DatumGetInt32(v2);
-                return (a > b) ? 1 : ((a < b) ? -1 : 0);
-            }
-        case INT8OID:
-            {
-                int64 a = DatumGetInt64(v1);
-                int64 b = DatumGetInt64(v2);
-                return (a > b) ? 1 : ((a < b) ? -1 : 0);
-            }
-        case TIMESTAMPOID:
-        case TIMESTAMPTZOID:
-            {
-                Timestamp a = DatumGetTimestamp(v1);
-                Timestamp b = DatumGetTimestamp(v2);
-                return (a > b) ? 1 : ((a < b) ? -1 : 0);
-            }
-        default:
-            /* Fallback for unknown types - assume valid order */
-            return 1;
-    }
-}
-
 static void
 xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
                     CommandId cid, int options,
@@ -784,7 +744,6 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
     volatile Datum group_value = (Datum) 0;
     TupleDesc tupdesc = RelationGetDescr(relation);
     uint64 group_lock_id;
-    bool restore_mode = false;
     volatile int32 allocated_seq = 0;  /* For rollback on failure */
     volatile Oid group_typid = InvalidOid;
 
@@ -795,23 +754,6 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
     /* Validate the schema on first insert */
     xpatch_validate_schema(relation, config);
     elog(DEBUG1, "xpatch_tuple_insert: schema validated");
-
-    /*
-     * Check for restore mode: if _xp_seq is explicitly provided with a 
-     * positive value, we're in restore mode (e.g., from pg_restore/COPY).
-     * In restore mode, we skip version validation because the data is
-     * known-good from the dump and may be interleaved across groups.
-     */
-    if (config->xp_seq_attnum != InvalidAttrNumber)
-    {
-        bool isnull;
-        Datum seq_datum = slot_getattr(slot, config->xp_seq_attnum, &isnull);
-        if (!isnull && DatumGetInt32(seq_datum) > 0)
-        {
-            restore_mode = true;
-            elog(DEBUG1, "xpatch_tuple_insert: restore mode detected (_xp_seq explicitly provided)");
-        }
-    }
 
     /* Get group value and type if configured */
     if (config->group_by_attnum != InvalidAttrNumber)
@@ -832,68 +774,9 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
      */
     group_lock_id = xpatch_compute_group_lock_id(RelationGetRelid(relation), group_value);
     DirectFunctionCall1(pg_advisory_xact_lock_int8, Int64GetDatum((int64) group_lock_id));
-    
-    elog(DEBUG1, "xpatch_tuple_insert: acquired advisory lock for group (lock_id=%lu)", 
+
+    elog(DEBUG1, "xpatch_tuple_insert: acquired advisory lock for group (lock_id=%lu)",
          (unsigned long) group_lock_id);
-
-    /* 
-     * VALIDATE VERSION: Must be greater than max version in group.
-     * Skip in restore mode - the data is known-good from the dump.
-     */
-    if (!restore_mode)
-    {
-        bool max_is_null;
-        Datum max_version;
-        Datum new_version;
-        bool new_is_null;
-        bool auto_seq = false;
-
-        new_version = slot_getattr(slot, config->order_by_attnum, &new_is_null);
-        
-        if (new_is_null)
-        {
-            ereport(ERROR,
-                    (errcode(ERRCODE_NOT_NULL_VIOLATION),
-                     errmsg("xpatch: order_by column \"%s\" cannot be NULL",
-                            config->order_by)));
-        }
-
-        /*
-         * Auto-seq sentinel: when order_by IS _xp_seq and the user provides
-         * value 0, this is auto-allocation mode. The value 0 is reserved as
-         * the sentinel — it cannot be a valid sequence number. Skip version
-         * validation because xpatch_logical_to_physical will auto-allocate
-         * the next sequence number for this group.
-         */
-        if (config->order_by_attnum == config->xp_seq_attnum &&
-            DatumGetInt32(new_version) == 0)
-        {
-            auto_seq = true;
-        }
-
-        if (!auto_seq)
-        {
-            max_version = xpatch_get_max_version(relation, config, group_value, &max_is_null);
-
-            if (!max_is_null)
-            {
-                /* Compare versions using safe comparison (no overflow) */
-                Form_pg_attribute attr = TupleDescAttr(tupdesc, config->order_by_attnum - 1);
-                int cmp = xpatch_compare_versions(new_version, max_version, attr->atttypid);
-
-                if (cmp <= 0)
-                {
-                    ereport(ERROR,
-                            (errcode(ERRCODE_CHECK_VIOLATION),
-                             errmsg("xpatch: new version must be greater than existing max version"),
-                             errhint("The order_by column \"%s\" must be strictly increasing within each group.",
-                                     config->order_by)));
-                }
-            }
-        }
-    }
-
-    elog(DEBUG1, "xpatch_tuple_insert: version validated, creating physical tuple");
 
     /* Use a temporary context for insert operations */
     insert_mcxt = AllocSetContextCreate(CurrentMemoryContext,

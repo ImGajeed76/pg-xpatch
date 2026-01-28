@@ -1,12 +1,12 @@
 -- Test 18: Restore Mode for pg_dump/pg_restore
--- Tests that explicit _xp_seq values are respected during INSERT (restore mode)
--- This enables pg_dump/pg_restore to work correctly with xpatch tables
+-- Tests that explicit _xp_seq values are honored during INSERT/COPY.
+-- This enables pg_dump/pg_restore to work correctly with xpatch tables.
 
 -- Suppress NOTICE messages for cleaner test output
 SET client_min_messages = warning;
 
 -- =============================================================================
--- Test 1: Basic restore mode - explicit _xp_seq values
+-- Test 1: Normal insert - _xp_seq auto-allocated
 -- =============================================================================
 
 CREATE TABLE restore_test1 (
@@ -21,13 +21,17 @@ SELECT xpatch.configure('restore_test1',
     order_by => 'version',
     delta_columns => ARRAY['content']);
 
--- Normal insert (should auto-generate _xp_seq = 1)
+-- Normal insert without _xp_seq (auto-generates _xp_seq = 1)
 INSERT INTO restore_test1 (doc_id, version, content) VALUES (1, 1, 'Version 1');
 
 -- Check _xp_seq was auto-generated
 SELECT doc_id, version, _xp_seq FROM restore_test1;
 
--- Restore mode: INSERT with explicit _xp_seq = 2
+-- =============================================================================
+-- Test 2: Explicit _xp_seq is honored (restore mode)
+-- =============================================================================
+
+-- Insert with explicit _xp_seq = 2 (simulates pg_restore)
 INSERT INTO restore_test1 (doc_id, version, _xp_seq, content) VALUES (1, 2, 2, 'Version 2');
 
 -- Verify explicit _xp_seq was used
@@ -40,8 +44,7 @@ INSERT INTO restore_test1 (doc_id, version, content) VALUES (1, 3, 'Version 3');
 SELECT doc_id, version, _xp_seq FROM restore_test1 ORDER BY _xp_seq;
 
 -- =============================================================================
--- Test 2: Restore mode skips version validation
--- This allows restoring data in COPY order (not necessarily per-group order)
+-- Test 3: Multi-group restore with interleaved data
 -- =============================================================================
 
 CREATE TABLE restore_test2 (
@@ -56,20 +59,19 @@ SELECT xpatch.configure('restore_test2',
     order_by => 'version',
     delta_columns => ARRAY['content']);
 
--- Simulate COPY FROM: data comes in table order, not per-group order
--- This would fail without restore mode because doc_id=2/version=1 < doc_id=1/version=3
+-- Simulate COPY FROM / pg_restore: data comes in table order with explicit _xp_seq
 INSERT INTO restore_test2 (doc_id, version, _xp_seq, content) VALUES 
     (1, 1, 1, 'Doc 1 v1'),
     (1, 2, 2, 'Doc 1 v2'),
     (1, 3, 3, 'Doc 1 v3'),
-    (2, 1, 1, 'Doc 2 v1'),  -- version=1 < max(version) but OK in restore mode
+    (2, 1, 1, 'Doc 2 v1'),
     (2, 2, 2, 'Doc 2 v2');
 
--- Verify all rows were inserted
+-- Verify all rows were inserted with correct _xp_seq
 SELECT doc_id, version, _xp_seq, content FROM restore_test2 ORDER BY doc_id, version;
 
 -- =============================================================================
--- Test 3: dump_configs() generates correct SQL
+-- Test 4: dump_configs() generates correct SQL
 -- =============================================================================
 
 SELECT 'Testing dump_configs():' AS test;
@@ -78,15 +80,15 @@ SELECT 'Testing dump_configs():' AS test;
 SELECT dc FROM xpatch.dump_configs() dc WHERE dc LIKE '%restore_test1%';
 
 -- =============================================================================
--- Test 4: Continue inserting after restore
+-- Test 5: Continue inserting after restore
 -- =============================================================================
 
--- Insert new rows into restored table
+-- Insert new rows into restored table (auto-allocate continues from max)
 INSERT INTO restore_test2 (doc_id, version, content) VALUES 
     (1, 4, 'Doc 1 v4 - post-restore'),
     (2, 3, 'Doc 2 v3 - post-restore');
 
--- Verify correct sequence numbers were assigned
+-- Verify correct sequence numbers were assigned (4 and 3 respectively)
 SELECT doc_id, version, _xp_seq, content FROM restore_test2 ORDER BY doc_id, version;
 
 -- Verify reconstruction still works

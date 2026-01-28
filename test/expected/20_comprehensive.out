@@ -890,34 +890,30 @@ SELECT xpatch.configure('test_errors',
 
 INSERT INTO test_errors VALUES (1, 1, 'first');
 INSERT INTO test_errors VALUES (1, 2, 'second');
--- Test: INSERT with duplicate/lower version should fail
-\set ON_ERROR_STOP off
-INSERT INTO test_errors VALUES (1, 1, 'duplicate'); -- Should fail
-ERROR:  xpatch: new version must be greater than existing max version
-HINT:  The order_by column "version" must be strictly increasing within each group.
-INSERT INTO test_errors VALUES (1, 0, 'lower'); -- Should fail
-ERROR:  xpatch: new version must be greater than existing max version
-HINT:  The order_by column "version" must be strictly increasing within each group.
-\set ON_ERROR_STOP on
+-- Duplicate/lower version values are now allowed (auto-seq handles ordering)
+INSERT INTO test_errors VALUES (1, 1, 'duplicate version value');
+INSERT INTO test_errors VALUES (1, 0, 'lower version value');
 -- Test: UPDATE should fail
 \set ON_ERROR_STOP off
 UPDATE test_errors SET data = 'modified' WHERE id = 1 AND version = 1; -- Should fail
 ERROR:  UPDATE is not supported on xpatch tables
 HINT:  xpatch tables are append-only. Insert a new version instead.
 \set ON_ERROR_STOP on
--- Verify table is still intact
-SELECT 'Table still intact after errors:' as test;
-               test               
-----------------------------------
- Table still intact after errors:
+-- Verify table has all 4 rows
+SELECT 'Table has all rows:' as test;
+        test         
+---------------------
+ Table has all rows:
 (1 row)
 
-SELECT * FROM test_errors ORDER BY version;
- id | version |  data  | _xp_seq 
-----+---------+--------+---------
-  1 |       1 | first  |       1
-  1 |       2 | second |       2
-(2 rows)
+SELECT id, version, data FROM test_errors ORDER BY _xp_seq;
+ id | version |          data           
+----+---------+-------------------------
+  1 |       1 | first
+  1 |       2 | second
+  1 |       1 | duplicate version value
+  1 |       0 | lower version value
+(4 rows)
 
 DROP TABLE test_errors;
 -- ================================================================
