@@ -1179,6 +1179,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     Oid group_typid = InvalidOid;
     int insert_cache_slot = -1;
     bool insert_cache_is_new = false;
+    XPatchGroupHash insert_cache_hash = {0};  /* For ownership validation */
     
     /* Initialize out_seq to 0 (will be set later if allocation succeeds) */
     if (out_seq)
@@ -1284,7 +1285,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
         insert_cache_slot = xpatch_insert_cache_get_slot(
             RelationGetRelid(rel), group_value, group_typid,
             config->compress_depth, config->num_delta_columns,
-            &insert_cache_is_new);
+            &insert_cache_is_new, &insert_cache_hash);
         
         if (insert_cache_is_new && insert_cache_slot >= 0 && new_seq > 1 && !is_keyframe)
         {
@@ -1378,8 +1379,11 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                 /* Try to get bases from FIFO cache first */
                 if (insert_cache_slot >= 0)
                 {
-                    xpatch_insert_cache_get_bases(insert_cache_slot, new_seq,
-                                                  delta_col_index, fifo_bases);
+                    xpatch_insert_cache_get_bases(insert_cache_slot,
+                                                  RelationGetRelid(rel),
+                                                  insert_cache_hash,
+                                                  new_seq, delta_col_index,
+                                                  fifo_bases);
                 }
 
                 if (fifo_bases->count > 0)
@@ -1553,8 +1557,10 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                 /* Push into FIFO insert cache for future inserts */
                 if (insert_cache_slot >= 0)
                 {
-                    xpatch_insert_cache_push(insert_cache_slot, new_seq,
-                                             delta_col_index,
+                    xpatch_insert_cache_push(insert_cache_slot,
+                                             RelationGetRelid(rel),
+                                             insert_cache_hash,
+                                             new_seq, delta_col_index,
                                              (const uint8 *) VARDATA_ANY(cache_content),
                                              VARSIZE_ANY_EXHDR(cache_content));
                 }
@@ -1569,7 +1575,10 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     /* Commit the FIFO entry after all delta columns are written */
     if (insert_cache_slot >= 0 && !restore_mode)
     {
-        xpatch_insert_cache_commit_entry(insert_cache_slot, new_seq);
+        xpatch_insert_cache_commit_entry(insert_cache_slot,
+                                         RelationGetRelid(rel),
+                                         insert_cache_hash,
+                                         new_seq);
     }
     
     /* Build the physical tuple */

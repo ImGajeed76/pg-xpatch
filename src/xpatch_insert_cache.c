@@ -81,6 +81,7 @@ typedef struct InsertCacheShmem
     pg_atomic_uint64 hit_count;
     pg_atomic_uint64 miss_count;
     pg_atomic_uint64 eviction_count;
+    pg_atomic_uint64 eviction_miss_count;  /* Slot evicted while in use */
     InsertCacheSlot slots[FLEXIBLE_ARRAY_MEMBER];
 } InsertCacheShmem;
 
@@ -224,6 +225,7 @@ insert_cache_shmem_startup(void)
         pg_atomic_init_u64(&insert_cache->hit_count, 0);
         pg_atomic_init_u64(&insert_cache->miss_count, 0);
         pg_atomic_init_u64(&insert_cache->eviction_count, 0);
+        pg_atomic_init_u64(&insert_cache->eviction_miss_count, 0);
 
         for (i = 0; i < xpatch_insert_cache_slots; i++)
             init_slot(&insert_cache->slots[i]);
@@ -428,7 +430,8 @@ find_least_active_slot(void)
  */
 int
 xpatch_insert_cache_get_slot(Oid relid, Datum group_value, Oid typid,
-                             int depth, int num_delta_cols, bool *is_new)
+                             int depth, int num_delta_cols, bool *is_new,
+                             XPatchGroupHash *out_hash)
 {
     XPatchGroupHash ghash;
     int i;
@@ -446,6 +449,10 @@ xpatch_insert_cache_get_slot(Oid relid, Datum group_value, Oid typid,
     ensure_dsa_attached();
 
     ghash = xpatch_compute_group_hash(group_value, typid, false);
+
+    /* Return the hash to caller for ownership validation */
+    if (out_hash)
+        *out_hash = ghash;
 
     *is_new = false;
 
@@ -527,13 +534,39 @@ xpatch_insert_cache_get_slot(Oid relid, Datum group_value, Oid typid,
     return slot_idx;
 }
 
+/* Per-backend flag to avoid spamming eviction warnings */
+static bool eviction_miss_warned = false;
+
+/*
+ * Record an eviction miss and warn once per backend.
+ */
+static void
+record_eviction_miss(void)
+{
+    pg_atomic_fetch_add_u64(&insert_cache->eviction_miss_count, 1);
+
+    if (!eviction_miss_warned)
+    {
+        elog(WARNING, "xpatch: insert cache slot evicted during use "
+             "(consider increasing pg_xpatch.insert_cache_slots from %d "
+             "or reducing concurrent writers to the same table)",
+             xpatch_insert_cache_slots);
+        eviction_miss_warned = true;
+    }
+}
+
 /*
  * Get base contents from a FIFO slot for delta encoding.
  * Returns up to depth bases, each palloc'd in CurrentMemoryContext.
+ *
+ * If the slot has been evicted and reused by another group, returns count=0
+ * and the caller should fall back to reconstruction.
  */
 void
-xpatch_insert_cache_get_bases(int slot_idx, int32 new_seq,
-                              int col_idx, InsertCacheBases *bases)
+xpatch_insert_cache_get_bases(int slot_idx, Oid relid,
+                              XPatchGroupHash expected_hash,
+                              int32 new_seq, int col_idx,
+                              InsertCacheBases *bases)
 {
     InsertCacheSlot *slot;
     void *ring_base;
@@ -557,6 +590,19 @@ xpatch_insert_cache_get_bases(int slot_idx, int32 new_seq,
         return;
 
     LWLockAcquire(&insert_cache_locks[slot_idx].lock, LW_SHARED);
+
+    /*
+     * Ownership check: verify slot still belongs to our (relid, group).
+     * Another process may have evicted and reused this slot since get_slot().
+     */
+    if (!slot->in_use ||
+        slot->relid != relid ||
+        !xpatch_group_hash_equals(slot->group_hash, expected_hash))
+    {
+        LWLockRelease(&insert_cache_locks[slot_idx].lock);
+        record_eviction_miss();
+        return;  /* Cache miss - caller falls back to reconstruction */
+    }
 
     ring_base = dsa_get_address(insert_cache_dsa, slot->ring_ptr);
     seqs = ring_seqs(ring_base);
@@ -641,10 +687,13 @@ xpatch_insert_cache_get_bases(int slot_idx, int32 new_seq,
 
 /*
  * Push new row content into the FIFO ring buffer for one column.
+ * If the slot has been evicted and reused by another group, this is a no-op.
  */
 void
-xpatch_insert_cache_push(int slot_idx, int32 seq,
-                          int col_idx, const uint8 *data, Size size)
+xpatch_insert_cache_push(int slot_idx, Oid relid,
+                         XPatchGroupHash expected_hash,
+                         int32 seq, int col_idx,
+                         const uint8 *data, Size size)
 {
     InsertCacheSlot *slot;
     void *ring_base;
@@ -670,6 +719,19 @@ xpatch_insert_cache_push(int slot_idx, int32 seq,
         return;
 
     LWLockAcquire(&insert_cache_locks[slot_idx].lock, LW_EXCLUSIVE);
+
+    /*
+     * Ownership check: verify slot still belongs to our (relid, group).
+     * If not, silently skip - the data was already written to heap correctly.
+     */
+    if (!slot->in_use ||
+        slot->relid != relid ||
+        !xpatch_group_hash_equals(slot->group_hash, expected_hash))
+    {
+        LWLockRelease(&insert_cache_locks[slot_idx].lock);
+        record_eviction_miss();
+        return;
+    }
 
     ring_base = dsa_get_address(insert_cache_dsa, slot->ring_ptr);
     ptrs = ring_ptrs(ring_base, slot->depth);
@@ -707,9 +769,12 @@ xpatch_insert_cache_push(int slot_idx, int32 seq,
 
 /*
  * Mark a FIFO entry as complete (all columns written).
+ * If the slot has been evicted and reused by another group, this is a no-op.
  */
 void
-xpatch_insert_cache_commit_entry(int slot_idx, int32 seq)
+xpatch_insert_cache_commit_entry(int slot_idx, Oid relid,
+                                 XPatchGroupHash expected_hash,
+                                 int32 seq)
 {
     InsertCacheSlot *slot;
     void *ring_base;
@@ -726,6 +791,19 @@ xpatch_insert_cache_commit_entry(int slot_idx, int32 seq)
         return;
 
     LWLockAcquire(&insert_cache_locks[slot_idx].lock, LW_EXCLUSIVE);
+
+    /*
+     * Ownership check: verify slot still belongs to our (relid, group).
+     * If not, silently skip.
+     */
+    if (!slot->in_use ||
+        slot->relid != relid ||
+        !xpatch_group_hash_equals(slot->group_hash, expected_hash))
+    {
+        LWLockRelease(&insert_cache_locks[slot_idx].lock);
+        record_eviction_miss();
+        return;
+    }
 
     ring_base = dsa_get_address(insert_cache_dsa, slot->ring_ptr);
     valid = ring_valid(ring_base, slot->depth);
@@ -748,6 +826,8 @@ xpatch_insert_cache_commit_entry(int slot_idx, int32 seq)
 
 /*
  * Populate a FIFO slot with reconstructed content (cold start).
+ * This is called right after get_slot() when we own the slot, so we use
+ * the slot's own relid/hash for the ownership checks.
  */
 void
 xpatch_insert_cache_populate(int slot_idx, Relation rel,
@@ -755,6 +835,8 @@ xpatch_insert_cache_populate(int slot_idx, Relation rel,
                              Datum group_value, int32 current_max_seq)
 {
     InsertCacheSlot *slot;
+    Oid relid;
+    XPatchGroupHash slot_hash;
     int depth;
     int num_to_populate;
     int i, j;
@@ -769,6 +851,10 @@ xpatch_insert_cache_populate(int slot_idx, Relation rel,
         return;
 
     ensure_dsa_attached();
+
+    /* Capture ownership info from slot (we own it, just got it from get_slot) */
+    relid = slot->relid;
+    slot_hash = slot->group_hash;
 
     depth = slot->depth;
 
@@ -794,14 +880,15 @@ xpatch_insert_cache_populate(int slot_idx, Relation rel,
                                                 seq, j);
             if (content != NULL)
             {
-                xpatch_insert_cache_push(slot_idx, seq, j,
+                xpatch_insert_cache_push(slot_idx, relid, slot_hash,
+                                         seq, j,
                                          (const uint8 *) VARDATA_ANY(content),
                                          VARSIZE_ANY_EXHDR(content));
                 pfree(content);
             }
         }
 
-        xpatch_insert_cache_commit_entry(slot_idx, seq);
+        xpatch_insert_cache_commit_entry(slot_idx, relid, slot_hash, seq);
     }
 }
 
@@ -855,6 +942,7 @@ xpatch_insert_cache_get_stats(InsertCacheStats *stats)
     stats->hits = pg_atomic_read_u64(&insert_cache->hit_count);
     stats->misses = pg_atomic_read_u64(&insert_cache->miss_count);
     stats->evictions = pg_atomic_read_u64(&insert_cache->eviction_count);
+    stats->eviction_misses = pg_atomic_read_u64(&insert_cache->eviction_miss_count);
 
     for (i = 0; i < insert_cache->num_slots; i++)
     {

@@ -1,6 +1,6 @@
 # pg_xpatch extension control file
 comment = 'Table Access Method for delta-compressed versioned data using xpatch'
-default_version = '0.3.0'
+default_version = '0.3.1'
 module_pathname = '$libdir/pg_xpatch'
 relocatable = false
 requires = ''

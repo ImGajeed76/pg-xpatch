@@ -30,6 +30,7 @@
 #include "xpatch_config.h"
 #include "xpatch_cache.h"
 #include "xpatch_compress.h"
+#include "xpatch_insert_cache.h"
 #include "xpatch_storage.h"
 
 #include "access/amapi.h"
@@ -575,6 +576,44 @@ xpatch_cache_stats_fn(PG_FUNCTION_ARGS)
     values[3] = Int64GetDatum(stats.hit_count);
     values[4] = Int64GetDatum(stats.miss_count);
     values[5] = Int64GetDatum(stats.eviction_count);
+
+    result_tuple = heap_form_tuple(tupdesc, values, nulls);
+
+    PG_RETURN_DATUM(HeapTupleGetDatum(result_tuple));
+}
+
+/*
+ * xpatch_insert_cache_stats() - Get insert cache statistics
+ */
+PG_FUNCTION_INFO_V1(xpatch_insert_cache_stats_fn);
+Datum
+xpatch_insert_cache_stats_fn(PG_FUNCTION_ARGS)
+{
+    TupleDesc tupdesc;
+    Datum values[6];
+    bool nulls[6];
+    HeapTuple result_tuple;
+    InsertCacheStats stats;
+
+    /* Build result tuple descriptor */
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("function returning record called in context "
+                        "that cannot accept type record")));
+
+    /* Get insert cache statistics */
+    xpatch_insert_cache_get_stats(&stats);
+
+    /* Build result tuple */
+    memset(nulls, 0, sizeof(nulls));
+
+    values[0] = Int64GetDatum(stats.slots_in_use);
+    values[1] = Int64GetDatum(stats.total_slots);
+    values[2] = Int64GetDatum(stats.hits);
+    values[3] = Int64GetDatum(stats.misses);
+    values[4] = Int64GetDatum(stats.evictions);
+    values[5] = Int64GetDatum(stats.eviction_misses);
 
     result_tuple = heap_form_tuple(tupdesc, values, nulls);
 

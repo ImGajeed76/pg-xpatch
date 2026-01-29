@@ -2,7 +2,21 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
-## [0.3.0] - 2025-01-28
+## [0.3.1] - 2025-01-29
+
+### Fixed
+
+- **Critical: Insert cache race condition** - Fixed a race condition where insert cache slots could be evicted while another process was still using them, leading to delta encoding corruption and "xpatch decode error" on read. The fix validates ownership (relid + group_hash) after acquiring the lock; if the slot was evicted, operations gracefully fall back to reconstruction.
+
+### Added
+
+- **Insert cache stats function** - Added `xpatch_insert_cache_stats()` / `xpatch.insert_cache_stats()` to monitor insert cache health. Returns `slots_in_use`, `total_slots`, `hits`, `misses`, `evictions`, and `eviction_misses` (race condition detections).
+
+- **Eviction miss warning** - When a race condition is detected, a WARNING is logged once per backend suggesting to increase `pg_xpatch.insert_cache_slots` or reduce concurrent writers.
+
+## [0.3.0] - 2025-01-28 [YANKED - DO NOT USE]
+
+**WARNING: This version contains a critical bug that can cause data corruption under concurrent writes. Upgrade to v0.3.1 immediately.**
 
 ### Added
 

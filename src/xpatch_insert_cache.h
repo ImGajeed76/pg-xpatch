@@ -123,11 +123,13 @@ void xpatch_insert_cache_init(void);
  *   depth       - Desired ring buffer depth (compression_depth)
  *   num_delta_cols - Number of delta columns in the table
  *   is_new      - Output: true if this is a freshly allocated slot (cold start)
+ *   out_hash    - Output: the computed group hash (for ownership validation)
  *
  * Returns the slot index, or -1 if insert cache is not available.
  */
 int xpatch_insert_cache_get_slot(Oid relid, Datum group_value, Oid typid,
-                                 int depth, int num_delta_cols, bool *is_new);
+                                 int depth, int num_delta_cols, bool *is_new,
+                                 XPatchGroupHash *out_hash);
 
 /*
  * Get base contents from a FIFO slot for delta encoding.
@@ -136,38 +138,57 @@ int xpatch_insert_cache_get_slot(Oid relid, Datum group_value, Oid typid,
  * The returned data pointers are palloc'd copies valid in the current
  * memory context. Caller must pfree them when done.
  *
+ * If the slot has been evicted and reused by another group, returns count=0
+ * (caller should fall back to reconstruction).
+ *
  * Parameters:
- *   slot_idx    - Slot index from xpatch_insert_cache_get_slot()
- *   new_seq     - Sequence number of the row being inserted
- *   col_idx     - Delta column index (0-based)
- *   bases       - Output: filled with base information
+ *   slot_idx      - Slot index from xpatch_insert_cache_get_slot()
+ *   relid         - Relation OID (for ownership validation)
+ *   expected_hash - Group hash from get_slot (for ownership validation)
+ *   new_seq       - Sequence number of the row being inserted
+ *   col_idx       - Delta column index (0-based)
+ *   bases         - Output: filled with base information
  */
-void xpatch_insert_cache_get_bases(int slot_idx, int32 new_seq,
-                                   int col_idx, InsertCacheBases *bases);
+void xpatch_insert_cache_get_bases(int slot_idx, Oid relid,
+                                   XPatchGroupHash expected_hash,
+                                   int32 new_seq, int col_idx,
+                                   InsertCacheBases *bases);
 
 /*
  * Push new row content into the FIFO ring buffer for one column.
  * Evicts the oldest entry if the ring is full.
  *
+ * If the slot has been evicted and reused by another group, this is a no-op.
+ *
  * Parameters:
- *   slot_idx    - Slot index
- *   seq         - Sequence number of the new row
- *   col_idx     - Delta column index (0-based)
- *   data        - Raw content to store
- *   size        - Content size in bytes
+ *   slot_idx      - Slot index
+ *   relid         - Relation OID (for ownership validation)
+ *   expected_hash - Group hash from get_slot (for ownership validation)
+ *   seq           - Sequence number of the new row
+ *   col_idx       - Delta column index (0-based)
+ *   data          - Raw content to store
+ *   size          - Content size in bytes
  */
-void xpatch_insert_cache_push(int slot_idx, int32 seq,
-                              int col_idx, const uint8 *data, Size size);
+void xpatch_insert_cache_push(int slot_idx, Oid relid,
+                              XPatchGroupHash expected_hash,
+                              int32 seq, int col_idx,
+                              const uint8 *data, Size size);
 
 /*
  * Mark a FIFO entry as complete (all columns written).
  * Called after all delta columns for a row have been pushed.
  *
+ * If the slot has been evicted and reused by another group, this is a no-op.
+ *
  * Parameters:
- *   slot_idx    - Slot index
- *   seq         - Sequence number that was just completed
+ *   slot_idx      - Slot index
+ *   relid         - Relation OID (for ownership validation)
+ *   expected_hash - Group hash from get_slot (for ownership validation)
+ *   seq           - Sequence number that was just completed
  */
-void xpatch_insert_cache_commit_entry(int slot_idx, int32 seq);
+void xpatch_insert_cache_commit_entry(int slot_idx, Oid relid,
+                                      XPatchGroupHash expected_hash,
+                                      int32 seq);
 
 /*
  * Populate a FIFO slot with reconstructed content (cold start).
@@ -201,6 +222,7 @@ typedef struct InsertCacheStats
     int64       hits;           /* FIFO was already warm */
     int64       misses;         /* Cold start required */
     int64       evictions;      /* Slots evicted for reuse */
+    int64       eviction_misses; /* Slot evicted while in use (race condition) */
 } InsertCacheStats;
 
 void xpatch_insert_cache_get_stats(InsertCacheStats *stats);
