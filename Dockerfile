@@ -14,13 +14,13 @@ ARG PG_MAJOR=16
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install build dependencies
-# Note: We install clang/llvm matching what postgresql-server-dev pulls in
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     postgresql-server-dev-${PG_MAJOR} \
     curl \
     ca-certificates \
     pkg-config \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust
