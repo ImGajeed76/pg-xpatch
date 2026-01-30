@@ -34,6 +34,7 @@
 #include "xpatch_cache.h"
 #include "xpatch_seq_cache.h"
 #include "xpatch_insert_cache.h"
+#include "xpatch_stats_cache.h"
 
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
@@ -1409,6 +1410,15 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
             /* Deleted all rows in group - remove from cache */
             xpatch_seq_cache_set_max_seq(relid, group_value, group_typid, 0);
         }
+        
+        /*
+         * Step 7: Invalidate stats cache for this group.
+         * Stats will be recomputed on next access or explicit refresh.
+         */
+        {
+            XPatchGroupHash group_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
+            xpatch_stats_cache_invalidate_group(relid, group_hash);
+        }
     }
     
     return TM_Ok;
@@ -1684,6 +1694,7 @@ xpatch_relation_nontransactional_truncate(Relation rel)
     xpatch_cache_invalidate_rel(relid);      /* Content cache */
     xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
     xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
+    xpatch_stats_cache_invalidate_table(relid); /* Stats cache */
 
     /* Delegate to heap */
     RelationTruncate(rel, 0);

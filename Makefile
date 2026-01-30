@@ -15,6 +15,7 @@ OBJS = src/pg_xpatch.o \
        src/xpatch_seq_cache.o \
        src/xpatch_insert_cache.o \
        src/xpatch_encode_pool.o \
+       src/xpatch_stats_cache.o \
        src/xpatch_utils.o \
        lib/blake3/blake3.o \
        lib/blake3/blake3_dispatch.o \
@@ -53,9 +54,10 @@ SHLIB_LINK_INTERNAL = $(BLAKE3_ASM_OBJS)
 # Extension data files
 DATA = sql/pg_xpatch--0.1.0.sql sql/pg_xpatch--0.1.1.sql sql/pg_xpatch--0.2.0.sql \
        sql/pg_xpatch--0.2.1.sql sql/pg_xpatch--0.3.0.sql sql/pg_xpatch--0.3.1.sql \
-       sql/pg_xpatch--0.1.0--0.1.1.sql sql/pg_xpatch--0.1.1--0.2.0.sql \
-       sql/pg_xpatch--0.2.0--0.2.1.sql sql/pg_xpatch--0.2.1--0.3.0.sql \
-       sql/pg_xpatch--0.3.0--0.3.1.sql
+       sql/pg_xpatch--0.4.0.sql sql/pg_xpatch--0.1.0--0.1.1.sql \
+       sql/pg_xpatch--0.1.1--0.2.0.sql sql/pg_xpatch--0.2.0--0.2.1.sql \
+       sql/pg_xpatch--0.2.1--0.3.0.sql sql/pg_xpatch--0.3.0--0.3.1.sql \
+       sql/pg_xpatch--0.3.1--0.4.0.sql
 EXTRA_CLEAN = lib/libxpatch_c.a lib/xpatch.h lib/blake3/*.o
 
 # Regression tests

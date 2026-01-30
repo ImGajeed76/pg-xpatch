@@ -41,6 +41,7 @@
 #include "xpatch_seq_cache.h"
 #include "xpatch_insert_cache.h"
 #include "xpatch_encode_pool.h"
+#include "xpatch_stats_cache.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -1180,6 +1181,8 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     int insert_cache_slot = -1;
     bool insert_cache_is_new = false;
     XPatchGroupHash insert_cache_hash = {0};  /* For ownership validation */
+    int64 total_raw_size = 0;      /* For stats tracking */
+    int64 total_compressed_size = 0; /* For stats tracking */
     
     /* Initialize out_seq to 0 (will be set later if allocation succeeds) */
     if (out_seq)
@@ -1554,6 +1557,10 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                 cache_content = datum_to_bytea(slot_getattr(slot, attnum, &isnull), typid, false);
                 xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid, new_seq, attnum, cache_content);
                 
+                /* Track sizes for stats */
+                total_raw_size += VARSIZE_ANY_EXHDR(cache_content);
+                total_compressed_size += VARSIZE(compressed);
+                
                 /* Push into FIFO insert cache for future inserts */
                 if (insert_cache_slot >= 0)
                 {
@@ -1579,6 +1586,52 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                                          RelationGetRelid(rel),
                                          insert_cache_hash,
                                          new_seq);
+    }
+    
+    /*
+     * Update stats cache with this insert's info.
+     * Skip in restore mode (bulk restore should use refresh_stats afterward).
+     */
+    if (!restore_mode && config->num_delta_columns > 0)
+    {
+        XPatchGroupHash stats_hash;
+        char *group_text = NULL;
+        
+        /* Use existing hash if available, otherwise compute it */
+        if (insert_cache_slot >= 0)
+        {
+            stats_hash = insert_cache_hash;
+        }
+        else
+        {
+            bool group_isnull = (group_value == (Datum) 0 && config->group_by_attnum != InvalidAttrNumber);
+            stats_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
+        }
+        
+        /* Get human-readable group value for debugging */
+        if (config->group_by_attnum != InvalidAttrNumber && group_value != (Datum) 0)
+        {
+            Oid out_func;
+            bool is_varlena;
+            getTypeOutputInfo(group_typid, &out_func, &is_varlena);
+            group_text = OidOutputFunctionCall(out_func, group_value);
+        }
+        
+        xpatch_stats_cache_update_group(
+            RelationGetRelid(rel),
+            stats_hash,
+            group_text,
+            is_keyframe,
+            new_seq,
+            InvalidOid,  /* max_version_typid - TODO: track order_by value */
+            NULL,        /* max_version_data */
+            0,           /* max_version_len */
+            total_raw_size,
+            total_compressed_size
+        );
+        
+        if (group_text)
+            pfree(group_text);
     }
     
     /* Build the physical tuple */
