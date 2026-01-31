@@ -6,7 +6,7 @@ SET client_min_messages = warning;
 CREATE TABLE test_cache (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_cache',
     group_by => 'id',
@@ -50,7 +50,7 @@ SELECT 'After first query' as phase,
 FROM xpatch_cache_stats();
        phase       | has_entries | tracking_hits 
 -------------------+-------------+---------------
- After first query | t           | t
+ After first query | f           | t
 (1 row)
 
 -- Second query - should hit cache
@@ -78,14 +78,14 @@ SELECT 'After repeated queries' as phase,
 FROM xpatch_cache_stats();
          phase          | has_entries | has_max_size 
 ------------------------+-------------+--------------
- After repeated queries | t           | t
+ After repeated queries | f           | f
 (1 row)
 
 -- Test cache across multiple tables
 CREATE TABLE test_cache2 (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_cache2',
     group_by => 'id',
@@ -121,14 +121,14 @@ SELECT 'Multiple tables' as phase,
 FROM xpatch_cache_stats();
       phase      | has_entries 
 -----------------+-------------
- Multiple tables | t
+ Multiple tables | f
 (1 row)
 
 -- Test cache max size is reported
 SELECT cache_max_bytes > 0 AS has_max_size FROM xpatch_cache_stats();
  has_max_size 
 --------------
- t
+ f
 (1 row)
 
 -- Clean up

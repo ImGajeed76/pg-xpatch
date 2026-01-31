@@ -16,7 +16,7 @@ NOTICE:  table "test_wal" does not exist, skipping
 CREATE TABLE test_wal (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: version
 NOTICE:  xpatch: auto-detected 1 delta column(s): content

@@ -13,7 +13,7 @@ SET client_min_messages = warning;
 CREATE TABLE test_analyze (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_analyze',
@@ -50,7 +50,7 @@ DROP TABLE test_analyze;
 CREATE TABLE test_vacuum_integrity (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_vacuum_integrity',

@@ -8,7 +8,7 @@ SET client_min_messages = warning;
 CREATE TABLE test_cache (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_cache',
@@ -55,7 +55,7 @@ FROM xpatch_cache_stats();
 CREATE TABLE test_cache2 (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_cache2',

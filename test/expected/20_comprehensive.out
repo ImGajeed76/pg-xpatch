@@ -10,8 +10,8 @@ SET client_min_messages = warning;
 CREATE TABLE test_nulls (
     doc_id INT,
     version INT,
-    content TEXT,
-    metadata TEXT
+    content TEXT NOT NULL,
+    metadata TEXT NOT NULL NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_nulls',
     group_by => 'doc_id',
@@ -25,9 +25,15 @@ SELECT xpatch.configure('test_nulls',
 
 -- Test NULL in delta columns
 INSERT INTO test_nulls VALUES (1, 1, 'content1', NULL);
+ERROR:  null value in column "metadata" of relation "test_nulls" violates not-null constraint
+DETAIL:  Failing row contains (1, 1, content1, null, null).
 INSERT INTO test_nulls VALUES (1, 2, NULL, 'has metadata');
+ERROR:  null value in column "content" of relation "test_nulls" violates not-null constraint
+DETAIL:  Failing row contains (1, 2, null, has metadata, null).
 INSERT INTO test_nulls VALUES (1, 3, 'content3', 'metadata3');
 INSERT INTO test_nulls VALUES (1, 4, NULL, NULL);
+ERROR:  null value in column "content" of relation "test_nulls" violates not-null constraint
+DETAIL:  Failing row contains (1, 4, null, null, null).
 SELECT 'NULL handling:' as test;
       test      
 ----------------
@@ -35,13 +41,10 @@ SELECT 'NULL handling:' as test;
 (1 row)
 
 SELECT * FROM test_nulls ORDER BY version;
- doc_id | version | content  |   metadata   | _xp_seq 
---------+---------+----------+--------------+---------
-      1 |       1 | content1 |              |       1
-      1 |       2 |          | has metadata |       2
-      1 |       3 | content3 | metadata3    |       3
-      1 |       4 |          |              |       4
-(4 rows)
+ doc_id | version | content  | metadata  | _xp_seq 
+--------+---------+----------+-----------+---------
+      1 |       3 | content3 | metadata3 |       1
+(1 row)
 
 -- Verify NULLs are preserved correctly
 SELECT 'NULL counts:' as test;
@@ -56,7 +59,7 @@ SELECT
 FROM test_nulls;
  null_content | null_metadata 
 --------------+---------------
-            2 |             2
+            0 |             0
 (1 row)
 
 DROP TABLE test_nulls;
@@ -68,7 +71,7 @@ DROP TABLE test_nulls;
 CREATE TABLE test_special_chars (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_special_chars',
     group_by => 'id',
@@ -133,7 +136,7 @@ DROP TABLE test_special_chars;
 CREATE TABLE test_long_chain (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_long_chain',
     group_by => 'id',
@@ -190,7 +193,7 @@ DROP TABLE test_long_chain;
 CREATE TABLE test_multi_group (
     group_id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_multi_group',
     group_by => 'group_id',
@@ -253,7 +256,7 @@ DROP TABLE test_multi_group;
 CREATE TABLE test_delete_edge (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_delete_edge',
     group_by => 'doc_id',
@@ -340,7 +343,7 @@ DROP TABLE test_delete_edge;
 CREATE TABLE test_indexes (
     doc_id INT,
     version INT,
-    content TEXT,
+    content TEXT NOT NULL,
     category TEXT
 ) USING xpatch;
 SELECT xpatch.configure('test_indexes',
@@ -422,7 +425,7 @@ CREATE TABLE test_aggregates (
     group_id INT,
     version INT,
     value INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_aggregates',
     group_by => 'group_id',
@@ -486,7 +489,7 @@ DROP TABLE test_aggregates;
 CREATE TABLE test_docs (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_docs',
     group_by => 'doc_id',
@@ -500,7 +503,7 @@ SELECT xpatch.configure('test_docs',
 
 CREATE TABLE test_metadata (
     doc_id INT PRIMARY KEY,
-    title TEXT
+    title TEXT NOT NULL
 );
 INSERT INTO test_docs VALUES (1, 1, 'v1');
 INSERT INTO test_docs VALUES (1, 2, 'v2');
@@ -568,7 +571,7 @@ DROP TABLE test_metadata;
 CREATE TABLE test_txn (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_txn',
     group_by => 'id',
@@ -643,8 +646,8 @@ SELECT 'Rollback integrity test:' as test;
 SELECT * FROM test_txn ORDER BY version;
  id | version |         data          | _xp_seq 
 ----+---------+-----------------------+---------
-  1 |       1 | first after rollback  |       2
-  1 |       2 | second after rollback |       3
+  1 |       1 | first after rollback  |       1
+  1 |       2 | second after rollback |       2
 (2 rows)
 
 DROP TABLE test_txn;
@@ -656,7 +659,7 @@ DROP TABLE test_txn;
 CREATE TABLE test_orm (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_orm',
     group_by => 'id',
@@ -757,9 +760,9 @@ DROP TABLE test_orm;
 CREATE TABLE test_multi_delta (
     id INT,
     version INT,
-    title TEXT,
-    body TEXT,
-    metadata JSONB
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    metadata JSONB NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_multi_delta',
     group_by => 'id',
@@ -814,7 +817,7 @@ DROP TABLE test_multi_delta;
 CREATE TABLE test_concurrent (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_concurrent',
     group_by => 'id',
@@ -876,7 +879,7 @@ DROP TABLE IF EXISTS test_errors;
 CREATE TABLE test_errors (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_errors',
     group_by => 'id',
@@ -924,7 +927,7 @@ DROP TABLE test_errors;
 CREATE TABLE test_stats (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_stats',
     group_by => 'id',

@@ -4,11 +4,11 @@
 SET client_min_messages = warning;
 -- Clean up from previous runs
 DROP TABLE IF EXISTS test_errors;
--- Create a test table
+-- Create a test table (content must be NOT NULL for delta encoding)
 CREATE TABLE test_errors (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL NOT NULL
 ) USING xpatch;
 SELECT xpatch.configure('test_errors',
     group_by => 'id',
@@ -64,5 +64,30 @@ ERROR:  Table "regular_table" is not using the xpatch access method
 CONTEXT:  PL/pgSQL function xpatch.configure(regclass,text,text,text[],integer,integer,boolean) line 21 at RAISE
 \set ON_ERROR_STOP on
 DROP TABLE regular_table;
+-- Test 7: Nullable delta column should be rejected
+DROP TABLE IF EXISTS test_nullable_delta;
+CREATE TABLE test_nullable_delta (id INT, ver INT, data TEXT) USING xpatch;
+\set ON_ERROR_STOP off
+SELECT xpatch.configure('test_nullable_delta', 
+    group_by => 'id', 
+    delta_columns => ARRAY['data']::text[]
+);
+ERROR:  Delta column "data" must be NOT NULL. Add a NOT NULL constraint before configuring.
+CONTEXT:  PL/pgSQL function xpatch.configure(regclass,text,text,text[],integer,integer,boolean) line 60 at RAISE
+\set ON_ERROR_STOP on
+DROP TABLE test_nullable_delta;
+-- Test 8: NOT NULL delta column should work
+DROP TABLE IF EXISTS test_notnull_delta;
+CREATE TABLE test_notnull_delta (id INT, ver INT, data TEXT NOT NULL) USING xpatch;
+SELECT xpatch.configure('test_notnull_delta', 
+    group_by => 'id', 
+    delta_columns => ARRAY['data']::text[]
+);
+ configure 
+-----------
+ 
+(1 row)
+
+DROP TABLE test_notnull_delta;
 -- Clean up
 DROP TABLE test_errors;

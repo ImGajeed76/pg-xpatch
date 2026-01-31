@@ -12,7 +12,7 @@ SET client_min_messages = warning;
 CREATE TABLE test_parallel (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_parallel',

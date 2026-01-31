@@ -8,7 +8,7 @@ SET client_min_messages = warning;
 CREATE TABLE test_reconstruct (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_reconstruct',

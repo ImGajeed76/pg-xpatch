@@ -8,8 +8,8 @@ SET client_min_messages = warning;
 CREATE TABLE test_indexes (
     doc_id INT,
     version INT,
-    title TEXT,
-    content TEXT
+    title TEXT NOT NULL,
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_indexes',

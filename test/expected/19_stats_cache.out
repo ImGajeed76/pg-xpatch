@@ -7,7 +7,7 @@
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_insert CASCADE;
 NOTICE:  table "test_stats_insert" does not exist, skipping
-CREATE TABLE test_stats_insert (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_insert (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_insert', group_by => 'grp');
@@ -56,7 +56,7 @@ DROP TABLE test_stats_insert;
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_sizes CASCADE;
 NOTICE:  table "test_stats_sizes" does not exist, skipping
-CREATE TABLE test_stats_sizes (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_sizes (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_sizes', group_by => 'grp');
@@ -107,7 +107,7 @@ DROP TABLE test_stats_sizes;
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_delete CASCADE;
 NOTICE:  table "test_stats_delete" does not exist, skipping
-CREATE TABLE test_stats_delete (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_delete (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_delete', group_by => 'grp');
@@ -163,7 +163,7 @@ DROP TABLE test_stats_delete;
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_kf CASCADE;
 NOTICE:  table "test_stats_kf" does not exist, skipping
-CREATE TABLE test_stats_kf (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_kf (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_kf', group_by => 'grp', keyframe_every => 3);
@@ -194,7 +194,7 @@ DROP TABLE test_stats_kf;
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_regen CASCADE;
 NOTICE:  table "test_stats_regen" does not exist, skipping
-CREATE TABLE test_stats_regen (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_regen (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_regen', group_by => 'grp');
@@ -248,7 +248,7 @@ DROP TABLE test_stats_regen;
 -- 6a: Empty table
 DROP TABLE IF EXISTS test_stats_empty CASCADE;
 NOTICE:  table "test_stats_empty" does not exist, skipping
-CREATE TABLE test_stats_empty (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_empty (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_empty', group_by => 'grp');
@@ -271,7 +271,7 @@ DROP TABLE test_stats_empty;
 -- 6b: NULL group value
 DROP TABLE IF EXISTS test_stats_null CASCADE;
 NOTICE:  table "test_stats_null" does not exist, skipping
-CREATE TABLE test_stats_null (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_null (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_null', group_by => 'grp');
@@ -297,7 +297,7 @@ DROP TABLE test_stats_null;
 -- 6c: Many groups
 DROP TABLE IF EXISTS test_stats_many CASCADE;
 NOTICE:  table "test_stats_many" does not exist, skipping
-CREATE TABLE test_stats_many (grp INT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_many (grp INT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 1 delta column(s): data
 SELECT xpatch.configure('test_stats_many', group_by => 'grp');
@@ -325,7 +325,7 @@ DROP TABLE test_stats_many;
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_trunc CASCADE;
 NOTICE:  table "test_stats_trunc" does not exist, skipping
-CREATE TABLE test_stats_trunc (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_trunc (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_trunc', group_by => 'grp');
@@ -372,7 +372,7 @@ DROP TABLE test_stats_trunc;
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_depth CASCADE;
 NOTICE:  table "test_stats_depth" does not exist, skipping
-CREATE TABLE test_stats_depth (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_depth (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_depth', group_by => 'grp', compress_depth => 5);
@@ -412,7 +412,7 @@ DROP TABLE test_stats_depth;
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_large CASCADE;
 NOTICE:  table "test_stats_large" does not exist, skipping
-CREATE TABLE test_stats_large (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_large (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_large', group_by => 'grp');
@@ -442,7 +442,7 @@ DROP TABLE test_stats_large;
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_vis CASCADE;
 NOTICE:  table "test_stats_vis" does not exist, skipping
-CREATE TABLE test_stats_vis (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_vis (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 2 delta column(s): grp, ...
 SELECT xpatch.configure('test_stats_vis', group_by => 'grp');

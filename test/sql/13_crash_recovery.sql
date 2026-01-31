@@ -17,7 +17,7 @@ DROP TABLE IF EXISTS test_wal CASCADE;
 CREATE TABLE test_wal (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_wal', 'doc_id', 'version', ARRAY['content']);

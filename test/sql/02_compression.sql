@@ -8,7 +8,7 @@ SET client_min_messages = warning;
 CREATE TABLE test_compression (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_compression',
@@ -36,7 +36,7 @@ FROM xpatch_stats('test_compression');
 CREATE TABLE test_json_compression (
     doc_id INT,
     version INT,
-    metadata JSONB
+    metadata JSONB NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_json_compression',

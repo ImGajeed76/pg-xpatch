@@ -13,7 +13,7 @@ CREATE TABLE restore_test1 (
     doc_id INT,
     version INT,
     _xp_seq INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('restore_test1', 
@@ -51,7 +51,7 @@ CREATE TABLE restore_test2 (
     doc_id INT,
     version INT,
     _xp_seq INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('restore_test2', 

@@ -16,7 +16,7 @@ DROP TABLE IF EXISTS test_warm_empty;
 CREATE TABLE test_warm_basic (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 -- Insert data (no group_by configured, so single version chain)
@@ -40,7 +40,7 @@ FROM xpatch.warm_cache('test_warm_basic');
 CREATE TABLE test_warm_grouped (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_warm_grouped', group_by => 'doc_id');
@@ -88,7 +88,7 @@ FROM xpatch.warm_cache('test_warm_grouped', max_groups => 3);
 -- Test 5: Empty table
 -- ================================================================
 
-CREATE TABLE test_warm_empty (id INT, ver INT, data TEXT) USING xpatch;
+CREATE TABLE test_warm_empty (id INT, ver INT, data TEXT NOT NULL) USING xpatch;
 
 SELECT 
     CASE WHEN rows_scanned = 0 AND groups_warmed = 0 

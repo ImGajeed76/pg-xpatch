@@ -95,4 +95,143 @@ CREATE FUNCTION xpatch_update_group_stats(
 AS 'MODULE_PATHNAME', 'xpatch_update_group_stats'
 LANGUAGE C;
 
+-- ============================================================================
+-- Update configure function to validate delta columns are NOT NULL
+-- ============================================================================
 
+CREATE OR REPLACE FUNCTION xpatch.configure(
+    table_name REGCLASS,
+    group_by TEXT DEFAULT NULL,          -- Column for grouping (NULL = single version chain)
+    order_by TEXT DEFAULT NULL,          -- Column for ordering (NULL = auto-detect last INT)
+    delta_columns TEXT[] DEFAULT NULL,   -- Columns to compress (NULL = auto-detect TEXT/BYTEA/JSON)
+    keyframe_every INT DEFAULT 100,      -- Full snapshot every N rows
+    compress_depth INT DEFAULT 1,        -- Try N previous versions for best delta
+    enable_zstd BOOLEAN DEFAULT true     -- Additional zstd compression
+) RETURNS VOID AS $$
+DECLARE
+    v_relid OID;
+    v_amname NAME;
+    v_col TEXT;
+BEGIN
+    v_relid := table_name::OID;
+    
+    -- Verify caller owns the table (security check)
+    IF NOT pg_catalog.has_table_privilege(current_user, v_relid, 'INSERT') THEN
+        RAISE EXCEPTION 'permission denied: must have INSERT privilege on table "%"', table_name;
+    END IF;
+    
+    -- Verify table uses xpatch access method
+    SELECT a.amname INTO v_amname
+    FROM pg_class c
+    JOIN pg_am a ON c.relam = a.oid
+    WHERE c.oid = v_relid;
+    
+    IF v_amname IS NULL OR v_amname != 'xpatch' THEN
+        RAISE EXCEPTION 'Table "%" is not using the xpatch access method', table_name;
+    END IF;
+    
+    -- Validate group_by column exists
+    IF group_by IS NOT NULL THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_attribute 
+            WHERE attrelid = v_relid AND attname = group_by AND NOT attisdropped
+        ) THEN
+            RAISE EXCEPTION 'Column "%" does not exist in table "%"', group_by, table_name;
+        END IF;
+    END IF;
+    
+    -- Validate order_by column exists
+    IF order_by IS NOT NULL THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_attribute 
+            WHERE attrelid = v_relid AND attname = order_by AND NOT attisdropped
+        ) THEN
+            RAISE EXCEPTION 'Column "%" does not exist in table "%"', order_by, table_name;
+        END IF;
+    END IF;
+    
+    -- Validate delta_columns exist and are NOT NULL
+    IF delta_columns IS NOT NULL THEN
+        FOREACH v_col IN ARRAY delta_columns
+        LOOP
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_attribute 
+                WHERE attrelid = v_relid AND attname = v_col AND NOT attisdropped
+            ) THEN
+                RAISE EXCEPTION 'Column "%" does not exist in table "%"', v_col, table_name;
+            END IF;
+            
+            -- Check that delta column is NOT NULL (nullable columns cannot be delta-encoded)
+            IF EXISTS (
+                SELECT 1 FROM pg_attribute 
+                WHERE attrelid = v_relid AND attname = v_col AND NOT attnotnull
+            ) THEN
+                RAISE EXCEPTION 'Delta column "%" must be NOT NULL. Add a NOT NULL constraint before configuring.', v_col;
+            END IF;
+        END LOOP;
+    END IF;
+    
+    -- Validate keyframe_every is positive
+    IF keyframe_every IS NOT NULL AND keyframe_every < 1 THEN
+        RAISE EXCEPTION 'keyframe_every must be at least 1, got %', keyframe_every;
+    END IF;
+    
+    -- Validate compress_depth is at least 1 (matches table constraint)
+    IF compress_depth IS NOT NULL AND compress_depth < 1 THEN
+        RAISE EXCEPTION 'compress_depth must be at least 1, got %', compress_depth;
+    END IF;
+    
+    -- Upsert config (delete + insert for simplicity)
+    DELETE FROM xpatch.table_config WHERE relid = v_relid;
+    
+    INSERT INTO xpatch.table_config (relid, schema_name, table_name, group_by, order_by, 
+                                     delta_columns, keyframe_every, compress_depth, enable_zstd)
+    SELECT v_relid, n.nspname, c.relname, group_by, order_by, 
+           delta_columns, keyframe_every, compress_depth, enable_zstd
+    FROM pg_class c
+    JOIN pg_namespace n ON c.relnamespace = n.oid
+    WHERE c.oid = v_relid;
+    
+    -- Create composite index on (group_by, _xp_seq) for efficient delta chain lookups
+    -- This is critical for performance when reconstructing rows
+    IF group_by IS NOT NULL THEN
+        DECLARE
+            v_schema TEXT;
+            v_tbl TEXT;
+            v_idx_name TEXT;
+        BEGIN
+            SELECT n.nspname, c.relname INTO v_schema, v_tbl
+            FROM pg_class c
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE c.oid = v_relid;
+            
+            v_idx_name := v_tbl || '_xp_group_seq_idx';
+            
+            -- Drop the basic _xp_seq index if it exists (we're replacing with composite)
+            EXECUTE format('DROP INDEX IF EXISTS %I.%I', v_schema, v_tbl || '_xp_seq_idx');
+            
+            -- Create composite index if it doesn't exist
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_class c
+                JOIN pg_namespace n ON c.relnamespace = n.oid
+                WHERE c.relkind = 'i' AND c.relname = v_idx_name AND n.nspname = v_schema
+            ) THEN
+                EXECUTE format('CREATE INDEX %I ON %s (%I, _xp_seq)', v_idx_name, table_name, group_by);
+                RAISE NOTICE 'xpatch: created index % on (%s, _xp_seq)', v_idx_name, group_by;
+            END IF;
+        END;
+    END IF;
+    
+    -- Invalidate cached config so changes take effect immediately
+    PERFORM xpatch._invalidate_config(v_relid);
+            
+    RAISE NOTICE 'xpatch: configured "%" (group_by=%, order_by=%, keyframe_every=%)',
+        table_name, 
+        COALESCE(group_by, '(none)'), 
+        COALESCE(order_by, '(auto)'), 
+        keyframe_every;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION xpatch.configure IS 
+    'Configure an xpatch table. Creates a composite (group_by, _xp_seq) index when group_by is set. Delta columns must be NOT NULL.';

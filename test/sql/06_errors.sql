@@ -7,11 +7,11 @@ SET client_min_messages = warning;
 -- Clean up from previous runs
 DROP TABLE IF EXISTS test_errors;
 
--- Create a test table
+-- Create a test table (content must be NOT NULL for delta encoding)
 CREATE TABLE test_errors (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_errors',
@@ -55,6 +55,26 @@ CREATE TABLE regular_table (id INT, data TEXT);
 SELECT xpatch.configure('regular_table', order_by => 'id');
 \set ON_ERROR_STOP on
 DROP TABLE regular_table;
+
+-- Test 7: Nullable delta column should be rejected
+DROP TABLE IF EXISTS test_nullable_delta;
+CREATE TABLE test_nullable_delta (id INT, ver INT, data TEXT) USING xpatch;
+\set ON_ERROR_STOP off
+SELECT xpatch.configure('test_nullable_delta', 
+    group_by => 'id', 
+    delta_columns => ARRAY['data']::text[]
+);
+\set ON_ERROR_STOP on
+DROP TABLE test_nullable_delta;
+
+-- Test 8: NOT NULL delta column should work
+DROP TABLE IF EXISTS test_notnull_delta;
+CREATE TABLE test_notnull_delta (id INT, ver INT, data TEXT NOT NULL) USING xpatch;
+SELECT xpatch.configure('test_notnull_delta', 
+    group_by => 'id', 
+    delta_columns => ARRAY['data']::text[]
+);
+DROP TABLE test_notnull_delta;
 
 -- Clean up
 DROP TABLE test_errors;

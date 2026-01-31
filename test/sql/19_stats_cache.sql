@@ -7,7 +7,7 @@
 -- TEST 1: Basic INSERT Tracking
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_insert CASCADE;
-CREATE TABLE test_stats_insert (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_insert (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_insert', group_by => 'grp');
 
 -- Single row insert
@@ -34,7 +34,7 @@ DROP TABLE test_stats_insert;
 -- TEST 2: Raw Size vs Compressed Size Accuracy
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_sizes CASCADE;
-CREATE TABLE test_stats_sizes (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_sizes (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_sizes', group_by => 'grp');
 
 -- Known size data (100 bytes)
@@ -63,7 +63,7 @@ DROP TABLE test_stats_sizes;
 -- TEST 3: DELETE Updates Stats
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_delete CASCADE;
-CREATE TABLE test_stats_delete (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_delete (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_delete', group_by => 'grp');
 
 -- Setup
@@ -98,7 +98,7 @@ DROP TABLE test_stats_delete;
 -- TEST 4: Keyframe Tracking
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_kf CASCADE;
-CREATE TABLE test_stats_kf (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_kf (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_kf', group_by => 'grp', keyframe_every => 3);
 
 -- Insert 5 rows - keyframes at seq 1 and 4
@@ -115,7 +115,7 @@ DROP TABLE test_stats_kf;
 -- TEST 5: Stats Regeneration (delete + refresh)
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_regen CASCADE;
-CREATE TABLE test_stats_regen (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_regen (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_regen', group_by => 'grp');
 
 INSERT INTO test_stats_regen VALUES ('A', 1, 'aaaa'), ('A', 2, 'bbbb'), ('B', 1, 'cccc');
@@ -149,7 +149,7 @@ DROP TABLE test_stats_regen;
 
 -- 6a: Empty table
 DROP TABLE IF EXISTS test_stats_empty CASCADE;
-CREATE TABLE test_stats_empty (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_empty (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_empty', group_by => 'grp');
 SELECT 'TEST 6a: Empty table' as test,
        CASE WHEN total_rows = 0 AND total_groups = 0 THEN 'PASS' ELSE 'FAIL' END as result
@@ -158,7 +158,7 @@ DROP TABLE test_stats_empty;
 
 -- 6b: NULL group value
 DROP TABLE IF EXISTS test_stats_null CASCADE;
-CREATE TABLE test_stats_null (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_null (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_null', group_by => 'grp');
 INSERT INTO test_stats_null VALUES (NULL, 1, 'null_grp');
 SELECT 'TEST 6b: NULL group' as test,
@@ -168,7 +168,7 @@ DROP TABLE test_stats_null;
 
 -- 6c: Many groups
 DROP TABLE IF EXISTS test_stats_many CASCADE;
-CREATE TABLE test_stats_many (grp INT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_many (grp INT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_many', group_by => 'grp');
 INSERT INTO test_stats_many SELECT g, 1, ('data' || g)::bytea FROM generate_series(1, 50) g;
 SELECT 'TEST 6c: 50 groups' as test,
@@ -180,7 +180,7 @@ DROP TABLE test_stats_many;
 -- TEST 7: TRUNCATE Clears Stats
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_trunc CASCADE;
-CREATE TABLE test_stats_trunc (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_trunc (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_trunc', group_by => 'grp');
 
 INSERT INTO test_stats_trunc VALUES ('A', 1, 'a1'), ('B', 1, 'b1');
@@ -207,7 +207,7 @@ DROP TABLE test_stats_trunc;
 -- TEST 8: Compression Depth Tracking
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_depth CASCADE;
-CREATE TABLE test_stats_depth (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_depth (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_depth', group_by => 'grp', compress_depth => 5);
 
 -- Insert chain: keyframe (tag=0), then deltas (tag=1 each)
@@ -229,7 +229,7 @@ DROP TABLE test_stats_depth;
 -- TEST 9: Large Data
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_large CASCADE;
-CREATE TABLE test_stats_large (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_large (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_large', group_by => 'grp');
 
 -- Insert 1MB of data
@@ -245,7 +245,7 @@ DROP TABLE test_stats_large;
 -- TEST 10: SnapshotSelf Visibility (delete sees own changes)
 -- ============================================================
 DROP TABLE IF EXISTS test_stats_vis CASCADE;
-CREATE TABLE test_stats_vis (grp TEXT, ver INT, data BYTEA) USING xpatch;
+CREATE TABLE test_stats_vis (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_vis', group_by => 'grp');
 
 INSERT INTO test_stats_vis VALUES ('A', 1, 'a1'), ('A', 2, 'a2');

@@ -8,7 +8,7 @@ SET client_min_messages = warning;
 CREATE TABLE test_keyframes (
     id INT,
     seq INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_keyframes',
@@ -47,7 +47,7 @@ ORDER BY seq;
 CREATE TABLE test_compress_depth (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_compress_depth',

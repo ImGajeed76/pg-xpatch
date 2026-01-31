@@ -130,7 +130,7 @@ BEGIN
         END IF;
     END IF;
     
-    -- Validate delta_columns exist
+    -- Validate delta_columns exist and are NOT NULL
     IF delta_columns IS NOT NULL THEN
         FOREACH v_col IN ARRAY delta_columns
         LOOP
@@ -139,6 +139,14 @@ BEGIN
                 WHERE attrelid = v_relid AND attname = v_col AND NOT attisdropped
             ) THEN
                 RAISE EXCEPTION 'Column "%" does not exist in table "%"', v_col, table_name;
+            END IF;
+            
+            -- Check that delta column is NOT NULL (nullable columns cannot be delta-encoded)
+            IF EXISTS (
+                SELECT 1 FROM pg_attribute 
+                WHERE attrelid = v_relid AND attname = v_col AND NOT attnotnull
+            ) THEN
+                RAISE EXCEPTION 'Delta column "%" must be NOT NULL. Add a NOT NULL constraint before configuring.', v_col;
             END IF;
         END LOOP;
     END IF;
