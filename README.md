@@ -11,7 +11,7 @@ Store versioned rows (document revisions, config history, audit logs, etc.) with
 CREATE TABLE documents (
     doc_id   INT,
     version  INT,
-    content  TEXT
+    content  TEXT NOT NULL  -- Delta columns must be NOT NULL
 ) USING xpatch;
 
 -- Configure grouping and ordering (optional - auto-detection works for most cases)
@@ -29,7 +29,7 @@ INSERT INTO documents VALUES (1, 3, 'Hello PostgreSQL World! Updated.');
 SELECT * FROM documents WHERE doc_id = 1 ORDER BY version;
 
 -- Check compression stats
-SELECT * FROM xpatch_stats('documents');
+SELECT * FROM xpatch.stats('documents');
 ```
 
 ## Features
@@ -46,12 +46,14 @@ SELECT * FROM xpatch_stats('documents');
 - **VACUUM** - Dead tuple cleanup works
 - **WAL logging** - Crash recovery supported
 - **Shared memory cache** - LRU cache for reconstructed content across all backends
+- **Stats cache** - Statistics updated incrementally on INSERT/DELETE for instant `xpatch.stats()` calls
 
 ### What Doesn't Work (By Design)
 
 - **UPDATE** - Not supported. Insert a new version instead. This is intentional for append-only versioned data.
 - **Out-of-order inserts** - Versions must be inserted in order within each group
 - **Hidden columns** - The internal `_xp_seq` column is visible in `SELECT *` (PostgreSQL limitation)
+- **Nullable delta columns** - Columns configured for delta compression must have a NOT NULL constraint
 
 ### Utility Functions
 
@@ -59,27 +61,36 @@ SELECT * FROM xpatch_stats('documents');
 -- Describe a table: shows config, schema, and storage stats
 SELECT * FROM xpatch.describe('documents');
 
+-- Get compression statistics (instant - reads from stats table)
+SELECT * FROM xpatch.stats('documents');
+
 -- Warm the cache for faster subsequent queries
 SELECT * FROM xpatch.warm_cache('documents');
 SELECT * FROM xpatch.warm_cache('documents', max_groups => 100);
 
--- Get compression statistics
-SELECT * FROM xpatch_stats('documents');
-
 -- Inspect internal storage for a specific group (debugging/analysis)
-SELECT * FROM xpatch_inspect('documents', 1);  -- group_value = 1
+SELECT * FROM xpatch.inspect('documents', 1);  -- group_value = 1
+
+-- View raw physical storage (delta bytes)
+SELECT * FROM xpatch.physical('documents');
 
 -- Get cache statistics (requires shared_preload_libraries)
-SELECT * FROM xpatch_cache_stats();
+SELECT * FROM xpatch.cache_stats();
+
+-- Get insert cache statistics
+SELECT * FROM xpatch.insert_cache_stats();
 
 -- Get xpatch library version
-SELECT xpatch_version();
+SELECT xpatch.version();
 
 -- Dump all table configs as SQL (for backup/migration)
 SELECT * FROM xpatch.dump_configs();
 
 -- Fix config OIDs after pg_restore
 SELECT xpatch.fix_restored_configs();
+
+-- Force recalculate stats (rarely needed - stats are auto-maintained)
+SELECT * FROM xpatch.refresh_stats('documents');
 ```
 
 ## Performance
@@ -90,107 +101,100 @@ Space savings depend heavily on your data patterns. Here are real benchmarks wit
 
 | Data Pattern | xpatch Size | heap Size | Space Saved |
 |--------------|-------------|-----------|-------------|
-| Incremental changes (base content + small additions) | 416 KB | 9.2 MB | **95% smaller** |
-| Identical content across versions | 488 KB | 648 KB | 25% smaller |
-| Completely random data | 816 KB | 728 KB | 12% larger (overhead) |
+| Incremental changes (base content + small edits) | 432 KB | 5.6 MB | **92% smaller** |
+| Identical content across versions | 312 KB | 448 KB | 30% smaller |
+| Completely random data | 624 KB | 568 KB | 10% larger (overhead) |
 
 **Key insight:** xpatch shines when versions share content. For typical document versioning (where each version is similar to the previous), expect 10-20x space savings. For random/unrelated data, xpatch adds overhead and provides no benefit.
 
 ### Query Performance
 
-**Important:** These benchmarks are rough indicators, not precise measurements. Your mileage will vary based on hardware, data patterns, cache state, and query complexity.
+**Important:** These benchmarks require `shared_preload_libraries = 'pg_xpatch'` to enable the shared memory cache. Without it, performance is orders of magnitude worse.
 
-Benchmark setup: 10,100 rows (101 documents x 100 versions), incremental text data. xpatch: 776 KB, heap: 17 MB.
+These are rough indicators, not precise measurements. Your results will vary based on hardware, data patterns, cache state, and query complexity.
+
+Benchmark setup: 10,100 rows (101 documents x 100 versions), ~1KB content per row. xpatch: 800 KB, heap: 11 MB.
+
+| Operation | xpatch | heap | Notes |
+|-----------|--------|------|-------|
+| **Full table COUNT** | 13ms | 0.4ms | 32x slower (decodes all rows) |
+| **Point lookup (single doc, 100 rows)** | 0.07ms | 0.06ms | ~same with index |
+| **Point lookup (single row)** | 0.07ms | 0.04ms | 1.8x slower |
+| **GROUP BY aggregate** | 0.12ms | 0.06ms | 2x slower |
+| **Latest version per doc** | 19ms | 2ms | 10x slower |
+| **Text search (LIKE)** | 21ms | 9ms | 2.3x slower |
+| **Parallel scan (2 workers)** | 16ms | 0.4ms | 40x slower |
+
+**Key observations:**
+- **Index lookups are fast** - Point queries using the composite index are nearly heap speed
+- **Full scans are slow** - Operations requiring all rows to be decoded have significant overhead
+- **Cache helps significantly** - Warm cache queries are 2-3x faster than cold
+
+### Write Performance
 
 | Operation | xpatch | heap | Slowdown |
 |-----------|--------|------|----------|
-| **Full table COUNT** | | | |
-| - Cold cache | 44ms | 2.6ms | 17x slower |
-| - Warm cache | 20ms | 1.4ms | 14x slower |
-| **Point lookup (single doc, 100 rows)** | 0.7ms | 0.05ms | 14x slower |
-| **Point lookup (single row)** | 0.13ms | 0.02ms | 6x slower |
-| **GROUP BY aggregate** | 27ms | 3ms | 9x slower |
-| **Latest version per doc** | 28ms | 5.5ms | 5x slower |
-| **Text search (LIKE)** | 3.4ms | 1.5ms | 2x slower |
-| **INSERT (100 rows)** | 33ms | 0.3ms | 100x slower |
-| **Parallel scan (2 workers)** | 31ms | 3.5ms | 9x slower |
+| **Individual inserts** (100 rows, loop) | 24ms | 1.3ms | 18x |
+| **Batch insert** (100 rows, 1 group) | 5ms | 1.0ms | **5x** |
+| **Batch insert** (100 rows, 100 groups) | 5ms | 0.9ms | **6x** |
+| **Batch insert** (1000 rows) | 65ms | 2.8ms | 23x |
+| **Batch insert** (5000 rows) | 217ms | 12ms | 18x |
 
-**Key observations:**
-- **Reads are 5-17x slower** due to delta reconstruction overhead
-- **Writes are ~100x slower** due to delta encoding (this is the main trade-off)
-- **Cache helps** but doesn't eliminate the reconstruction cost
-- **Indexed lookups** are faster than full scans but still have overhead
+**Key insight: Batch inserts are 4-5x faster than individual inserts.** Use `INSERT ... SELECT` or multi-row `INSERT` statements when possible.
 
-> **A note on write performance:**
-> 
-> "100x slower" sounds alarming, but look at the absolute numbers: **33ms for 100 rows is ~0.33ms per row**. For versioned document storage, audit logs, or real-time collaboration (saving state every few seconds), sub-millisecond writes are more than fast enough.
-> 
-> Also remember that **writes parallelize across groups**. If you have 50 users editing 50 different documents, all 50 writes happen concurrently. Sequential writes only apply *within* a single group's version chain—which is inherent to delta compression, not a limitation.
+The absolute numbers matter more than the ratios: **5ms for 100 rows is 50μs per row**, which is fast enough for most versioned data workloads.
+
+Also remember that **writes parallelize across groups**. If you have 100 users editing 100 different documents, all 100 writes happen concurrently. Sequential writes only apply *within* a single group's version chain.
 
 **When to use xpatch:**
-- Storage cost is a primary concern (95% space savings)
+- Storage cost is a primary concern (90%+ space savings)
 - Data is written once and read occasionally
 - Append-only versioned data (audit logs, document history, config snapshots)
-- You can tolerate higher write latency
+- You can use batch inserts
 
 **When NOT to use xpatch:**
-- High-frequency reads on the same data
-- Write-heavy workloads where latency matters
+- High-frequency full table scans
+- Write-heavy workloads with individual row inserts
 - Data with no similarity between versions (random data)
 
-### Cache Behavior
+### Cache Configuration
 
-The shared memory cache dramatically improves read performance for repeated access:
+The shared memory cache is **essential** for good read performance. Add to `postgresql.conf`:
 
-```sql
--- First query (cold): ~35ms for 5000 rows
-SELECT COUNT(*) FROM documents;
-
--- Second query (warm): ~1ms for 5000 rows  
-SELECT COUNT(*) FROM documents;
-```
-
-To enable the shared memory cache, add to `postgresql.conf`:
 ```
 shared_preload_libraries = 'pg_xpatch'
+
+# Cache sizes (adjust based on your workload)
+pg_xpatch.cache_size_mb = 512       # Content cache (default: 64, max: 1024)
+pg_xpatch.group_cache_size_mb = 64  # Group sequence cache (default: 8)
+pg_xpatch.tid_cache_size_mb = 64    # TID cache (default: 8)
+pg_xpatch.insert_cache_slots = 64   # Concurrent insert slots (default: 16)
+pg_xpatch.encode_threads = 4        # Parallel encoding threads (default: 0)
 ```
 
-### Real-World Benchmark: pg-xpatch vs Git
+Cache warming example:
+```sql
+-- Cold query: ~2.3ms
+SELECT COUNT(*) FROM documents;
 
-To test pg-xpatch against a real versioning system, we stored the complete file history of the [tokio](https://github.com/tokio-rs/tokio) repository (35,827 file versions across 2,641 files, 296 MB raw content) and compared storage size and random access speed against git's packfile format.
+-- Warm the cache
+SELECT * FROM xpatch.warm_cache('documents');
 
-**Setup:**
-- `group_by=path, compress_depth=1000, keyframe_every=100, enable_zstd=true`
-- Each row stores: file path, content, commit message, commit hash, parent hash, timestamp
-- No optimization was done — the schema is a single flat denormalized table with commit metadata repeated per row, no content deduplication, no normalization. Just naive INSERTs and let xpatch handle compression.
+-- Warm query: ~0.7ms
+SELECT COUNT(*) FROM documents;
+```
 
-**Storage comparison (total on-disk size):**
+### Stats Cache
 
-| Storage Method | Total Size | What's Included |
-|----------------|------------|-----------------|
-| Raw file content | 296 MB | Just the file blobs |
-| Git (normal bare clone) | 18 MB | Packfile + commit/tree objects + refs |
-| Git (`gc --aggressive`) | 11 MB | Same, with aggressive packing |
-| pg-xpatch | 12 MB | Table + TOAST + indexes + per-row metadata |
+Statistics are stored in the `xpatch.group_stats` table and updated automatically:
+- **INSERT**: Stats for the affected group are updated incrementally
+- **DELETE**: Only the affected group's stats are recalculated
 
-Git with aggressive packing is slightly smaller (11 MB vs 12 MB), but pg-xpatch provides full SQL queryability over the data. Both systems store more than just file content — git stores commit/tree objects, pg-xpatch stores commit hashes, timestamps, messages, and indexes.
+This provides instant (~0.4ms) performance for `xpatch.stats()` calls. You typically don't need to call `refresh_stats()` - stats are maintained automatically during normal operations.
 
-**Internal delta compression:** xpatch's delta engine achieves 42x compression on the content columns alone (296 MB → 7 MB), but the total relation size (12 MB) includes non-delta columns and index overhead.
+### Real-World Example: pgit
 
-**Random access performance (100 random point lookups, warmed cache):**
-
-| Method | Median | p95 | Max |
-|--------|--------|-----|-----|
-| pg-xpatch | 0.20 ms | < 1 ms | 22 ms |
-| git (`git show`) | 1.32 ms | 1.47 ms | 1.81 ms |
-
-pg-xpatch is ~6.5x faster on median, with 95% of queries under 1 ms. Git has more consistent latency (tight 1-2 ms range), while pg-xpatch has occasional tail latency spikes from cold chain reconstructions.
-
-**Insert and engine performance:**
-
-The delta engine performs up to **22,000 base comparisons per second** (~45μs per comparison). Each insert compares against up to `compress_depth` previous versions to find the best delta base, so practical insert speed depends on how many comparisons are needed. With `group_by`, chains are short (avg 13.57 versions here), meaning fewer comparisons per insert and higher row throughput — up to 336 rows/s for this dataset.
-
-**Parallel writes:** Since groups are independent, multiple groups can be written concurrently from separate connections with no performance degradation.
+For real-world benchmarks comparing pg-xpatch against git's packfile format, see [pgit](https://github.com/ImGajeed76/pgit) — a Git-like CLI that stores repositories in PostgreSQL using pg-xpatch compression.
 
 ## Installation
 
@@ -270,11 +274,24 @@ For most tables, xpatch auto-detects the configuration:
 SELECT xpatch.configure('my_table',
     group_by => 'doc_id',           -- Column that groups versions (optional)
     order_by => 'version',          -- Column that orders versions
-    delta_columns => ARRAY['content', 'metadata']::text[],  -- Columns to compress
+    delta_columns => ARRAY['content', 'metadata']::text[],  -- Columns to compress (must be NOT NULL)
     keyframe_every => 100,          -- Full snapshot every N versions (default: 100)
     compress_depth => 1,            -- How many previous versions to consider (default: 1)
     enable_zstd => true             -- Enable zstd compression (default: true)
 );
+```
+
+**Note:** Delta columns must have a `NOT NULL` constraint. The extension will raise an error if you try to configure a nullable column for delta compression.
+
+```sql
+-- This will fail:
+CREATE TABLE bad (id INT, data TEXT) USING xpatch;
+SELECT xpatch.configure('bad', delta_columns => ARRAY['data']::text[]);
+-- ERROR: Delta column "data" must be NOT NULL
+
+-- This works:
+CREATE TABLE good (id INT, data TEXT NOT NULL) USING xpatch;
+SELECT xpatch.configure('good', delta_columns => ARRAY['data']::text[]);
 ```
 
 ### Inspecting Configuration
@@ -322,7 +339,7 @@ xpatch automatically creates indexes for efficient lookups:
 ### Basic Test Suite
 
 ```bash
-# Run all tests (20 test files)
+# Run all tests (21 test files)
 # First create the test database and extension
 createdb xpatch_test
 psql -d xpatch_test -c "CREATE EXTENSION pg_xpatch;"
