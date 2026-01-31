@@ -1196,12 +1196,11 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     /* Ensure slot is materialized early so we can check _xp_seq */
     slot_getallattrs(slot);
     
-    /* Get group value if configured */
+    /* Get group value if configured (NULL groups are rejected in xpatch_tam.c) */
     if (config->group_by_attnum != InvalidAttrNumber)
     {
         group_value = slot_getattr(slot, config->group_by_attnum, &isnull);
-        if (isnull)
-            group_value = (Datum) 0;
+        /* isnull should never be true here - validated at insert time */
     }
     
     /* Get group column type OID for proper hash computation */
@@ -1610,8 +1609,8 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
         }
         else
         {
-            bool group_isnull = (group_value == (Datum) 0 && config->group_by_attnum != InvalidAttrNumber);
-            stats_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
+            /* NULL groups are rejected at insert time, so always pass false */
+            stats_hash = xpatch_compute_group_hash(group_value, group_typid, false);
         }
         
         /* Compute average delta tag across all delta columns */

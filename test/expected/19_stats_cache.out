@@ -268,7 +268,7 @@ FROM xpatch.stats('test_stats_empty');
 (1 row)
 
 DROP TABLE test_stats_empty;
--- 6b: NULL group value
+-- 6b: NULL group value (should be rejected)
 DROP TABLE IF EXISTS test_stats_null CASCADE;
 NOTICE:  table "test_stats_null" does not exist, skipping
 CREATE TABLE test_stats_null (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
@@ -282,15 +282,19 @@ NOTICE:  xpatch: configured "test_stats_null" (group_by=grp, order_by=(auto), ke
  
 (1 row)
 
+-- NULL group values are not allowed - this should fail
 INSERT INTO test_stats_null VALUES (NULL, 1, 'null_grp');
 NOTICE:  xpatch: auto-detected order_by column: ver
 NOTICE:  xpatch: auto-detected 1 delta column(s): data
-SELECT 'TEST 6b: NULL group' as test,
-       CASE WHEN total_rows = 1 AND total_groups = 1 THEN 'PASS' ELSE 'FAIL' END as result
+ERROR:  NULL value not allowed in group column "grp"
+HINT:  The group_by column must have a non-NULL value for each row.
+-- Table should be empty since insert failed
+SELECT 'TEST 6b: NULL group rejected' as test,
+       CASE WHEN total_rows = 0 THEN 'PASS' ELSE 'FAIL' END as result
 FROM xpatch.stats('test_stats_null');
-        test         | result 
----------------------+--------
- TEST 6b: NULL group | PASS
+             test             | result 
+------------------------------+--------
+ TEST 6b: NULL group rejected | PASS
 (1 row)
 
 DROP TABLE test_stats_null;

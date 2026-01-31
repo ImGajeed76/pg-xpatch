@@ -2,6 +2,33 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
+## [0.4.0] - 2026-01-31
+
+### Added
+
+- **Stats cache**: Statistics are now stored in `xpatch.group_stats` table and updated incrementally on INSERT/DELETE. The `xpatch.stats()` function now returns instantly (~0.4ms) instead of scanning the entire table.
+
+- **New utility functions**:
+  - `xpatch.refresh_stats(table)` - Force recalculate stats by full table scan (rarely needed)
+  - `xpatch.physical(table)` - View raw physical storage including delta bytes
+  - `xpatch.stats_exist(table)` - Check if stats cache exists for a table
+
+### Changed
+
+- **Delta columns must be NOT NULL**: The `xpatch.configure()` function now validates that delta columns have a NOT NULL constraint. Attempting to configure a nullable column for delta compression will raise an error with a helpful message.
+
+- **Function naming**: All utility functions now use schema-qualified names (`xpatch.stats()`, `xpatch.inspect()`, `xpatch.cache_stats()`, `xpatch.version()`). The old unqualified names (`xpatch_stats()`, etc.) still work for backwards compatibility.
+
+### Fixed
+
+- **Advisory lock hashing**: Fixed a bug where TEXT group values would hash the pointer instead of the content when computing advisory lock IDs. Now uses BLAKE3 consistently.
+
+- **Raw size tracking in stats**: Stats refresh now decodes delta columns to get actual uncompressed sizes, consistent with INSERT tracking.
+
+- **Empty group handling**: When a group has 0 visible rows after DELETE, its stats are now properly deleted from `xpatch.group_stats`.
+
+- **NULL group validation**: Inserting a NULL value into the group_by column now raises a clear error instead of causing undefined behavior. The group column must have a non-NULL value for each row.
+
 ## [0.3.1] - 2025-01-29
 
 ### Fixed

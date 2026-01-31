@@ -50,7 +50,7 @@ SELECT 'After first query' as phase,
 FROM xpatch_cache_stats();
        phase       | has_entries | tracking_hits 
 -------------------+-------------+---------------
- After first query | f           | t
+ After first query | t           | t
 (1 row)
 
 -- Second query - should hit cache
@@ -78,7 +78,7 @@ SELECT 'After repeated queries' as phase,
 FROM xpatch_cache_stats();
          phase          | has_entries | has_max_size 
 ------------------------+-------------+--------------
- After repeated queries | f           | f
+ After repeated queries | t           | t
 (1 row)
 
 -- Test cache across multiple tables
@@ -121,14 +121,14 @@ SELECT 'Multiple tables' as phase,
 FROM xpatch_cache_stats();
       phase      | has_entries 
 -----------------+-------------
- Multiple tables | f
+ Multiple tables | t
 (1 row)
 
 -- Test cache max size is reported
 SELECT cache_max_bytes > 0 AS has_max_size FROM xpatch_cache_stats();
  has_max_size 
 --------------
- f
+ t
 (1 row)
 
 -- Clean up

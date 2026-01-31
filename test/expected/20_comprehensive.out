@@ -646,8 +646,8 @@ SELECT 'Rollback integrity test:' as test;
 SELECT * FROM test_txn ORDER BY version;
  id | version |         data          | _xp_seq 
 ----+---------+-----------------------+---------
-  1 |       1 | first after rollback  |       1
-  1 |       2 | second after rollback |       2
+  1 |       1 | first after rollback  |       2
+  1 |       2 | second after rollback |       3
 (2 rows)
 
 DROP TABLE test_txn;

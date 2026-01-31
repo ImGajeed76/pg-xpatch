@@ -745,7 +745,11 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
         group_typid = group_attr->atttypid;
         group_value = slot_getattr(slot, config->group_by_attnum, &isnull);
         if (isnull)
-            group_value = (Datum) 0;
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmsg("NULL value not allowed in group column \"%s\"",
+                            NameStr(group_attr->attname)),
+                     errhint("The group_by column must have a non-NULL value for each row.")));
     }
 
     /*
@@ -755,8 +759,8 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
      * The lock is released at transaction end.
      */
     {
-        bool group_isnull = (group_value == (Datum) 0 && config->group_by_attnum != InvalidAttrNumber);
-        XPatchGroupHash group_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
+        /* group_isnull is always false here - we reject NULL groups above */
+        XPatchGroupHash group_hash = xpatch_compute_group_hash(group_value, group_typid, false);
         group_lock_id = xpatch_compute_group_lock_id(RelationGetRelid(relation), group_hash);
     }
     DirectFunctionCall1(pg_advisory_xact_lock_int8, Int64GetDatum((int64) group_lock_id));

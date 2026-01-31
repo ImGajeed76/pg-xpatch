@@ -107,9 +107,11 @@ FROM generate_series(1, 10) AS d, generate_series(1, 5) AS v
 ORDER BY d, v;
 -- Re-run configure to create index on existing data
 SELECT xpatch.configure('test_idx_existing', group_by => 'id');
-ERROR:  could not read block 0 in file "base/21987/22307": read only 0 of 8192 bytes
-CONTEXT:  SQL statement "CREATE INDEX test_idx_existing_xp_group_seq_idx ON test_idx_existing (id, _xp_seq)"
-PL/pgSQL function xpatch.configure(regclass,text,text,text[],integer,integer,boolean) line 110 at EXECUTE
+ configure 
+-----------
+ 
+(1 row)
+
 -- Verify composite index exists
 SELECT 
     CASE WHEN COUNT(*) = 1 
@@ -118,9 +120,9 @@ SELECT
     END as result
 FROM pg_indexes 
 WHERE tablename = 'test_idx_existing' AND indexname LIKE '%group_seq%';
-                  result                  
-------------------------------------------
- FAIL: Index not created on existing data
+                result                
+--------------------------------------
+ PASS: Index created on existing data
 (1 row)
 
 -- Verify data is still accessible
@@ -140,9 +142,10 @@ FROM test_idx_existing;
 -- ================================================================
 -- Check index before truncate
 SELECT indexname FROM pg_indexes WHERE tablename = 'test_idx_existing';
- indexname 
------------
-(0 rows)
+             indexname              
+------------------------------------
+ test_idx_existing_xp_group_seq_idx
+(1 row)
 
 TRUNCATE test_idx_existing;
 -- Check index after truncate
@@ -153,9 +156,9 @@ SELECT
     END as result
 FROM pg_indexes 
 WHERE tablename = 'test_idx_existing' AND indexname LIKE '%group_seq%';
-             result              
----------------------------------
- FAIL: Index lost after TRUNCATE
+            result             
+-------------------------------
+ PASS: Index survives TRUNCATE
 (1 row)
 
 -- ================================================================
@@ -169,11 +172,13 @@ ANALYZE test_idx_existing;
 SET enable_seqscan = off;
 -- Check that index is used
 EXPLAIN (COSTS OFF) SELECT * FROM test_idx_existing WHERE id = 50;
-          QUERY PLAN           
--------------------------------
- Seq Scan on test_idx_existing
-   Filter: (id = 50)
-(2 rows)
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Bitmap Heap Scan on test_idx_existing
+   Recheck Cond: (id = 50)
+   ->  Bitmap Index Scan on test_idx_existing_xp_group_seq_idx
+         Index Cond: (id = 50)
+(4 rows)
 
 SET enable_seqscan = on;
 -- Clean up

@@ -156,13 +156,15 @@ SELECT 'TEST 6a: Empty table' as test,
 FROM xpatch.stats('test_stats_empty');
 DROP TABLE test_stats_empty;
 
--- 6b: NULL group value
+-- 6b: NULL group value (should be rejected)
 DROP TABLE IF EXISTS test_stats_null CASCADE;
 CREATE TABLE test_stats_null (grp TEXT, ver INT, data BYTEA NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_stats_null', group_by => 'grp');
+-- NULL group values are not allowed - this should fail
 INSERT INTO test_stats_null VALUES (NULL, 1, 'null_grp');
-SELECT 'TEST 6b: NULL group' as test,
-       CASE WHEN total_rows = 1 AND total_groups = 1 THEN 'PASS' ELSE 'FAIL' END as result
+-- Table should be empty since insert failed
+SELECT 'TEST 6b: NULL group rejected' as test,
+       CASE WHEN total_rows = 0 THEN 'PASS' ELSE 'FAIL' END as result
 FROM xpatch.stats('test_stats_null');
 DROP TABLE test_stats_null;
 
