@@ -37,50 +37,27 @@ COMMENT ON TABLE xpatch.table_config IS
     'Configuration for xpatch tables. Most tables work with auto-detection; explicit config is needed when: (1) you want a group_by column, (2) auto-detected order_by is wrong, or (3) you need custom keyframe/compression settings.';
 
 -- ============================================================================
--- Stats cache tables for O(1) lookups
+-- Stats cache table for O(1) lookups
 -- ============================================================================
 
--- Per-group statistics (authoritative source, updated on INSERT)
+-- Per-group statistics (updated incrementally on INSERT/DELETE)
 CREATE TABLE xpatch.group_stats (
-    relid               OID NOT NULL,
-    group_hash          BYTEA NOT NULL,         -- BLAKE3 hash of group value (32 bytes)
-    group_value_text    TEXT,                   -- Human-readable group value (for display)
-    row_count           BIGINT NOT NULL DEFAULT 0,
-    keyframe_count      BIGINT NOT NULL DEFAULT 0,
-    delta_count         BIGINT NOT NULL DEFAULT 0,
-    max_seq             INT NOT NULL DEFAULT 0,
-    max_version_typid   OID,                    -- Type OID of order_by column
-    max_version_data    BYTEA,                  -- Serialized max version value
-    raw_size_bytes      BIGINT NOT NULL DEFAULT 0,
+    relid                 OID NOT NULL,
+    group_hash            BYTEA NOT NULL,           -- BLAKE3 hash of group value (16 bytes)
+    row_count             BIGINT NOT NULL DEFAULT 0,
+    keyframe_count        BIGINT NOT NULL DEFAULT 0,
+    max_seq               INT NOT NULL DEFAULT 0,
+    raw_size_bytes        BIGINT NOT NULL DEFAULT 0,
     compressed_size_bytes BIGINT NOT NULL DEFAULT 0,
-    is_valid            BOOLEAN NOT NULL DEFAULT true,
-    last_updated        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sum_avg_delta_tags    FLOAT8 NOT NULL DEFAULT 0,  -- Sum of per-row average delta tags
     PRIMARY KEY (relid, group_hash)
 );
 
 -- Index for fast aggregation by table
-CREATE INDEX group_stats_relid_idx ON xpatch.group_stats(relid) WHERE is_valid;
+CREATE INDEX group_stats_relid_idx ON xpatch.group_stats(relid);
 
 COMMENT ON TABLE xpatch.group_stats IS 
-    'Per-group statistics cache. Updated incrementally on INSERT, invalidated on DELETE. Use xpatch.refresh_stats() to recompute after bulk operations.';
-
--- Per-table aggregated statistics (cached, derived from group_stats)
-CREATE TABLE xpatch.table_stats (
-    relid               OID PRIMARY KEY,
-    total_rows          BIGINT NOT NULL DEFAULT 0,
-    total_groups        BIGINT NOT NULL DEFAULT 0,
-    keyframe_count      BIGINT NOT NULL DEFAULT 0,
-    delta_count         BIGINT NOT NULL DEFAULT 0,
-    raw_size_bytes      BIGINT NOT NULL DEFAULT 0,
-    compressed_size_bytes BIGINT NOT NULL DEFAULT 0,
-    compression_ratio   FLOAT8,
-    avg_chain_length    FLOAT8,
-    is_valid            BOOLEAN NOT NULL DEFAULT true,
-    last_updated        TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-COMMENT ON TABLE xpatch.table_stats IS 
-    'Per-table aggregated statistics. Derived from xpatch.group_stats for fast xpatch_stats() queries.';
+    'Per-group statistics cache. Updated incrementally on INSERT, deleted on DELETE. Missing groups are recomputed on demand during stats() calls.';
 
 -- Create the table access method handler function
 CREATE FUNCTION xpatch_tam_handler(internal)
@@ -337,16 +314,16 @@ COMMENT ON FUNCTION xpatch._add_seq_column() IS 'Internal: Event trigger functio
 -- Utility function: Get compression statistics for a table
 CREATE FUNCTION xpatch_stats(rel regclass)
 RETURNS TABLE (
-    total_rows          BIGINT,
-    total_groups        BIGINT,
-    keyframe_count      BIGINT,
-    delta_count         BIGINT,
-    raw_size_bytes      BIGINT,
+    total_rows            BIGINT,
+    total_groups          BIGINT,
+    keyframe_count        BIGINT,
+    delta_count           BIGINT,
+    raw_size_bytes        BIGINT,
     compressed_size_bytes BIGINT,
-    compression_ratio   FLOAT8,
-    cache_hits          BIGINT,
-    cache_misses        BIGINT,
-    avg_chain_length    FLOAT8
+    compression_ratio     FLOAT8,
+    cache_hits            BIGINT,
+    cache_misses          BIGINT,
+    avg_compression_depth FLOAT8
 ) AS 'MODULE_PATHNAME', 'xpatch_stats'
 LANGUAGE C STRICT;
 
@@ -727,7 +704,7 @@ BEGIN
         property := 'raw_size'; value := pg_size_pretty(v_stats.raw_size_bytes); RETURN NEXT;
         property := 'compressed_size'; value := pg_size_pretty(v_stats.compressed_size_bytes); RETURN NEXT;
         property := 'compression_ratio'; value := round(v_stats.compression_ratio::numeric, 2)::TEXT || 'x'; RETURN NEXT;
-        property := 'avg_chain_length'; value := round(v_stats.avg_chain_length::numeric, 2)::TEXT; RETURN NEXT;
+        property := 'avg_compression_depth'; value := round(v_stats.avg_compression_depth::numeric, 2)::TEXT; RETURN NEXT;
         property := 'cache_hits'; value := v_stats.cache_hits::TEXT; RETURN NEXT;
         property := 'cache_misses'; value := v_stats.cache_misses::TEXT; RETURN NEXT;
     EXCEPTION WHEN OTHERS THEN
@@ -757,16 +734,16 @@ COMMENT ON FUNCTION xpatch.version() IS 'Get xpatch library version';
 -- xpatch.stats() - wrapper for xpatch_stats() with improved formatting
 CREATE OR REPLACE FUNCTION xpatch.stats(tbl REGCLASS)
 RETURNS TABLE (
-    total_rows          BIGINT,
-    total_groups        BIGINT,
-    keyframe_count      BIGINT,
-    delta_count         BIGINT,
-    raw_size_bytes      BIGINT,
+    total_rows            BIGINT,
+    total_groups          BIGINT,
+    keyframe_count        BIGINT,
+    delta_count           BIGINT,
+    raw_size_bytes        BIGINT,
     compressed_size_bytes BIGINT,
-    compression_ratio   NUMERIC(10,2),  -- Rounded to 2 decimals
-    cache_hits          BIGINT,
-    cache_misses        BIGINT,
-    avg_chain_length    NUMERIC(10,2)   -- Rounded to 2 decimals
+    compression_ratio     NUMERIC(10,2),  -- Rounded to 2 decimals
+    cache_hits            BIGINT,
+    cache_misses          BIGINT,
+    avg_compression_depth NUMERIC(10,2)   -- Rounded to 2 decimals
 ) AS $$
     SELECT 
         s.total_rows,
@@ -778,7 +755,7 @@ RETURNS TABLE (
         ROUND(s.compression_ratio::numeric, 2),
         s.cache_hits,
         s.cache_misses,
-        ROUND(s.avg_chain_length::numeric, 2)
+        ROUND(s.avg_compression_depth::numeric, 2)
     FROM xpatch_stats(tbl) s;
 $$ LANGUAGE SQL STABLE;
 
@@ -957,61 +934,17 @@ COMMENT ON FUNCTION xpatch.physical(regclass) IS
 -- Stats cache management functions
 -- ============================================================================
 
--- Internal: Recompute table_stats from group_stats
-CREATE OR REPLACE FUNCTION xpatch._recompute_table_stats(p_relid OID)
-RETURNS VOID AS $$
-BEGIN
-    INSERT INTO xpatch.table_stats (
-        relid, total_rows, total_groups, keyframe_count, delta_count,
-        raw_size_bytes, compressed_size_bytes, compression_ratio, avg_chain_length,
-        is_valid, last_updated
-    )
-    SELECT 
-        p_relid,
-        COALESCE(SUM(row_count), 0),
-        COUNT(*),
-        COALESCE(SUM(keyframe_count), 0),
-        COALESCE(SUM(delta_count), 0),
-        COALESCE(SUM(raw_size_bytes), 0),
-        COALESCE(SUM(compressed_size_bytes), 0),
-        CASE WHEN SUM(compressed_size_bytes) > 0 
-             THEN SUM(raw_size_bytes)::FLOAT8 / SUM(compressed_size_bytes)::FLOAT8
-             ELSE NULL END,
-        CASE WHEN SUM(keyframe_count) > 0
-             THEN SUM(delta_count)::FLOAT8 / SUM(keyframe_count)::FLOAT8
-             ELSE NULL END,
-        NOT EXISTS(SELECT 1 FROM xpatch.group_stats WHERE relid = p_relid AND NOT is_valid),
-        now()
-    FROM xpatch.group_stats
-    WHERE relid = p_relid AND is_valid
-    ON CONFLICT (relid) DO UPDATE SET
-        total_rows = EXCLUDED.total_rows,
-        total_groups = EXCLUDED.total_groups,
-        keyframe_count = EXCLUDED.keyframe_count,
-        delta_count = EXCLUDED.delta_count,
-        raw_size_bytes = EXCLUDED.raw_size_bytes,
-        compressed_size_bytes = EXCLUDED.compressed_size_bytes,
-        compression_ratio = EXCLUDED.compression_ratio,
-        avg_chain_length = EXCLUDED.avg_chain_length,
-        is_valid = EXCLUDED.is_valid,
-        last_updated = EXCLUDED.last_updated;
-END;
-$$ LANGUAGE plpgsql;
-
--- Check if stats for a table are valid (no invalidated groups)
-CREATE OR REPLACE FUNCTION xpatch.stats_valid(table_name REGCLASS)
+-- Check if stats exist for a table (for deciding whether to use cache or full scan)
+CREATE OR REPLACE FUNCTION xpatch.stats_exist(table_name REGCLASS)
 RETURNS BOOLEAN AS $$
-    SELECT COALESCE(
-        (SELECT is_valid FROM xpatch.table_stats WHERE relid = table_name::OID),
-        false
-    );
+    SELECT EXISTS(SELECT 1 FROM xpatch.group_stats WHERE relid = table_name::OID);
 $$ LANGUAGE SQL STABLE;
 
-COMMENT ON FUNCTION xpatch.stats_valid(regclass) IS 
-    'Check if cached statistics for a table are valid. Returns false if any group was modified since last refresh.';
+COMMENT ON FUNCTION xpatch.stats_exist(regclass) IS 
+    'Check if cached statistics exist for a table. Used internally to decide cache vs full scan.';
 
 -- Force recompute all stats for a table by doing a full scan
--- This is the slow path, only needed after DELETE or when stats are missing
+-- This is the slow path, only needed after bulk operations or when stats are missing
 CREATE OR REPLACE FUNCTION xpatch.refresh_stats(table_name REGCLASS)
 RETURNS TABLE (
     groups_scanned  BIGINT,
@@ -1029,14 +962,10 @@ BEGIN
     
     -- Delete existing stats for this table
     DELETE FROM xpatch.group_stats WHERE relid = v_relid;
-    DELETE FROM xpatch.table_stats WHERE relid = v_relid;
     
     -- Call internal C function to scan and populate stats
     -- This populates xpatch.group_stats directly
     SELECT * INTO v_groups, v_rows FROM xpatch_refresh_stats_internal(v_relid);
-    
-    -- Recompute table_stats from group_stats
-    PERFORM xpatch._recompute_table_stats(v_relid);
     
     groups_scanned := v_groups;
     rows_scanned := v_rows;
@@ -1046,7 +975,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 COMMENT ON FUNCTION xpatch.refresh_stats(regclass) IS 
-    'Force recompute all statistics for a table by doing a full scan. Call this after bulk DELETE operations or when stats appear stale.';
+    'Force recompute all statistics for a table by doing a full scan. Call this after bulk operations or when stats appear stale.';
 
 -- Internal C function for stats refresh (full table scan)
 CREATE FUNCTION xpatch_refresh_stats_internal(relid OID)
@@ -1058,21 +987,13 @@ LANGUAGE C STRICT;
 CREATE FUNCTION xpatch_update_group_stats(
     p_relid OID,
     p_group_hash BYTEA,
-    p_group_value_text TEXT,
     p_is_keyframe BOOLEAN,
     p_max_seq INT,
-    p_max_version_typid OID,
-    p_max_version_data BYTEA,
     p_raw_size BIGINT,
-    p_compressed_size BIGINT
+    p_compressed_size BIGINT,
+    p_avg_delta_tag FLOAT8
 ) RETURNS VOID
 AS 'MODULE_PATHNAME', 'xpatch_update_group_stats'
 LANGUAGE C;
 
--- Internal C function to invalidate group stats on DELETE
-CREATE FUNCTION xpatch_invalidate_group_stats(
-    p_relid OID,
-    p_group_hash BYTEA
-) RETURNS VOID
-AS 'MODULE_PATHNAME', 'xpatch_invalidate_group_stats'
-LANGUAGE C;
+

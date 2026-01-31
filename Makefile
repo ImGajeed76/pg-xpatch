@@ -64,7 +64,7 @@ EXTRA_CLEAN = lib/libxpatch_c.a lib/xpatch.h lib/blake3/*.o
 REGRESS = 00_setup 01_basic 02_compression 03_reconstruction 04_keyframes \
           05_cache 06_errors 07_indexes 08_parallel 09_multi_delta 10_no_group \
           11_delete 12_vacuum 13_crash_recovery 14_describe 15_warm_cache \
-          16_auto_index 17_edge_cases 18_restore_mode 20_comprehensive
+          16_auto_index 17_edge_cases 18_restore_mode 19_stats_cache 20_comprehensive
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 # Link against static xpatch library

@@ -174,4 +174,22 @@ xpatch_group_hash_to_uint32(XPatchGroupHash hash, uint32 max_entries)
     return h % max_entries;
 }
 
+/*
+ * Compute a 64-bit lock ID for group-level advisory locking.
+ * Combines relation OID with group hash to create unique lock ID per group.
+ * Used to prevent concurrent modifications to the same group.
+ *
+ * Takes XPatchGroupHash (already computed via BLAKE3) rather than raw Datum
+ * to ensure consistent hashing for all group value types.
+ */
+static inline uint64
+xpatch_compute_group_lock_id(Oid relid, XPatchGroupHash group_hash)
+{
+    /* Combine relid with the BLAKE3 group hash */
+    uint64 h = group_hash.h1;
+    h ^= (uint64) relid;
+    h ^= group_hash.h2;
+    return h;
+}
+
 #endif /* XPATCH_HASH_H */

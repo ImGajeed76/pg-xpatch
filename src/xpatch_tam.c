@@ -712,26 +712,7 @@ xpatch_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
  * Tuple modification callbacks
  * ---------------------------------------------------------------- */
 
-/*
- * Compute a 64-bit hash for group-level advisory locking.
- * Combines relation OID with group value to create unique lock ID per group.
- */
-static uint64
-xpatch_compute_group_lock_id(Oid relid, Datum group_value)
-{
-    uint64 h = 14695981039346656037ULL;  /* FNV-1a offset basis */
-    uint64 group_hash = (uint64) group_value;
-    
-    /* Mix relid into hash */
-    h ^= (uint64) relid;
-    h *= 1099511628211ULL;  /* FNV-1a prime */
-    
-    /* Mix group_value into hash */
-    h ^= group_hash;
-    h *= 1099511628211ULL;
-    
-    return h;
-}
+/* xpatch_compute_group_lock_id is now in xpatch_hash.h */
 
 static void
 xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
@@ -773,7 +754,11 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
      * same group could both see the same max_version and create duplicates.
      * The lock is released at transaction end.
      */
-    group_lock_id = xpatch_compute_group_lock_id(RelationGetRelid(relation), group_value);
+    {
+        bool group_isnull = (group_value == (Datum) 0 && config->group_by_attnum != InvalidAttrNumber);
+        XPatchGroupHash group_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
+        group_lock_id = xpatch_compute_group_lock_id(RelationGetRelid(relation), group_hash);
+    }
     DirectFunctionCall1(pg_advisory_xact_lock_int8, Int64GetDatum((int64) group_lock_id));
 
     elog(DEBUG1, "xpatch_tuple_insert: acquired advisory lock for group (lock_id=%lu)",
@@ -1054,7 +1039,8 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
     ItemId itemId;
     HeapTupleData target_tuple;
     Datum group_value = (Datum) 0;
-    bool group_isnull;
+    Oid group_typid = InvalidOid;
+    bool group_isnull = false;
     uint64 group_lock_id;
     Oid relid;
     BlockNumber blkno;
@@ -1152,6 +1138,8 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
     /* Get group value if configured */
     if (config->group_by_attnum != InvalidAttrNumber)
     {
+        Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+        group_typid = group_attr->atttypid;
         group_value = heap_getattr(&target_tuple, config->group_by_attnum, 
                                    tupdesc, &group_isnull);
         if (group_isnull)
@@ -1164,7 +1152,10 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
     /*
      * Step 2: Acquire advisory lock on the group to prevent concurrent modifications
      */
-    group_lock_id = xpatch_compute_group_lock_id(relid, group_value);
+    {
+        XPatchGroupHash group_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
+        group_lock_id = xpatch_compute_group_lock_id(relid, group_hash);
+    }
     DirectFunctionCall1(pg_advisory_xact_lock_int8, Int64GetDatum((int64) group_lock_id));
     
     elog(DEBUG1, "xpatch: delete acquired advisory lock (lock_id=%lu)", 
@@ -1390,17 +1381,9 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
     
     /*
      * Step 6: Update seq cache - new max_seq is target_seq - 1
-     * Get the group column type OID for proper hash computation.
+     * group_typid was already set when we fetched the group value earlier.
      */
     {
-        Oid group_typid = InvalidOid;
-        
-        if (config->group_by_attnum != InvalidAttrNumber)
-        {
-            Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
-            group_typid = group_attr->atttypid;
-        }
-        
         if (target_seq > 1)
         {
             xpatch_seq_cache_set_max_seq(relid, group_value, group_typid, target_seq - 1);
@@ -1412,12 +1395,17 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
         }
         
         /*
-         * Step 7: Invalidate stats cache for this group.
-         * Stats will be recomputed on next access or explicit refresh.
+         * Step 7: Refresh stats cache for the affected group.
+         * 
+         * We cannot accurately decrement because we don't know the original
+         * uncompressed size. Instead, we refresh this group's stats by
+         * rescanning just this group. The advisory lock ensures no concurrent
+         * INSERTs to this group during the refresh.
          */
         {
-            XPatchGroupHash group_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
-            xpatch_stats_cache_invalidate_group(relid, group_hash);
+            XPatchGroupHash stats_group_hash;
+            stats_group_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
+            xpatch_stats_cache_refresh_groups(relid, &stats_group_hash, 1);
         }
     }
     
@@ -1673,6 +1661,7 @@ xpatch_relation_set_new_filelocator(Relation rel,
     xpatch_cache_invalidate_rel(relid);      /* Content cache */
     xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
     xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
+    xpatch_stats_cache_delete_table(relid);  /* Stats cache - delete on TRUNCATE */
 
     /*
      * Initialize the physical storage for the new relation.
@@ -1694,7 +1683,7 @@ xpatch_relation_nontransactional_truncate(Relation rel)
     xpatch_cache_invalidate_rel(relid);      /* Content cache */
     xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
     xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
-    xpatch_stats_cache_invalidate_table(relid); /* Stats cache */
+    xpatch_stats_cache_delete_table(relid); /* Stats cache */
 
     /* Delegate to heap */
     RelationTruncate(rel, 0);

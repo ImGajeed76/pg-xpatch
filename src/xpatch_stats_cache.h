@@ -4,9 +4,8 @@
  *
  * xpatch_stats_cache.h - Stats cache for O(1) lookups
  *
- * Provides cached statistics for xpatch tables, stored in xpatch.group_stats
- * and xpatch.table_stats catalog tables. Updated incrementally on INSERT,
- * invalidated on DELETE.
+ * Provides cached statistics for xpatch tables, stored in xpatch.group_stats.
+ * Updated incrementally on INSERT and DELETE.
  */
 
 #ifndef XPATCH_STATS_CACHE_H
@@ -22,48 +21,69 @@
  * Parameters:
  *   relid           - Table OID
  *   group_hash      - BLAKE3 hash of group value
- *   group_value_text - Human-readable group value (can be NULL)
  *   is_keyframe     - True if this row is a keyframe
- *   max_seq         - New max sequence number for this group
- *   max_version_typid - Type OID of order_by column
- *   max_version_data - Serialized max version value (can be NULL)
- *   max_version_len  - Length of max_version_data
+ *   max_seq         - New sequence number for this row
  *   raw_size        - Uncompressed size of this row's delta columns
  *   compressed_size - Compressed size of this row's delta columns
+ *   avg_delta_tag   - Average tag across delta columns (0 for keyframe)
  */
 void xpatch_stats_cache_update_group(
     Oid relid,
     XPatchGroupHash group_hash,
-    const char *group_value_text,
     bool is_keyframe,
     int32 max_seq,
-    Oid max_version_typid,
-    const uint8 *max_version_data,
-    Size max_version_len,
     int64 raw_size,
-    int64 compressed_size
+    int64 compressed_size,
+    double avg_delta_tag
 );
 
 /*
- * Invalidate group stats after DELETE.
- * The stats will be recomputed on next read or explicit refresh.
+ * Delete stats for a specific group.
+ * Used internally; prefer refresh_groups for DELETE operations.
  */
-void xpatch_stats_cache_invalidate_group(Oid relid, XPatchGroupHash group_hash);
+void xpatch_stats_cache_delete_group(Oid relid, XPatchGroupHash group_hash);
 
 /*
- * Invalidate all stats for a table (called on TRUNCATE).
+ * Delete all stats for a table (called on TRUNCATE).
  */
-void xpatch_stats_cache_invalidate_table(Oid relid);
+void xpatch_stats_cache_delete_table(Oid relid);
 
 /*
- * Get max_seq for a group from cache.
- * Returns -1 if not found or invalid.
+ * Get max_seq for a group from stats cache.
+ * Returns -1 if not found.
  */
 int32 xpatch_stats_cache_get_max_seq(Oid relid, XPatchGroupHash group_hash);
 
 /*
- * Check if table stats are valid (no invalidated groups).
+ * Check if stats exist for a table.
  */
-bool xpatch_stats_cache_is_valid(Oid relid);
+bool xpatch_stats_cache_exists(Oid relid);
+
+/*
+ * Get aggregated stats for a table from cache.
+ * Returns true if stats exist, false if cache miss.
+ */
+bool xpatch_stats_cache_get_table_stats(
+    Oid relid,
+    int64 *total_rows,
+    int64 *total_groups,
+    int64 *keyframe_count,
+    int64 *raw_size_bytes,
+    int64 *compressed_size_bytes,
+    double *sum_avg_delta_tags
+);
+
+/*
+ * Refresh stats for specific groups that are missing from cache.
+ * Scans only the rows belonging to those groups.
+ * 
+ * Parameters:
+ *   relid        - Table OID
+ *   group_hashes - Array of group hashes to refresh (NULL-terminated bytea array)
+ *   num_groups   - Number of groups to refresh
+ *
+ * Returns the number of rows scanned.
+ */
+int64 xpatch_stats_cache_refresh_groups(Oid relid, XPatchGroupHash *group_hashes, int num_groups);
 
 #endif /* XPATCH_STATS_CACHE_H */

@@ -1183,6 +1183,8 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     XPatchGroupHash insert_cache_hash = {0};  /* For ownership validation */
     int64 total_raw_size = 0;      /* For stats tracking */
     int64 total_compressed_size = 0; /* For stats tracking */
+    int total_delta_tags = 0;      /* Sum of best_tag values for avg_compression_depth */
+    int num_delta_columns_processed = 0; /* Count of delta columns for averaging */
     
     /* Initialize out_seq to 0 (will be set later if allocation succeeds) */
     if (out_seq)
@@ -1532,6 +1534,10 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                      VARSIZE_ANY_EXHDR(raw_content),
                      compressed ? VARSIZE_ANY_EXHDR(compressed) : 0,
                      best_tag);
+                
+                /* Track delta tags for avg_compression_depth calculation */
+                total_delta_tags += best_tag;
+                num_delta_columns_processed++;
             }
             
             if (compressed == NULL)
@@ -1595,7 +1601,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     if (!restore_mode && config->num_delta_columns > 0)
     {
         XPatchGroupHash stats_hash;
-        char *group_text = NULL;
+        double avg_delta_tag = 0.0;
         
         /* Use existing hash if available, otherwise compute it */
         if (insert_cache_slot >= 0)
@@ -1608,30 +1614,19 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
             stats_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
         }
         
-        /* Get human-readable group value for debugging */
-        if (config->group_by_attnum != InvalidAttrNumber && group_value != (Datum) 0)
-        {
-            Oid out_func;
-            bool is_varlena;
-            getTypeOutputInfo(group_typid, &out_func, &is_varlena);
-            group_text = OidOutputFunctionCall(out_func, group_value);
-        }
+        /* Compute average delta tag across all delta columns */
+        if (num_delta_columns_processed > 0)
+            avg_delta_tag = (double) total_delta_tags / num_delta_columns_processed;
         
         xpatch_stats_cache_update_group(
             RelationGetRelid(rel),
             stats_hash,
-            group_text,
             is_keyframe,
             new_seq,
-            InvalidOid,  /* max_version_typid - TODO: track order_by value */
-            NULL,        /* max_version_data */
-            0,           /* max_version_len */
             total_raw_size,
-            total_compressed_size
+            total_compressed_size,
+            avg_delta_tag
         );
-        
-        if (group_text)
-            pfree(group_text);
     }
     
     /* Build the physical tuple */
