@@ -154,12 +154,14 @@ jobs:
       - name: Build extension
         run: |
           export PATH="$(brew --prefix postgresql@${{ matrix.pg_version }})/bin:$PATH"
-          make clean && make
+          # Override CFLAGS to remove unsupported clang flags
+          make clean && make PG_CFLAGS="-Wall -Wextra -Wno-unused-parameter -Wno-ignored-optimization-argument"
       
       - name: Package binaries
         run: |
           mkdir -p dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64
-          cp pg_xpatch.dylib dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
+          # On macOS, PGXS produces .dylib
+          cp pg_xpatch.dylib dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/ 2>/dev/null || cp pg_xpatch.so dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
           cp pg_xpatch.control dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
           cp sql/*.sql dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
           cp README.md dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
@@ -213,12 +215,14 @@ jobs:
       - name: Build extension
         run: |
           export PATH="$(brew --prefix postgresql@${{ matrix.pg_version }})/bin:$PATH"
-          make clean && make
+          # Override CFLAGS to remove unsupported clang flags
+          make clean && make PG_CFLAGS="-Wall -Wextra -Wno-unused-parameter -Wno-ignored-optimization-argument"
       
       - name: Package binaries
         run: |
           mkdir -p dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64
-          cp pg_xpatch.dylib dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
+          # On macOS, PGXS produces .dylib
+          cp pg_xpatch.dylib dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/ 2>/dev/null || cp pg_xpatch.so dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
           cp pg_xpatch.control dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
           cp sql/*.sql dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
           cp README.md dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
@@ -291,15 +295,15 @@ jobs:
         shell: pwsh
         run: |
           # Clone and build the Rust library
-          mkdir -p tmp
+          New-Item -ItemType Directory -Path tmp -Force
           git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
-          cd tmp/xpatch
+          Set-Location tmp/xpatch
           cargo build -p xpatch-c --release
-          cd ../..
+          Set-Location ../..
           
-          mkdir -p lib
+          # lib directory already exists in repo, no need to create
           Copy-Item tmp/xpatch/target/release/xpatch_c.lib lib/
-          cd tmp/xpatch/crates/xpatch-c
+          Set-Location tmp/xpatch/crates/xpatch-c
           cbindgen --config cbindgen.toml --output $env:GITHUB_WORKSPACE/lib/xpatch.h
       
       - name: Build extension
