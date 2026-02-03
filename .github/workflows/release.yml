@@ -34,25 +34,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       
-      - name: Clone xpatch for caching
-        run: |
-          mkdir -p tmp
-          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
-      
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tmp/xpatch
-          cache-on-failure: true
-      
-      - name: Cache cbindgen
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cbindgen
-          key: cbindgen-${{ runner.os }}-${{ runner.arch }}
-      
       - name: Install cbindgen
-        run: command -v cbindgen || cargo install cbindgen
+        run: cargo install cbindgen
       
       - name: Build extension
         run: make clean && make
@@ -108,25 +91,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       
-      - name: Clone xpatch for caching
-        run: |
-          mkdir -p tmp
-          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
-      
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tmp/xpatch
-          cache-on-failure: true
-      
-      - name: Cache cbindgen
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cbindgen
-          key: cbindgen-${{ runner.os }}-${{ runner.arch }}
-      
       - name: Install cbindgen
-        run: command -v cbindgen || cargo install cbindgen
+        run: cargo install cbindgen
       
       - name: Build extension
         run: make clean && make
@@ -166,7 +132,7 @@ jobs:
           path: dist/*.tar.gz
 
   build-macos-amd64:
-    runs-on: macos-15
+    runs-on: macos-13
     strategy:
       matrix:
         pg_version: [16]
@@ -174,67 +140,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install PostgreSQL (x86_64 via Rosetta)
+      - name: Install PostgreSQL
         run: |
-          # Install Rosetta for x86_64 emulation
-          softwareupdate --install-rosetta --agree-to-license || true
-          # Install x86_64 Homebrew and PostgreSQL
-          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
-          arch -x86_64 /usr/local/bin/brew install postgresql@${{ matrix.pg_version }}
-          echo "/usr/local/opt/postgresql@${{ matrix.pg_version }}/bin" >> $GITHUB_PATH
+          brew install postgresql@${{ matrix.pg_version }}
+          echo "$(brew --prefix postgresql@${{ matrix.pg_version }})/bin" >> $GITHUB_PATH
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin
-      
-      - name: Clone xpatch for caching
-        run: |
-          mkdir -p tmp
-          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
-      
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tmp/xpatch
-          cache-on-failure: true
-      
-      - name: Cache cbindgen
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cbindgen
-          key: cbindgen-${{ runner.os }}-${{ runner.arch }}
       
       - name: Install cbindgen
-        run: command -v cbindgen || cargo install cbindgen
+        run: cargo install cbindgen
       
       - name: Build extension
         run: |
-          export PATH="/usr/local/opt/postgresql@${{ matrix.pg_version }}/bin:$PATH"
-          # Build Rust library for x86_64
-          cd tmp/xpatch
-          cargo build -p xpatch-c --release --target x86_64-apple-darwin
-          cd ../..
-          mkdir -p lib
-          cp tmp/xpatch/target/x86_64-apple-darwin/release/libxpatch_c.a lib/
-          cd tmp/xpatch/crates/xpatch-c
-          cbindgen --config cbindgen.toml --output $GITHUB_WORKSPACE/lib/xpatch.h
-          cd $GITHUB_WORKSPACE
-          # Clean first
-          arch -x86_64 make clean
-          # Build BLAKE3 assembly files for x86_64 manually (after clean, before make)
-          arch -x86_64 cc -c -o lib/blake3/blake3_sse2_x86-64_unix.o lib/blake3/blake3_sse2_x86-64_unix.S
-          arch -x86_64 cc -c -o lib/blake3/blake3_sse41_x86-64_unix.o lib/blake3/blake3_sse41_x86-64_unix.S
-          arch -x86_64 cc -c -o lib/blake3/blake3_avx2_x86-64_unix.o lib/blake3/blake3_avx2_x86-64_unix.S
-          arch -x86_64 cc -c -o lib/blake3/blake3_avx512_x86-64_unix.o lib/blake3/blake3_avx512_x86-64_unix.S
-          # Build extension for x86_64
-          arch -x86_64 make PG_CFLAGS="-Wall -Wextra -Wno-unused-parameter -Wno-ignored-optimization-argument"
+          export PATH="$(brew --prefix postgresql@${{ matrix.pg_version }})/bin:$PATH"
+          make clean && make
       
       - name: Package binaries
         run: |
           mkdir -p dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64
-          # On macOS, PGXS produces .dylib
-          cp pg_xpatch.dylib dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/ 2>/dev/null || cp pg_xpatch.so dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
+          cp pg_xpatch.dylib dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
           cp pg_xpatch.control dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
           cp sql/*.sql dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
           cp README.md dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
@@ -282,37 +207,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       
-      - name: Clone xpatch for caching
-        run: |
-          mkdir -p tmp
-          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
-      
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tmp/xpatch
-          cache-on-failure: true
-      
-      - name: Cache cbindgen
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cbindgen
-          key: cbindgen-${{ runner.os }}-${{ runner.arch }}
-      
       - name: Install cbindgen
-        run: command -v cbindgen || cargo install cbindgen
+        run: cargo install cbindgen
       
       - name: Build extension
         run: |
           export PATH="$(brew --prefix postgresql@${{ matrix.pg_version }})/bin:$PATH"
-          # Override CFLAGS to remove unsupported clang flags
-          make clean && make PG_CFLAGS="-Wall -Wextra -Wno-unused-parameter -Wno-ignored-optimization-argument"
+          make clean && make
       
       - name: Package binaries
         run: |
           mkdir -p dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64
-          # On macOS, PGXS produces .dylib
-          cp pg_xpatch.dylib dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/ 2>/dev/null || cp pg_xpatch.so dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
+          cp pg_xpatch.dylib dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
           cp pg_xpatch.control dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
           cp sql/*.sql dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
           cp README.md dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
@@ -375,18 +281,6 @@ jobs:
         with:
           toolchain: stable-msvc
       
-      - name: Clone xpatch for caching
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path tmp -Force | Out-Null
-          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
-      
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tmp/xpatch
-          cache-on-failure: true
-      
       - name: Install cbindgen
         run: cargo install cbindgen
       
@@ -396,13 +290,16 @@ jobs:
       - name: Build Rust library
         shell: pwsh
         run: |
-          Set-Location tmp/xpatch
+          # Clone and build the Rust library
+          mkdir -p tmp
+          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
+          cd tmp/xpatch
           cargo build -p xpatch-c --release
-          Set-Location $env:GITHUB_WORKSPACE
+          cd ../..
           
-          # lib directory already exists in repo, no need to create
+          mkdir -p lib
           Copy-Item tmp/xpatch/target/release/xpatch_c.lib lib/
-          Set-Location tmp/xpatch/crates/xpatch-c
+          cd tmp/xpatch/crates/xpatch-c
           cbindgen --config cbindgen.toml --output $env:GITHUB_WORKSPACE/lib/xpatch.h
       
       - name: Build extension
@@ -412,51 +309,6 @@ jobs:
           $includePath = & $pgConfig --includedir-server
           $libPath = & $pgConfig --libdir
           $pkgLibDir = & $pgConfig --pkglibdir
-          
-          # Create stub headers to satisfy PostgreSQL includes on Windows
-          New-Item -ItemType Directory -Path "stub" -Force | Out-Null
-          New-Item -ItemType Directory -Path "stub/netinet" -Force | Out-Null
-          New-Item -ItemType Directory -Path "stub/arpa" -Force | Out-Null
-          New-Item -ItemType Directory -Path "stub/sys" -Force | Out-Null
-          
-          @"
-          /* Stub libintl.h for Windows builds without gettext */
-          #ifndef LIBINTL_H
-          #define LIBINTL_H
-          #define gettext(x) (x)
-          #define dgettext(d, x) (x)
-          #define ngettext(s, p, n) ((n) == 1 ? (s) : (p))
-          #define dngettext(d, s, p, n) ((n) == 1 ? (s) : (p))
-          #define textdomain(d) ((char*)0)
-          #define bindtextdomain(d, dir) ((char*)0)
-          #endif
-          "@ | Out-File -FilePath "stub/libintl.h" -Encoding ascii
-          
-          @"
-          /* Stub netinet/in.h for Windows */
-          #ifndef _NETINET_IN_H
-          #define _NETINET_IN_H
-          #include <winsock2.h>
-          #include <ws2tcpip.h>
-          #endif
-          "@ | Out-File -FilePath "stub/netinet/in.h" -Encoding ascii
-          
-          @"
-          /* Stub arpa/inet.h for Windows */
-          #ifndef _ARPA_INET_H
-          #define _ARPA_INET_H
-          #include <winsock2.h>
-          #include <ws2tcpip.h>
-          #endif
-          "@ | Out-File -FilePath "stub/arpa/inet.h" -Encoding ascii
-          
-          @"
-          /* Stub sys/socket.h for Windows */
-          #ifndef _SYS_SOCKET_H
-          #define _SYS_SOCKET_H
-          #include <winsock2.h>
-          #endif
-          "@ | Out-File -FilePath "stub/sys/socket.h" -Encoding ascii
           
           # Compile BLAKE3
           cl /c /O2 /I"lib/blake3" /DBLAKE3_NO_SSE2 /DBLAKE3_NO_SSE41 /DBLAKE3_NO_AVX2 /DBLAKE3_NO_AVX512 lib/blake3/blake3.c /Fo:lib/blake3/blake3.obj
@@ -480,8 +332,7 @@ jobs:
           
           foreach ($src in $sources) {
             $obj = $src -replace '\.c$', '.obj'
-            # Include stub directory first to provide libintl.h
-            cl /c /O2 /I"stub" /I"$includePath" /I"lib" /I"lib/blake3" /I"src" /D_CRT_SECURE_NO_WARNINGS $src /Fo:$obj
+            cl /c /O2 /I"$includePath" /I"lib" /I"lib/blake3" /I"src" /D_CRT_SECURE_NO_WARNINGS $src /Fo:$obj
           }
           
           # Link DLL
