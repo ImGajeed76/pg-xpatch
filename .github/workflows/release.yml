@@ -178,6 +178,11 @@ jobs:
         with:
           targets: x86_64-apple-darwin
       
+      - name: Clone xpatch for caching
+        run: |
+          mkdir -p tmp
+          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
+      
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -197,8 +202,6 @@ jobs:
         run: |
           export PATH="/usr/local/opt/postgresql@${{ matrix.pg_version }}/bin:$PATH"
           # Build Rust library for x86_64
-          mkdir -p tmp
-          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
           cd tmp/xpatch
           cargo build -p xpatch-c --release --target x86_64-apple-darwin
           cd ../..
@@ -207,6 +210,11 @@ jobs:
           cd tmp/xpatch/crates/xpatch-c
           cbindgen --config cbindgen.toml --output $GITHUB_WORKSPACE/lib/xpatch.h
           cd $GITHUB_WORKSPACE
+          # Build BLAKE3 assembly files for x86_64 manually
+          arch -x86_64 cc -c -o lib/blake3/blake3_sse2_x86-64_unix.o lib/blake3/blake3_sse2_x86-64_unix.S
+          arch -x86_64 cc -c -o lib/blake3/blake3_sse41_x86-64_unix.o lib/blake3/blake3_sse41_x86-64_unix.S
+          arch -x86_64 cc -c -o lib/blake3/blake3_avx2_x86-64_unix.o lib/blake3/blake3_avx2_x86-64_unix.S
+          arch -x86_64 cc -c -o lib/blake3/blake3_avx512_x86-64_unix.o lib/blake3/blake3_avx512_x86-64_unix.S
           # Build extension for x86_64
           arch -x86_64 make clean
           arch -x86_64 make PG_CFLAGS="-Wall -Wextra -Wno-unused-parameter -Wno-ignored-optimization-argument"
@@ -351,6 +359,12 @@ jobs:
         with:
           toolchain: stable-msvc
       
+      - name: Clone xpatch for caching
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path tmp -Force | Out-Null
+          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
+      
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -366,12 +380,9 @@ jobs:
       - name: Build Rust library
         shell: pwsh
         run: |
-          # Clone and build the Rust library
-          New-Item -ItemType Directory -Path tmp -Force
-          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
           Set-Location tmp/xpatch
           cargo build -p xpatch-c --release
-          Set-Location ../..
+          Set-Location $env:GITHUB_WORKSPACE
           
           # lib directory already exists in repo, no need to create
           Copy-Item tmp/xpatch/target/release/xpatch_c.lib lib/
@@ -385,6 +396,21 @@ jobs:
           $includePath = & $pgConfig --includedir-server
           $libPath = & $pgConfig --libdir
           $pkgLibDir = & $pgConfig --pkglibdir
+          
+          # Create stub libintl.h to satisfy PostgreSQL NLS include
+          New-Item -ItemType Directory -Path "stub" -Force | Out-Null
+          @"
+          /* Stub libintl.h for Windows builds without gettext */
+          #ifndef LIBINTL_H
+          #define LIBINTL_H
+          #define gettext(x) (x)
+          #define dgettext(d, x) (x)
+          #define ngettext(s, p, n) ((n) == 1 ? (s) : (p))
+          #define dngettext(d, s, p, n) ((n) == 1 ? (s) : (p))
+          #define textdomain(d) ((char*)0)
+          #define bindtextdomain(d, dir) ((char*)0)
+          #endif
+          "@ | Out-File -FilePath "stub/libintl.h" -Encoding ascii
           
           # Compile BLAKE3
           cl /c /O2 /I"lib/blake3" /DBLAKE3_NO_SSE2 /DBLAKE3_NO_SSE41 /DBLAKE3_NO_AVX2 /DBLAKE3_NO_AVX512 lib/blake3/blake3.c /Fo:lib/blake3/blake3.obj
@@ -408,8 +434,8 @@ jobs:
           
           foreach ($src in $sources) {
             $obj = $src -replace '\.c$', '.obj'
-            # Disable NLS to avoid libintl.h dependency
-            cl /c /O2 /I"$includePath" /I"lib" /I"lib/blake3" /I"src" /D_CRT_SECURE_NO_WARNINGS /DENABLE_NLS=0 $src /Fo:$obj
+            # Include stub directory first to provide libintl.h
+            cl /c /O2 /I"stub" /I"$includePath" /I"lib" /I"lib/blake3" /I"src" /D_CRT_SECURE_NO_WARNINGS $src /Fo:$obj
           }
           
           # Link DLL
