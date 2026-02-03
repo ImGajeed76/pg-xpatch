@@ -34,6 +34,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       
+      - name: Clone xpatch for caching
+        run: |
+          mkdir -p tmp
+          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
+      
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -102,6 +107,11 @@ jobs:
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      
+      - name: Clone xpatch for caching
+        run: |
+          mkdir -p tmp
+          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
       
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -270,6 +280,11 @@ jobs:
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      
+      - name: Clone xpatch for caching
+        run: |
+          mkdir -p tmp
+          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
       
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
