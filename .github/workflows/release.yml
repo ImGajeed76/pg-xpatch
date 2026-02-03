@@ -4,13 +4,20 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Test build without releasing'
+        required: false
+        default: true
+        type: boolean
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-binaries:
+  build-linux-amd64:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -46,7 +53,7 @@ jobs:
           1. Copy files to PostgreSQL directories:
              ```bash
              sudo cp pg_xpatch.so $(pg_config --pkglibdir)/
-             sudo cp pg_xpatch.control sql/*.sql $(pg_config --sharedir)/extension/
+             sudo cp pg_xpatch.control *.sql $(pg_config --sharedir)/extension/
              ```
           
           2. (Optional) Enable shared memory cache in postgresql.conf:
@@ -67,6 +74,306 @@ jobs:
           name: pg_xpatch-pg${{ matrix.pg_version }}-linux-amd64
           path: dist/*.tar.gz
 
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        pg_version: [16]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install PostgreSQL dev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg_version }} clang llvm
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install cbindgen
+        run: cargo install cbindgen
+      
+      - name: Build extension
+        run: make clean && make
+      
+      - name: Package binaries
+        run: |
+          mkdir -p dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-arm64
+          cp pg_xpatch.so dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-arm64/
+          cp pg_xpatch.control dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-arm64/
+          cp sql/*.sql dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-arm64/
+          cp README.md dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-arm64/
+          cat > dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-arm64/INSTALL.md << 'EOF'
+          # Installation
+          
+          1. Copy files to PostgreSQL directories:
+             ```bash
+             sudo cp pg_xpatch.so $(pg_config --pkglibdir)/
+             sudo cp pg_xpatch.control *.sql $(pg_config --sharedir)/extension/
+             ```
+          
+          2. (Optional) Enable shared memory cache in postgresql.conf:
+             ```
+             shared_preload_libraries = 'pg_xpatch'
+             ```
+          
+          3. Restart PostgreSQL and create extension:
+             ```sql
+             CREATE EXTENSION pg_xpatch;
+             ```
+          EOF
+          cd dist && tar -czvf pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-arm64.tar.gz pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-linux-arm64
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg_xpatch-pg${{ matrix.pg_version }}-linux-arm64
+          path: dist/*.tar.gz
+
+  build-macos-amd64:
+    runs-on: macos-13
+    strategy:
+      matrix:
+        pg_version: [16]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install PostgreSQL
+        run: |
+          brew install postgresql@${{ matrix.pg_version }}
+          echo "$(brew --prefix postgresql@${{ matrix.pg_version }})/bin" >> $GITHUB_PATH
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install cbindgen
+        run: cargo install cbindgen
+      
+      - name: Build extension
+        run: |
+          export PATH="$(brew --prefix postgresql@${{ matrix.pg_version }})/bin:$PATH"
+          make clean && make
+      
+      - name: Package binaries
+        run: |
+          mkdir -p dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64
+          cp pg_xpatch.dylib dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
+          cp pg_xpatch.control dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
+          cp sql/*.sql dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
+          cp README.md dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/
+          cat > dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64/INSTALL.md << 'EOF'
+          # Installation (macOS)
+          
+          1. Copy files to PostgreSQL directories:
+             ```bash
+             sudo cp pg_xpatch.dylib $(pg_config --pkglibdir)/
+             sudo cp pg_xpatch.control *.sql $(pg_config --sharedir)/extension/
+             ```
+          
+          2. (Optional) Enable shared memory cache in postgresql.conf:
+             ```
+             shared_preload_libraries = 'pg_xpatch'
+             ```
+          
+          3. Restart PostgreSQL and create extension:
+             ```sql
+             CREATE EXTENSION pg_xpatch;
+             ```
+          EOF
+          cd dist && tar -czvf pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64.tar.gz pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-amd64
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg_xpatch-pg${{ matrix.pg_version }}-macos-amd64
+          path: dist/*.tar.gz
+
+  build-macos-arm64:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        pg_version: [16]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install PostgreSQL
+        run: |
+          brew install postgresql@${{ matrix.pg_version }}
+          echo "$(brew --prefix postgresql@${{ matrix.pg_version }})/bin" >> $GITHUB_PATH
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install cbindgen
+        run: cargo install cbindgen
+      
+      - name: Build extension
+        run: |
+          export PATH="$(brew --prefix postgresql@${{ matrix.pg_version }})/bin:$PATH"
+          make clean && make
+      
+      - name: Package binaries
+        run: |
+          mkdir -p dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64
+          cp pg_xpatch.dylib dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
+          cp pg_xpatch.control dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
+          cp sql/*.sql dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
+          cp README.md dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/
+          cat > dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64/INSTALL.md << 'EOF'
+          # Installation (macOS)
+          
+          1. Copy files to PostgreSQL directories:
+             ```bash
+             sudo cp pg_xpatch.dylib $(pg_config --pkglibdir)/
+             sudo cp pg_xpatch.control *.sql $(pg_config --sharedir)/extension/
+             ```
+          
+          2. (Optional) Enable shared memory cache in postgresql.conf:
+             ```
+             shared_preload_libraries = 'pg_xpatch'
+             ```
+          
+          3. Restart PostgreSQL and create extension:
+             ```sql
+             CREATE EXTENSION pg_xpatch;
+             ```
+          EOF
+          cd dist && tar -czvf pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64.tar.gz pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-macos-arm64
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg_xpatch-pg${{ matrix.pg_version }}-macos-arm64
+          path: dist/*.tar.gz
+
+  build-windows-amd64:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        pg_version: [16]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install PostgreSQL
+        shell: pwsh
+        run: |
+          # Download and install PostgreSQL
+          $pgVersion = "${{ matrix.pg_version }}"
+          $pgFullVersion = "16.4-1"  # Adjust as needed
+          $installerUrl = "https://get.enterprisedb.com/postgresql/postgresql-${pgFullVersion}-windows-x64.exe"
+          $installerPath = "$env:TEMP\postgresql-installer.exe"
+          
+          Write-Host "Downloading PostgreSQL ${pgFullVersion}..."
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath
+          
+          Write-Host "Installing PostgreSQL..."
+          Start-Process -FilePath $installerPath -ArgumentList "--mode unattended --prefix C:\PostgreSQL\$pgVersion --datadir C:\PostgreSQL\$pgVersion\data" -Wait
+          
+          # Add to PATH
+          echo "C:\PostgreSQL\$pgVersion\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-msvc
+      
+      - name: Install cbindgen
+        run: cargo install cbindgen
+      
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+      
+      - name: Build Rust library
+        shell: pwsh
+        run: |
+          # Clone and build the Rust library
+          mkdir -p tmp
+          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
+          cd tmp/xpatch
+          cargo build -p xpatch-c --release
+          cd ../..
+          
+          mkdir -p lib
+          Copy-Item tmp/xpatch/target/release/xpatch_c.lib lib/
+          cd tmp/xpatch/crates/xpatch-c
+          cbindgen --config cbindgen.toml --output $env:GITHUB_WORKSPACE/lib/xpatch.h
+      
+      - name: Build extension
+        shell: pwsh
+        run: |
+          $pgConfig = "C:\PostgreSQL\${{ matrix.pg_version }}\bin\pg_config.exe"
+          $includePath = & $pgConfig --includedir-server
+          $libPath = & $pgConfig --libdir
+          $pkgLibDir = & $pgConfig --pkglibdir
+          
+          # Compile BLAKE3
+          cl /c /O2 /I"lib/blake3" /DBLAKE3_NO_SSE2 /DBLAKE3_NO_SSE41 /DBLAKE3_NO_AVX2 /DBLAKE3_NO_AVX512 lib/blake3/blake3.c /Fo:lib/blake3/blake3.obj
+          cl /c /O2 /I"lib/blake3" /DBLAKE3_NO_SSE2 /DBLAKE3_NO_SSE41 /DBLAKE3_NO_AVX2 /DBLAKE3_NO_AVX512 lib/blake3/blake3_dispatch.c /Fo:lib/blake3/blake3_dispatch.obj
+          cl /c /O2 /I"lib/blake3" /DBLAKE3_NO_SSE2 /DBLAKE3_NO_SSE41 /DBLAKE3_NO_AVX2 /DBLAKE3_NO_AVX512 lib/blake3/blake3_portable.c /Fo:lib/blake3/blake3_portable.obj
+          
+          # Compile extension source files
+          $sources = @(
+            "src/pg_xpatch.c",
+            "src/xpatch_tam.c",
+            "src/xpatch_config.c",
+            "src/xpatch_storage.c",
+            "src/xpatch_compress.c",
+            "src/xpatch_cache.c",
+            "src/xpatch_seq_cache.c",
+            "src/xpatch_insert_cache.c",
+            "src/xpatch_encode_pool.c",
+            "src/xpatch_stats_cache.c",
+            "src/xpatch_utils.c"
+          )
+          
+          foreach ($src in $sources) {
+            $obj = $src -replace '\.c$', '.obj'
+            cl /c /O2 /I"$includePath" /I"lib" /I"lib/blake3" /I"src" /D_CRT_SECURE_NO_WARNINGS $src /Fo:$obj
+          }
+          
+          # Link DLL
+          $objs = $sources | ForEach-Object { $_ -replace '\.c$', '.obj' }
+          $blake3Objs = @("lib/blake3/blake3.obj", "lib/blake3/blake3_dispatch.obj", "lib/blake3/blake3_portable.obj")
+          
+          link /DLL /OUT:pg_xpatch.dll $objs $blake3Objs lib/xpatch_c.lib "$libPath\postgres.lib" ws2_32.lib userenv.lib ntdll.lib bcrypt.lib
+      
+      - name: Package binaries
+        shell: pwsh
+        run: |
+          $distDir = "dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-windows-amd64"
+          New-Item -ItemType Directory -Path $distDir -Force
+          
+          Copy-Item pg_xpatch.dll $distDir/
+          Copy-Item pg_xpatch.control $distDir/
+          Copy-Item sql/*.sql $distDir/
+          Copy-Item README.md $distDir/
+          
+          @"
+          # Installation (Windows)
+          
+          1. Copy files to PostgreSQL directories:
+             - Copy pg_xpatch.dll to the lib directory (pg_config --pkglibdir)
+             - Copy pg_xpatch.control and *.sql to the share/extension directory
+          
+          2. (Optional) Enable shared memory cache in postgresql.conf:
+             shared_preload_libraries = 'pg_xpatch'
+          
+          3. Restart PostgreSQL and create extension:
+             CREATE EXTENSION pg_xpatch;
+          "@ | Out-File -FilePath "$distDir/INSTALL.md" -Encoding utf8
+          
+          Compress-Archive -Path $distDir -DestinationPath "dist/pg_xpatch-${{ github.ref_name }}-pg${{ matrix.pg_version }}-windows-amd64.zip"
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg_xpatch-pg${{ matrix.pg_version }}-windows-amd64
+          path: dist/*.zip
+
   build-docker:
     runs-on: ubuntu-latest
     permissions:
@@ -77,6 +384,7 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Log in to Container Registry
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -97,13 +405,14 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
+          push: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
   release:
-    needs: [build-binaries, build-docker]
+    needs: [build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64, build-windows-amd64, build-docker]
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     
@@ -122,7 +431,9 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/**/*.tar.gz
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
           generate_release_notes: true
           body: |
             ## Installation
@@ -134,12 +445,11 @@ jobs:
             ```
             
             ### Binary Installation
-            Download the tarball for your PostgreSQL version and platform, then:
-            ```bash
-            tar -xzf pg_xpatch-*.tar.gz
-            cd pg_xpatch-*
-            sudo cp pg_xpatch.so $(pg_config --pkglibdir)/
-            sudo cp pg_xpatch.control *.sql $(pg_config --sharedir)/extension/
-            # Restart PostgreSQL, then:
-            psql -c "CREATE EXTENSION pg_xpatch;"
-            ```
+            Download the tarball/zip for your PostgreSQL version and platform, then follow the included INSTALL.md instructions.
+            
+            **Available platforms:**
+            - Linux amd64 (x86_64)
+            - Linux arm64 (aarch64)
+            - macOS amd64 (Intel)
+            - macOS arm64 (Apple Silicon)
+            - Windows amd64 (x86_64)
