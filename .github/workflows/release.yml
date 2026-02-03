@@ -220,13 +220,14 @@ jobs:
           cd tmp/xpatch/crates/xpatch-c
           cbindgen --config cbindgen.toml --output $GITHUB_WORKSPACE/lib/xpatch.h
           cd $GITHUB_WORKSPACE
-          # Build BLAKE3 assembly files for x86_64 manually
+          # Clean first
+          arch -x86_64 make clean
+          # Build BLAKE3 assembly files for x86_64 manually (after clean, before make)
           arch -x86_64 cc -c -o lib/blake3/blake3_sse2_x86-64_unix.o lib/blake3/blake3_sse2_x86-64_unix.S
           arch -x86_64 cc -c -o lib/blake3/blake3_sse41_x86-64_unix.o lib/blake3/blake3_sse41_x86-64_unix.S
           arch -x86_64 cc -c -o lib/blake3/blake3_avx2_x86-64_unix.o lib/blake3/blake3_avx2_x86-64_unix.S
           arch -x86_64 cc -c -o lib/blake3/blake3_avx512_x86-64_unix.o lib/blake3/blake3_avx512_x86-64_unix.S
           # Build extension for x86_64
-          arch -x86_64 make clean
           arch -x86_64 make PG_CFLAGS="-Wall -Wextra -Wno-unused-parameter -Wno-ignored-optimization-argument"
       
       - name: Package binaries
@@ -412,8 +413,12 @@ jobs:
           $libPath = & $pgConfig --libdir
           $pkgLibDir = & $pgConfig --pkglibdir
           
-          # Create stub libintl.h to satisfy PostgreSQL NLS include
+          # Create stub headers to satisfy PostgreSQL includes on Windows
           New-Item -ItemType Directory -Path "stub" -Force | Out-Null
+          New-Item -ItemType Directory -Path "stub/netinet" -Force | Out-Null
+          New-Item -ItemType Directory -Path "stub/arpa" -Force | Out-Null
+          New-Item -ItemType Directory -Path "stub/sys" -Force | Out-Null
+          
           @"
           /* Stub libintl.h for Windows builds without gettext */
           #ifndef LIBINTL_H
@@ -426,6 +431,32 @@ jobs:
           #define bindtextdomain(d, dir) ((char*)0)
           #endif
           "@ | Out-File -FilePath "stub/libintl.h" -Encoding ascii
+          
+          @"
+          /* Stub netinet/in.h for Windows */
+          #ifndef _NETINET_IN_H
+          #define _NETINET_IN_H
+          #include <winsock2.h>
+          #include <ws2tcpip.h>
+          #endif
+          "@ | Out-File -FilePath "stub/netinet/in.h" -Encoding ascii
+          
+          @"
+          /* Stub arpa/inet.h for Windows */
+          #ifndef _ARPA_INET_H
+          #define _ARPA_INET_H
+          #include <winsock2.h>
+          #include <ws2tcpip.h>
+          #endif
+          "@ | Out-File -FilePath "stub/arpa/inet.h" -Encoding ascii
+          
+          @"
+          /* Stub sys/socket.h for Windows */
+          #ifndef _SYS_SOCKET_H
+          #define _SYS_SOCKET_H
+          #include <winsock2.h>
+          #endif
+          "@ | Out-File -FilePath "stub/sys/socket.h" -Encoding ascii
           
           # Compile BLAKE3
           cl /c /O2 /I"lib/blake3" /DBLAKE3_NO_SSE2 /DBLAKE3_NO_SSE41 /DBLAKE3_NO_AVX2 /DBLAKE3_NO_AVX512 lib/blake3/blake3.c /Fo:lib/blake3/blake3.obj
