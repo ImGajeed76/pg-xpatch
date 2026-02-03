@@ -34,8 +34,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tmp/xpatch
+          cache-on-failure: true
+      
+      - name: Cache cbindgen
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cbindgen
+          key: cbindgen-${{ runner.os }}-${{ runner.arch }}
+      
       - name: Install cbindgen
-        run: cargo install cbindgen
+        run: command -v cbindgen || cargo install cbindgen
       
       - name: Build extension
         run: make clean && make
@@ -91,8 +103,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tmp/xpatch
+          cache-on-failure: true
+      
+      - name: Cache cbindgen
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cbindgen
+          key: cbindgen-${{ runner.os }}-${{ runner.arch }}
+      
       - name: Install cbindgen
-        run: cargo install cbindgen
+        run: command -v cbindgen || cargo install cbindgen
       
       - name: Build extension
         run: make clean && make
@@ -132,7 +156,7 @@ jobs:
           path: dist/*.tar.gz
 
   build-macos-amd64:
-    runs-on: macos-13
+    runs-on: macos-15
     strategy:
       matrix:
         pg_version: [16]
@@ -140,22 +164,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install PostgreSQL
+      - name: Install PostgreSQL (x86_64 via Rosetta)
         run: |
-          brew install postgresql@${{ matrix.pg_version }}
-          echo "$(brew --prefix postgresql@${{ matrix.pg_version }})/bin" >> $GITHUB_PATH
+          # Install Rosetta for x86_64 emulation
+          softwareupdate --install-rosetta --agree-to-license || true
+          # Install x86_64 Homebrew and PostgreSQL
+          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+          arch -x86_64 /usr/local/bin/brew install postgresql@${{ matrix.pg_version }}
+          echo "/usr/local/opt/postgresql@${{ matrix.pg_version }}/bin" >> $GITHUB_PATH
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tmp/xpatch
+          cache-on-failure: true
+      
+      - name: Cache cbindgen
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cbindgen
+          key: cbindgen-${{ runner.os }}-${{ runner.arch }}
       
       - name: Install cbindgen
-        run: cargo install cbindgen
+        run: command -v cbindgen || cargo install cbindgen
       
       - name: Build extension
         run: |
-          export PATH="$(brew --prefix postgresql@${{ matrix.pg_version }})/bin:$PATH"
-          # Override CFLAGS to remove unsupported clang flags
-          make clean && make PG_CFLAGS="-Wall -Wextra -Wno-unused-parameter -Wno-ignored-optimization-argument"
+          export PATH="/usr/local/opt/postgresql@${{ matrix.pg_version }}/bin:$PATH"
+          # Build Rust library for x86_64
+          mkdir -p tmp
+          git clone https://github.com/ImGajeed76/xpatch.git tmp/xpatch
+          cd tmp/xpatch
+          cargo build -p xpatch-c --release --target x86_64-apple-darwin
+          cd ../..
+          mkdir -p lib
+          cp tmp/xpatch/target/x86_64-apple-darwin/release/libxpatch_c.a lib/
+          cd tmp/xpatch/crates/xpatch-c
+          cbindgen --config cbindgen.toml --output $GITHUB_WORKSPACE/lib/xpatch.h
+          cd $GITHUB_WORKSPACE
+          # Build extension for x86_64
+          arch -x86_64 make clean
+          arch -x86_64 make PG_CFLAGS="-Wall -Wextra -Wno-unused-parameter -Wno-ignored-optimization-argument"
       
       - name: Package binaries
         run: |
@@ -209,8 +263,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tmp/xpatch
+          cache-on-failure: true
+      
+      - name: Cache cbindgen
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cbindgen
+          key: cbindgen-${{ runner.os }}-${{ runner.arch }}
+      
       - name: Install cbindgen
-        run: cargo install cbindgen
+        run: command -v cbindgen || cargo install cbindgen
       
       - name: Build extension
         run: |
@@ -285,6 +351,12 @@ jobs:
         with:
           toolchain: stable-msvc
       
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tmp/xpatch
+          cache-on-failure: true
+      
       - name: Install cbindgen
         run: cargo install cbindgen
       
@@ -336,7 +408,8 @@ jobs:
           
           foreach ($src in $sources) {
             $obj = $src -replace '\.c$', '.obj'
-            cl /c /O2 /I"$includePath" /I"lib" /I"lib/blake3" /I"src" /D_CRT_SECURE_NO_WARNINGS $src /Fo:$obj
+            # Disable NLS to avoid libintl.h dependency
+            cl /c /O2 /I"$includePath" /I"lib" /I"lib/blake3" /I"src" /D_CRT_SECURE_NO_WARNINGS /DENABLE_NLS=0 $src /Fo:$obj
           }
           
           # Link DLL
