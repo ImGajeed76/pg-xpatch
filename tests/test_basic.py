@@ -52,7 +52,7 @@ class TestTableCreation:
         ).fetchall()
         col_map = {r["column_name"]: r["data_type"] for r in cols}
         assert "_xp_seq" in col_map, f"_xp_seq not found in columns: {list(col_map)}"
-        assert col_map["_xp_seq"] == "integer"
+        assert col_map["_xp_seq"] == "bigint"
 
     def test_create_table_creates_seq_index(self, db: psycopg.Connection, make_table):
         """Auto-created btree index on _xp_seq."""

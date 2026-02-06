@@ -16,7 +16,7 @@ def test_pg_xpatch_version(db: psycopg.Connection, xpatch_expect_version: str | 
 
     raw = db.execute("SELECT xpatch.version()").fetchone()["version"]
 
-    # xpatch.version() returns e.g. "pg_xpatch 0.4.0 (xpatch 0.4.2)"
+    # xpatch.version() returns e.g. "pg_xpatch 0.5.0 (xpatch 0.4.2)"
     assert xpatch_expect_version in raw, (
         f"Version mismatch: container reports '{raw}', "
         f"expected it to contain '{xpatch_expect_version}'. "

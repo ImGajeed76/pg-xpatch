@@ -31,7 +31,7 @@ void xpatch_stats_cache_update_group(
     Oid relid,
     XPatchGroupHash group_hash,
     bool is_keyframe,
-    int32 max_seq,
+    int64 max_seq,
     int64 raw_size,
     int64 compressed_size,
     double avg_delta_tag
@@ -52,7 +52,7 @@ void xpatch_stats_cache_delete_table(Oid relid);
  * Get max_seq for a group from stats cache.
  * Returns -1 if not found.
  */
-int32 xpatch_stats_cache_get_max_seq(Oid relid, XPatchGroupHash group_hash);
+int64 xpatch_stats_cache_get_max_seq(Oid relid, XPatchGroupHash group_hash);
 
 /*
  * Check if stats exist for a table.

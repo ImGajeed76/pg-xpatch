@@ -231,10 +231,10 @@ bytea_to_datum(bytea *data, Oid typid)
  * After the first call for a group, subsequent calls hit the cache and return
  * immediately without scanning.
  */
-int32
+int64
 xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
 {
-    int32 max_seq = 0;
+    int64 max_seq = 0;
     bool found;
     TupleDesc tupdesc;
     BlockNumber nblocks;
@@ -259,7 +259,7 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                  errmsg("xpatch: table \"%s\" is missing required _xp_seq column",
                         RelationGetRelationName(rel)),
-                 errhint("Recreate the table or run: ALTER TABLE %s ADD COLUMN _xp_seq INT",
+                 errhint("Recreate the table or run: ALTER TABLE %s ADD COLUMN _xp_seq BIGINT",
                          RelationGetRelationName(rel))));
     }
     
@@ -274,7 +274,7 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
     max_seq = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel), group_value, group_typid, &found);
     if (found)
     {
-        elog(DEBUG1, "xpatch: get_max_seq cache hit for group, max_seq=%d", max_seq);
+        elog(DEBUG1, "xpatch: get_max_seq cache hit for group, max_seq=" INT64_FORMAT, max_seq);
         return max_seq;
     }
     
@@ -344,7 +344,7 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
                 Datum seq_datum = heap_getattr(&tuple, config->xp_seq_attnum, tupdesc, &seq_isnull);
                 if (!seq_isnull)
                 {
-                    int32 tuple_seq = DatumGetInt32(seq_datum);
+                    int64 tuple_seq = DatumGetInt64(seq_datum);
                     if (tuple_seq > max_seq)
                         max_seq = tuple_seq;
                 }
@@ -392,6 +392,7 @@ xpatch_get_max_version(Relation rel, XPatchConfig *config,
     
     tupdesc = RelationGetDescr(rel);
     nblocks = RelationGetNumberOfBlocks(rel);
+    order_attr = TupleDescAttr(tupdesc, config->order_by_attnum - 1);
     
     /* Scan all blocks */
     for (blkno = 0; blkno < nblocks; blkno++)
@@ -457,13 +458,12 @@ xpatch_get_max_version(Relation rel, XPatchConfig *config,
             
             if (!found)
             {
-                max_version = version_datum;
+                max_version = datumCopy(version_datum, order_attr->attbyval, order_attr->attlen);
                 found = true;
             }
             else
             {
                 /* Compare versions based on type */
-                order_attr = TupleDescAttr(tupdesc, config->order_by_attnum - 1);
                 typid = order_attr->atttypid;
                 cmp = 0;
                 
@@ -499,7 +499,12 @@ xpatch_get_max_version(Relation rel, XPatchConfig *config,
                 }
                 
                 if (cmp > 0)
-                    max_version = version_datum;
+                {
+                    /* Free old copy if pass-by-ref */
+                    if (!order_attr->attbyval && DatumGetPointer(max_version) != NULL)
+                        pfree(DatumGetPointer(max_version));
+                    max_version = datumCopy(version_datum, order_attr->attbyval, order_attr->attlen);
+                }
             }
         }
         
@@ -637,7 +642,7 @@ find_xp_seq_index(Relation rel, XPatchConfig *config)
  */
 static HeapTuple
 fetch_by_seq_using_index(Relation rel, XPatchConfig *config,
-                         Datum group_value, int32 target_seq, ItemPointer out_tid)
+                         Datum group_value, int64 target_seq, ItemPointer out_tid)
 {
     Oid indexOid;
     Relation indexRel;
@@ -682,8 +687,8 @@ fetch_by_seq_using_index(Relation rel, XPatchConfig *config,
             ScanKeyInit(&scankeys[nkeys],
                         2,  /* Second column is _xp_seq */
                         BTEqualStrategyNumber,
-                        F_INT4EQ,
-                        Int32GetDatum(target_seq));
+                        F_INT8EQ,
+                        Int64GetDatum(target_seq));
             nkeys++;
         }
     }
@@ -693,8 +698,8 @@ fetch_by_seq_using_index(Relation rel, XPatchConfig *config,
         ScanKeyInit(&scankeys[nkeys],
                     1,  /* First (and only) column is _xp_seq */
                     BTEqualStrategyNumber,
-                    F_INT4EQ,
-                    Int32GetDatum(target_seq));
+                    F_INT8EQ,
+                    Int64GetDatum(target_seq));
         nkeys++;
     }
     
@@ -774,7 +779,7 @@ fetch_by_seq_using_index(Relation rel, XPatchConfig *config,
  */
 HeapTuple
 xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
-                    Datum group_value, int32 target_seq)
+                    Datum group_value, int64 target_seq)
 {
     HeapTuple result = NULL;
     TupleDesc tupdesc;
@@ -795,7 +800,7 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
     if (xpatch_seq_cache_get_seq_tid(RelationGetRelid(rel), group_value, group_typid,
                                       target_seq, &cached_tid))
     {
-        elog(DEBUG2, "xpatch: fetch_by_seq cache HIT for seq=%d", target_seq);
+        elog(DEBUG2, "xpatch: fetch_by_seq cache HIT for seq=" INT64_FORMAT, target_seq);
         
         /* Fetch tuple by cached TID */
         result = fetch_tuple_by_tid(rel, &cached_tid);
@@ -806,7 +811,7 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
             bool seq_isnull;
             Datum seq_datum = heap_getattr(result, config->xp_seq_attnum, tupdesc, &seq_isnull);
             
-            if (!seq_isnull && DatumGetInt32(seq_datum) == target_seq)
+            if (!seq_isnull && DatumGetInt64(seq_datum) == target_seq)
             {
                 /* Cache hit valid - return the tuple */
                 return result;
@@ -815,7 +820,7 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
             /* Cache stale - TID no longer points to our seq. Free and continue. */
             heap_freetuple(result);
             result = NULL;
-            elog(DEBUG2, "xpatch: fetch_by_seq cache STALE for seq=%d", target_seq);
+            elog(DEBUG2, "xpatch: fetch_by_seq cache STALE for seq=" INT64_FORMAT, target_seq);
         }
     }
     
@@ -832,7 +837,7 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
     }
     
     /* Strategy 3: Fall back to sequential scan - O(n) */
-    elog(DEBUG1, "xpatch: fetch_by_seq falling back to sequential scan for seq=%d", target_seq);
+    elog(DEBUG1, "xpatch: fetch_by_seq falling back to sequential scan for seq=" INT64_FORMAT, target_seq);
     {
         BlockNumber nblocks;
         BlockNumber blkno;
@@ -886,7 +891,7 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
                 {
                     bool seq_isnull;
                     Datum seq_datum = heap_getattr(&tuple, config->xp_seq_attnum, tupdesc, &seq_isnull);
-                    if (!seq_isnull && DatumGetInt32(seq_datum) == target_seq)
+                    if (!seq_isnull && DatumGetInt64(seq_datum) == target_seq)
                     {
                         result = heap_copytuple(&tuple);
                         
@@ -922,14 +927,14 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
  */
 static bytea *
 xpatch_reconstruct_from_delta(Relation rel, XPatchConfig *config,
-                              Datum group_value, int32 seq,
-                              int delta_col_index, bytea *delta_bytea)
+                               Datum group_value, int64 seq,
+                               int delta_col_index, bytea *delta_bytea)
 {
     bytea *result;
     size_t tag;
     const char *err;
     bytea *base_content;
-    int32 base_seq;
+    int64 base_seq;
     AttrNumber attnum;
     
     attnum = config->delta_attnums[delta_col_index];
@@ -961,8 +966,8 @@ xpatch_reconstruct_from_delta(Relation rel, XPatchConfig *config,
         {
             ereport(ERROR,
                     (errcode(ERRCODE_DATA_CORRUPTED),
-                     errmsg("xpatch: invalid base sequence %d (tag=%zu, seq=%d)",
-                            base_seq, tag, seq)));
+                     errmsg("xpatch: invalid base sequence " INT64_FORMAT " (tag=%zu, seq=" INT64_FORMAT ")",
+                             base_seq, tag, seq)));
         }
         
         /* Recursively get base content (will hit cache if previously decoded) */
@@ -1015,8 +1020,8 @@ xpatch_reconstruct_from_delta(Relation rel, XPatchConfig *config,
  */
 bytea *
 xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
-                          Datum group_value, int32 seq,
-                          int delta_col_index)
+                           Datum group_value, int64 seq,
+                           int delta_col_index)
 {
     HeapTuple physical_tuple;
     TupleDesc tupdesc;
@@ -1054,7 +1059,7 @@ xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
          * We return NULL here instead of throwing an error so callers can
          * handle this gracefully (e.g., by falling back to keyframe encoding).
          */
-        elog(WARNING, "xpatch: could not find row with sequence %d (gap in chain?)", seq);
+        elog(WARNING, "xpatch: could not find row with sequence " INT64_FORMAT " (gap in chain?)", seq);
         return NULL;
     }
     
@@ -1097,8 +1102,8 @@ xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
 bytea *
 xpatch_reconstruct_column_with_tuple(Relation rel, XPatchConfig *config,
                                      HeapTuple physical_tuple,
-                                     Datum group_value, int32 seq,
-                                     int delta_col_index)
+                                      Datum group_value, int64 seq,
+                                      int delta_col_index)
 {
     TupleDesc tupdesc;
     AttrNumber attnum;
@@ -1147,14 +1152,14 @@ xpatch_reconstruct_column_with_tuple(Relation rel, XPatchConfig *config,
  */
 HeapTuple
 xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
-                           TupleTableSlot *slot, int32 *out_seq)
+                            TupleTableSlot *slot, int64 *out_seq)
 {
     TupleDesc tupdesc;
     int natts;
     Datum *values;
     bool *nulls;
     HeapTuple result;
-    int32 new_seq;
+    int64 new_seq;
     bool is_keyframe;
     Datum group_value = (Datum) 0;
     bool isnull;
@@ -1170,13 +1175,13 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     Size best_size;
     int best_tag;
     int tag;
-    int32 base_seq;
+    int64 base_seq;
     bytea *base_content;
     bytea *candidate;
     Size candidate_size;
     bytea *cache_content;
     bool restore_mode = false;
-    int32 user_seq = 0;
+    int64 user_seq = 0;
     Oid group_typid = InvalidOid;
     int insert_cache_slot = -1;
     bool insert_cache_is_new = false;
@@ -1220,12 +1225,12 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
         Datum seq_datum = slot_getattr(slot, config->xp_seq_attnum, &isnull);
         if (!isnull)
         {
-            user_seq = DatumGetInt32(seq_datum);
+            user_seq = DatumGetInt64(seq_datum);
             if (user_seq > 0)
             {
                 restore_mode = true;
                 new_seq = user_seq;
-                elog(DEBUG1, "xpatch: restore mode - using explicit _xp_seq=%d", new_seq);
+                elog(DEBUG1, "xpatch: restore mode - using explicit _xp_seq=" INT64_FORMAT, new_seq);
 
                 /*
                  * Update the seq cache if this seq is higher than what we have.
@@ -1233,7 +1238,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                  */
                 {
                     bool cache_found;
-                    int32 cached_max = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel),
+                    int64 cached_max = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel),
                                                                      group_value, group_typid,
                                                                      &cache_found);
                     if (!cache_found || new_seq > cached_max)
@@ -1275,7 +1280,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     /* Determine if this is a keyframe */
     is_keyframe = (new_seq == 1) || ((new_seq - 1) % config->keyframe_every == 0);
     
-    elog(DEBUG1, "xpatch: inserting seq %d, is_keyframe=%d%s", new_seq, is_keyframe,
+    elog(DEBUG1, "xpatch: inserting seq " INT64_FORMAT ", is_keyframe=%d%s", new_seq, is_keyframe,
          restore_mode ? " (restore mode)" : "");
     
     /*
@@ -1294,7 +1299,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
         if (insert_cache_is_new && insert_cache_slot >= 0 && new_seq > 1 && !is_keyframe)
         {
             /* Cold start: populate FIFO with previous rows */
-            int32 max_seq_for_populate = new_seq - 1;
+            int64 max_seq_for_populate = new_seq - 1;
             xpatch_insert_cache_populate(insert_cache_slot, rel, config,
                                          group_value, max_seq_for_populate);
         }
@@ -1314,7 +1319,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
         /* Handle _xp_seq column - set to the new sequence number */
         if (config->xp_seq_attnum != InvalidAttrNumber && attnum == config->xp_seq_attnum)
         {
-            values[i] = Int32GetDatum(new_seq);
+            values[i] = Int64GetDatum(new_seq);
             nulls[i] = false;
             continue;
         }
@@ -1660,7 +1665,7 @@ xpatch_physical_to_logical(Relation rel, XPatchConfig *config,
     TupleDesc tupdesc;
     int natts;
     Datum group_value = (Datum) 0;
-    int32 seq = 0;
+    int64 seq = 0;
     int i, j;
     AttrNumber attnum;
     Form_pg_attribute attr;
@@ -1712,7 +1717,7 @@ xpatch_physical_to_logical(Relation rel, XPatchConfig *config,
                 (errcode(ERRCODE_DATA_CORRUPTED),
                  errmsg("xpatch: _xp_seq column is NULL")));
     }
-    seq = DatumGetInt32(slot->tts_values[config->xp_seq_attnum - 1]);
+    seq = DatumGetInt64(slot->tts_values[config->xp_seq_attnum - 1]);
 
     /* Reconstruct delta columns - replace compressed data with decompressed */
     for (j = 0; j < config->num_delta_columns; j++)
@@ -1737,6 +1742,9 @@ xpatch_physical_to_logical(Relation rel, XPatchConfig *config,
                     pfree(DatumGetPointer(slot->tts_values[i]));
                 
                 slot->tts_values[i] = bytea_to_datum(reconstructed, typid);
+                
+                /* Free the reconstructed bytea now that bytea_to_datum has copied it */
+                pfree(reconstructed);
             }
             else
             {

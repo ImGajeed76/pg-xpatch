@@ -47,7 +47,7 @@ class TestVersion:
     def test_version_contains_xpatch_lib(self, db: psycopg.Connection):
         """version() string contains 'xpatch' (Rust library version)."""
         row = db.execute("SELECT xpatch.version() AS v").fetchone()
-        # Format: "pg_xpatch 0.4.0 (xpatch 0.4.2)"
+        # Format: "pg_xpatch 0.5.0 (xpatch 0.4.2)"
         assert "xpatch" in row["v"]
 
     def test_unqualified_xpatch_version(self, db: psycopg.Connection):

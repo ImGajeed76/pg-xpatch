@@ -556,81 +556,61 @@ class TestExcessDeltaColumns:
 
 
 # ---------------------------------------------------------------------------
-# C5 — _xp_seq INT4 overflow at 2.1B rows per group
+# C5 — _xp_seq column type (BIGINT since 0.5.0)
 # ---------------------------------------------------------------------------
 
 
-class TestXpSeqOverflow:
-    """``_xp_seq`` is defined as INT (int32).  For a group with more than
-    2,147,483,647 rows, the sequence wraps, causing delta chain corruption.
+class TestXpSeqBigint:
+    """Since 0.5.0, ``_xp_seq`` is BIGINT (int8) to support >2.1B rows/group.
 
-    Bug: xpatch_config.c:444, xpatch_storage.c:1157 (known bug C5)
-
-    Testing with actual 2.1B rows is impractical, so we test via restore mode
-    where we can explicitly set ``_xp_seq`` values near the INT_MAX boundary.
+    Previously it was INT (int4), which would overflow at 2,147,483,647.
+    These tests verify the migration was applied correctly.
     """
 
-    def test_xp_seq_near_int_max_insert_succeeds(
+    def test_new_table_xp_seq_is_bigint(
         self, db: psycopg.Connection, make_table
     ):
-        """Inserting rows with _xp_seq near INT_MAX via restore mode should
-        succeed and round-trip correctly (regression guard).
-        """
+        """New xpatch tables should have _xp_seq as BIGINT, not INT."""
         t = make_table()
-        # Use xpatch.restore() to insert with explicit _xp_seq values
-        # near INT_MAX
-        near_max = 2_147_483_640
-        try:
-            db.execute(
-                f"SELECT xpatch.restore('{t}'::regclass, "
-                f"group_id => 1, version => 1, _xp_seq => {near_max}, "
-                f"content => 'near-max')"
-            )
-            db.execute(
-                f"SELECT xpatch.restore('{t}'::regclass, "
-                f"group_id => 1, version => 2, _xp_seq => {near_max + 1}, "
-                f"content => 'near-max-plus-1')"
-            )
-            rows = db.execute(
-                f"SELECT _xp_seq, version, content FROM {t} ORDER BY _xp_seq"
-            ).fetchall()
-            assert len(rows) == 2
-            assert rows[0]["_xp_seq"] == near_max
-            assert rows[1]["content"] == "near-max-plus-1"
-        except psycopg.errors.Error:
-            # If restore() doesn't exist or doesn't support this,
-            # skip gracefully
-            pytest.skip("xpatch.restore() not available or doesn't support explicit _xp_seq")
+        row = db.execute(
+            "SELECT format_type(atttypid, atttypmod) AS typename "
+            "FROM pg_attribute "
+            "WHERE attrelid = %s::regclass AND attname = '_xp_seq' "
+            "  AND NOT attisdropped",
+            (t,),
+        ).fetchone()
+        assert row is not None, "_xp_seq column not found"
+        assert row["typename"] == "bigint", (
+            f"Expected _xp_seq to be bigint, got {row['typename']}"
+        )
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="C5: _xp_seq uses INT4 — overflow at 2.1B rows per group; "
-               "auto-increment after INT_MAX may wrap or error",
-    )
-    def test_xp_seq_at_int_max_auto_increment_errors(
+    def test_xp_seq_values_are_bigint_typed(
         self, db: psycopg.Connection, make_table
     ):
-        """Auto-incrementing _xp_seq past INT_MAX should raise an error
-        rather than silently wrapping.
-        """
+        """_xp_seq values returned by queries should be Python int (no overflow)."""
         t = make_table()
-        int_max = 2_147_483_647
-        try:
-            # Restore a row with _xp_seq at INT_MAX
-            db.execute(
-                f"SELECT xpatch.restore('{t}'::regclass, "
-                f"group_id => 1, version => 1, _xp_seq => {int_max}, "
-                f"content => 'at-max')"
-            )
-            # Now try a normal insert — auto-increment should need INT_MAX+1
-            # which overflows INT4
-            with pytest.raises(psycopg.errors.Error):
-                db.execute(
-                    f"INSERT INTO {t} (group_id, version, content) "
-                    f"VALUES (1, 2, 'overflow')"
-                )
-        except psycopg.errors.Error:
-            pytest.skip("xpatch.restore() not available for this test")
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, content) "
+            f"VALUES (1, 1, 'row1'), (1, 2, 'row2')"
+        )
+        rows = db.execute(f"SELECT _xp_seq FROM {t} ORDER BY _xp_seq").fetchall()
+        assert len(rows) == 2
+        # Python ints have arbitrary precision; just verify they're sensible
+        assert rows[0]["_xp_seq"] == 1
+        assert rows[1]["_xp_seq"] == 2
+
+    def test_group_stats_max_seq_is_bigint(self, db: psycopg.Connection):
+        """group_stats.max_seq should be BIGINT."""
+        row = db.execute(
+            "SELECT format_type(atttypid, atttypmod) AS typename "
+            "FROM pg_attribute "
+            "WHERE attrelid = 'xpatch.group_stats'::regclass "
+            "  AND attname = 'max_seq' AND NOT attisdropped"
+        ).fetchone()
+        assert row is not None, "max_seq column not found in group_stats"
+        assert row["typename"] == "bigint", (
+            f"Expected max_seq to be bigint, got {row['typename']}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -88,7 +88,7 @@ xpatch_stats_cache_update_group(
     Oid relid,
     XPatchGroupHash group_hash,
     bool is_keyframe,
-    int32 max_seq,
+    int64 max_seq,
     int64 raw_size,
     int64 compressed_size,
     double avg_delta_tag)
@@ -109,7 +109,7 @@ xpatch_stats_cache_update_group(
     argtypes[0] = OIDOID;
     argtypes[1] = BYTEAOID;
     argtypes[2] = INT4OID;
-    argtypes[3] = INT4OID;
+    argtypes[3] = INT8OID;
     argtypes[4] = INT8OID;
     argtypes[5] = INT8OID;
     argtypes[6] = FLOAT8OID;
@@ -117,7 +117,7 @@ xpatch_stats_cache_update_group(
     values[0] = ObjectIdGetDatum(relid);
     values[1] = PointerGetDatum(hash_bytea);
     values[2] = Int32GetDatum(is_keyframe ? 1 : 0);
-    values[3] = Int32GetDatum(max_seq);
+    values[3] = Int64GetDatum(max_seq);
     values[4] = Int64GetDatum(raw_size);
     values[5] = Int64GetDatum(compressed_size);
     values[6] = Float8GetDatum(avg_delta_tag);
@@ -189,11 +189,11 @@ xpatch_stats_cache_delete_table(Oid relid)
  * Get max_seq for a group from cache.
  * Returns -1 if not found.
  */
-int32
+int64
 xpatch_stats_cache_get_max_seq(Oid relid, XPatchGroupHash group_hash)
 {
     int ret;
-    int32 max_seq = -1;
+    int64 max_seq = -1;
     Oid argtypes[2];
     Datum values[2];
     bytea *hash_bytea;
@@ -214,7 +214,7 @@ xpatch_stats_cache_get_max_seq(Oid relid, XPatchGroupHash group_hash)
         bool isnull;
         Datum val = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
         if (!isnull)
-            max_seq = DatumGetInt32(val);
+            max_seq = DatumGetInt64(val);
     }
 
     SPI_finish();
@@ -320,7 +320,7 @@ xpatch_update_group_stats(PG_FUNCTION_ARGS)
     Oid relid = PG_GETARG_OID(0);
     bytea *hash_bytea = PG_GETARG_BYTEA_PP(1);
     bool is_keyframe = PG_GETARG_BOOL(2);
-    int32 max_seq = PG_GETARG_INT32(3);
+    int64 max_seq = PG_GETARG_INT64(3);
     int64 raw_size = PG_GETARG_INT64(4);
     int64 compressed_size = PG_GETARG_INT64(5);
     float8 avg_delta_tag = PG_GETARG_FLOAT8(6);
@@ -349,7 +349,7 @@ typedef struct {
     int64 raw_size;
     int64 compressed_size;
     double sum_avg_tags;
-    int32 max_seq;
+    int64 max_seq;
 } RefreshGroupEntry;
 
 /*
@@ -424,7 +424,7 @@ xpatch_stats_cache_refresh_groups(Oid relid, XPatchGroupHash *group_hashes, int 
             XPatchGroupHash group_hash;
             RefreshGroupEntry *entry;
             bool found;
-            int32 row_seq = 0;
+            int64 row_seq = 0;
             bool is_keyframe = false;
             int64 row_raw_size = 0;
             int64 row_compressed_size = 0;
@@ -510,7 +510,7 @@ xpatch_stats_cache_refresh_groups(Oid relid, XPatchGroupHash *group_hashes, int 
                 Datum seq_datum = heap_getattr(&tuple, config->xp_seq_attnum,
                                                rel_tupdesc, &seq_isnull);
                 if (!seq_isnull)
-                    row_seq = DatumGetInt32(seq_datum);
+                    row_seq = DatumGetInt64(seq_datum);
             }
 
             /* Process delta columns - get compressed size and tag info first */
@@ -620,7 +620,7 @@ xpatch_stats_cache_refresh_groups(Oid relid, XPatchGroupHash *group_hashes, int 
         hash_seq_init(&status, groups_seen);
         while ((entry = (RefreshGroupEntry *) hash_seq_search(&status)) != NULL)
         {
-            Oid argtypes[8] = {OIDOID, BYTEAOID, INT8OID, INT4OID, INT4OID,
+            Oid argtypes[8] = {OIDOID, BYTEAOID, INT8OID, INT8OID, INT8OID,
                                INT8OID, INT8OID, FLOAT8OID};
             Datum vals[8];
             bytea *hash_bytea = group_hash_to_bytea(entry->group_hash);
@@ -628,8 +628,8 @@ xpatch_stats_cache_refresh_groups(Oid relid, XPatchGroupHash *group_hashes, int 
             vals[0] = ObjectIdGetDatum(relid);
             vals[1] = PointerGetDatum(hash_bytea);
             vals[2] = Int64GetDatum(entry->row_count);
-            vals[3] = Int32GetDatum(entry->keyframe_count);
-            vals[4] = Int32GetDatum(entry->max_seq);
+            vals[3] = Int64GetDatum(entry->keyframe_count);
+            vals[4] = Int64GetDatum(entry->max_seq);
             vals[5] = Int64GetDatum(entry->raw_size);
             vals[6] = Int64GetDatum(entry->compressed_size);
             vals[7] = Float8GetDatum(entry->sum_avg_tags);

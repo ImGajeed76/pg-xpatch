@@ -1,5 +1,13 @@
 -- pg_xpatch extension SQL definitions
--- Version 0.4.0
+-- Version 0.5.0
+--
+-- Changes from 0.4.0:
+--   - _xp_seq column type changed from INT to BIGINT (supports >2.1B rows/group)
+--   - group_stats.max_seq changed from INT to BIGINT
+--   - xpatch.configure() now validates order_by column type (E17)
+--   - xpatch.configure() now validates auto-detection feasibility (E13)
+--   - xpatch_inspect/xpatch_physical seq columns changed from INT to BIGINT
+--   - xpatch_update_group_stats p_max_seq changed from INT to BIGINT
 
 -- Complain if script is sourced in psql rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_xpatch" to load this file. \quit
@@ -46,7 +54,7 @@ CREATE TABLE xpatch.group_stats (
     group_hash            BYTEA NOT NULL,           -- BLAKE3 hash of group value (16 bytes)
     row_count             BIGINT NOT NULL DEFAULT 0,
     keyframe_count        BIGINT NOT NULL DEFAULT 0,
-    max_seq               INT NOT NULL DEFAULT 0,
+    max_seq               BIGINT NOT NULL DEFAULT 0,
     raw_size_bytes        BIGINT NOT NULL DEFAULT 0,
     compressed_size_bytes BIGINT NOT NULL DEFAULT 0,
     sum_avg_delta_tags    FLOAT8 NOT NULL DEFAULT 0,  -- Sum of per-row average delta tags
@@ -120,13 +128,46 @@ BEGIN
         END IF;
     END IF;
     
-    -- Validate order_by column exists
+    -- Validate order_by column exists and has a suitable type
     IF order_by IS NOT NULL THEN
         IF NOT EXISTS (
             SELECT 1 FROM pg_attribute 
             WHERE attrelid = v_relid AND attname = order_by AND NOT attisdropped
         ) THEN
             RAISE EXCEPTION 'Column "%" does not exist in table "%"', order_by, table_name;
+        END IF;
+        -- E17: Validate order_by column is an integer or timestamp type
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = v_relid AND attname = order_by AND NOT attisdropped
+              AND atttypid IN (
+                  'int2'::regtype, 'int4'::regtype, 'int8'::regtype,
+                  'timestamp'::regtype, 'timestamptz'::regtype
+              )
+        ) THEN
+            RAISE EXCEPTION USING
+                errcode = 'datatype_mismatch',
+                message = format('order_by column "%s" must be an integer or timestamp type', order_by),
+                hint = 'Use a column of type SMALLINT, INTEGER, BIGINT, TIMESTAMP, or TIMESTAMPTZ.';
+        END IF;
+    ELSE
+        -- E13: If order_by is NULL, verify auto-detection can succeed
+        -- (there must be at least one INT or TIMESTAMP column)
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = v_relid AND NOT attisdropped
+              AND attname != '_xp_seq'
+              AND attnum > 0
+              AND atttypid IN (
+                  'int2'::regtype, 'int4'::regtype, 'int8'::regtype,
+                  'timestamp'::regtype, 'timestamptz'::regtype
+              )
+        ) THEN
+            RAISE EXCEPTION USING
+                errcode = 'invalid_parameter_value',
+                message = 'xpatch tables require an order_by column',
+                hint = 'Add an INTEGER, BIGINT, or TIMESTAMP column for versioning, '
+                       'or specify order_by explicitly.';
         END IF;
     END IF;
     
@@ -214,7 +255,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 COMMENT ON FUNCTION xpatch.configure IS 
-    'Configure an xpatch table. Creates a composite (group_by, _xp_seq) index when group_by is set. Optional for most tables - auto-detection works.';
+    'Configure an xpatch table. Creates a composite (group_by, _xp_seq) index when group_by is set. Validates order_by type and delta column constraints. Optional for most tables - auto-detection works.';
 
 -- Function to get configuration for an xpatch table
 -- NOTE: Parameter named 'tbl' to avoid conflict with table_config.table_name column
@@ -290,7 +331,7 @@ BEGIN
             
             -- Add the column if it doesn't exist
             IF NOT v_has_xp_seq THEN
-                EXECUTE format('ALTER TABLE %s ADD COLUMN _xp_seq INT', obj.objid::regclass);
+                EXECUTE format('ALTER TABLE %s ADD COLUMN _xp_seq BIGINT', obj.objid::regclass);
                 RAISE DEBUG 'xpatch: added _xp_seq column to table %', obj.objid::regclass;
             END IF;
             
@@ -341,7 +382,7 @@ COMMENT ON FUNCTION xpatch_stats(regclass) IS 'Get compression statistics for an
 CREATE FUNCTION xpatch_inspect(rel regclass, group_value anyelement)
 RETURNS TABLE (
     version             BIGINT,
-    seq                 INT,
+    seq                 BIGINT,
     is_keyframe         BOOL,
     tag                 INT,
     delta_size_bytes    INT,
@@ -773,7 +814,7 @@ COMMENT ON FUNCTION xpatch.stats(regclass) IS 'Get compression statistics for an
 CREATE OR REPLACE FUNCTION xpatch.inspect(tbl REGCLASS, group_value ANYELEMENT)
 RETURNS TABLE (
     version             BIGINT,
-    seq                 INT,        -- Now 1-based to match _xp_seq
+    seq                 BIGINT,     -- Now 1-based to match _xp_seq
     is_keyframe         BOOL,
     tag                 INT,
     delta_size_bytes    INT,
@@ -829,12 +870,12 @@ COMMENT ON FUNCTION xpatch.insert_cache_stats() IS 'Get insert cache (FIFO) stat
 CREATE OR REPLACE FUNCTION xpatch_physical(
     tbl REGCLASS,
     group_filter ANYELEMENT,
-    from_seq INT DEFAULT NULL
+    from_seq BIGINT DEFAULT NULL
 )
 RETURNS TABLE (
     group_value     TEXT,       -- Group identifier (cast to text for uniformity)
     version         BIGINT,     -- The order_by column value  
-    seq             INT,        -- 1-based sequence number within group
+    seq             BIGINT,     -- 1-based sequence number within group
     is_keyframe     BOOLEAN,    -- True if this is a keyframe
     tag             INT,        -- Delta tag (0=keyframe, 1=prev row, 2=2 back, etc)
     delta_column    TEXT,       -- Which column this delta is for
@@ -844,7 +885,7 @@ RETURNS TABLE (
 AS 'pg_xpatch', 'xpatch_physical'
 LANGUAGE C STABLE;
 
-COMMENT ON FUNCTION xpatch_physical(regclass, anyelement, int) IS 
+COMMENT ON FUNCTION xpatch_physical(regclass, anyelement, bigint) IS 
     'Access raw physical delta storage. Returns compressed delta bytes and metadata for each row/column.';
 
 -- ============================================================================
@@ -855,12 +896,12 @@ COMMENT ON FUNCTION xpatch_physical(regclass, anyelement, int) IS
 CREATE OR REPLACE FUNCTION xpatch.physical(
     tbl REGCLASS,
     group_filter ANYELEMENT,
-    from_seq INT DEFAULT NULL
+    from_seq BIGINT DEFAULT NULL
 )
 RETURNS TABLE (
     group_value     TEXT,
     version         BIGINT,
-    seq             INT,
+    seq             BIGINT,
     is_keyframe     BOOLEAN,
     tag             INT,
     delta_column    TEXT,
@@ -870,11 +911,12 @@ RETURNS TABLE (
     SELECT * FROM xpatch_physical(tbl, group_filter, from_seq);
 $$ LANGUAGE SQL STABLE;
 
-COMMENT ON FUNCTION xpatch.physical(regclass, anyelement, int) IS 
+COMMENT ON FUNCTION xpatch.physical(regclass, anyelement, bigint) IS 
     'Access raw physical delta storage for a specific group. Returns compressed delta bytes and metadata.';
 
 -- 2-arg version: all groups, filter by from_seq
--- Uses iteration through distinct groups since C function requires a group value
+-- Uses INT for from_seq to avoid ambiguity with the 3-arg (regclass, anyelement, bigint) overload.
+-- INT is implicitly upcast to BIGINT when calling the C function.
 CREATE OR REPLACE FUNCTION xpatch.physical(
     tbl REGCLASS,
     from_seq INT
@@ -882,7 +924,7 @@ CREATE OR REPLACE FUNCTION xpatch.physical(
 RETURNS TABLE (
     group_value     TEXT,
     version         BIGINT,
-    seq             INT,
+    seq             BIGINT,
     is_keyframe     BOOLEAN,
     tag             INT,
     delta_column    TEXT,
@@ -902,14 +944,14 @@ BEGIN
     IF v_group_col IS NULL THEN
         -- No grouping - call C function with NULL group
         RETURN QUERY
-        SELECT * FROM xpatch_physical(tbl, NULL::INT, from_seq);
+        SELECT * FROM xpatch_physical(tbl, NULL::INT, from_seq::BIGINT);
     ELSE
         -- Iterate through all distinct groups
         v_sql := format('SELECT DISTINCT %I as grp FROM %s ORDER BY 1', v_group_col, tbl);
         FOR v_grp IN EXECUTE v_sql
         LOOP
             RETURN QUERY
-            SELECT * FROM xpatch_physical(tbl, v_grp.grp, from_seq);
+            SELECT * FROM xpatch_physical(tbl, v_grp.grp, from_seq::BIGINT);
         END LOOP;
     END IF;
     
@@ -925,14 +967,14 @@ CREATE OR REPLACE FUNCTION xpatch.physical(tbl REGCLASS)
 RETURNS TABLE (
     group_value     TEXT,
     version         BIGINT,
-    seq             INT,
+    seq             BIGINT,
     is_keyframe     BOOLEAN,
     tag             INT,
     delta_column    TEXT,
     delta_bytes     BYTEA,
     delta_size      INT
 ) AS $$
-    SELECT * FROM xpatch.physical(tbl, NULL::INT);
+    SELECT * FROM xpatch.physical(tbl, NULL::BIGINT);
 $$ LANGUAGE SQL STABLE;
 
 COMMENT ON FUNCTION xpatch.physical(regclass) IS 
@@ -996,7 +1038,7 @@ CREATE FUNCTION xpatch_update_group_stats(
     p_relid OID,
     p_group_hash BYTEA,
     p_is_keyframe BOOLEAN,
-    p_max_seq INT,
+    p_max_seq BIGINT,
     p_raw_size BIGINT,
     p_compressed_size BIGINT,
     p_avg_delta_tag FLOAT8

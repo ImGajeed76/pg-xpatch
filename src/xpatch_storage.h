@@ -44,7 +44,7 @@
  *   xpatch_seq_cache_rollback_seq(relid, group_value, typid, *out_seq)
  */
 HeapTuple xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
-                                     TupleTableSlot *slot, int32 *out_seq);
+                                     TupleTableSlot *slot, int64 *out_seq);
 
 /*
  * Convert a physical tuple to logical format.
@@ -60,7 +60,7 @@ void xpatch_physical_to_logical(Relation rel, XPatchConfig *config,
  * Get the maximum sequence number for a group.
  * Returns 0 if the group is empty.
  */
-int32 xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value);
+int64 xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value);
 
 /*
  * Get the maximum version value for a group.
@@ -74,7 +74,7 @@ Datum xpatch_get_max_version(Relation rel, XPatchConfig *config,
  * Returns NULL if not found.
  */
 HeapTuple xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
-                              Datum group_value, int32 seq);
+                               Datum group_value, int64 seq);
 
 /*
  * Reconstruct the content of a delta column for a specific version.
@@ -83,8 +83,8 @@ HeapTuple xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
  * Returns a palloc'd bytea value.
  */
 bytea *xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
-                                 Datum group_value, int32 seq,
-                                 int delta_col_index);
+                                  Datum group_value, int64 seq,
+                                  int delta_col_index);
 
 /*
  * Reconstruct a delta column when we already have the physical tuple.
@@ -94,7 +94,7 @@ bytea *xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
  */
 bytea *xpatch_reconstruct_column_with_tuple(Relation rel, XPatchConfig *config,
                                             HeapTuple physical_tuple,
-                                            Datum group_value, int32 seq,
+                                             Datum group_value, int64 seq,
                                             int delta_col_index);
 
 /*

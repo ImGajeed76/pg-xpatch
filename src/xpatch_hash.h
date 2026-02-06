@@ -38,6 +38,7 @@
 
 #include "postgres.h"
 #include "utils/datum.h"
+#include "utils/lsyscache.h"
 #include "blake3.h"
 
 /*
@@ -70,9 +71,9 @@ xpatch_compute_group_hash(Datum group_value, Oid typid, bool isnull)
     const unsigned char *data;
     Size len;
     
-    if (isnull)
+    if (isnull || typid == InvalidOid)
     {
-        /* NULL group - use a fixed hash (all zeros) */
+        /* NULL group or no group_by column - use a fixed hash (all zeros) */
         result.h1 = 0;
         result.h2 = 0;
         return result;
@@ -130,10 +131,54 @@ xpatch_compute_group_hash(Datum group_value, Oid typid, bool isnull)
             break;
             
         default:
-            /* For unknown types, hash the pointer value as fallback */
-            /* This works for pass-by-value types of any size */
-            data = (const unsigned char *) &group_value;
-            len = sizeof(Datum);
+            {
+                /* Handle both pass-by-value and pass-by-reference types correctly.
+                 * For pass-by-value types, hash the Datum value directly.
+                 * For pass-by-reference types (e.g. NUMERIC), detoast and hash
+                 * the actual varlena content to avoid hashing pointer addresses (M1 fix). */
+                bool typbyval;
+                int16 typlen;
+                
+                get_typlenbyval(typid, &typlen, &typbyval);
+                
+                if (typbyval)
+                {
+                    /* Pass-by-value: hash the Datum directly */
+                    data = (const unsigned char *) &group_value;
+                    len = sizeof(Datum);
+                }
+                else if (typlen == -1)
+                {
+                    /* Variable-length (varlena) pass-by-ref type like NUMERIC */
+                    struct varlena *val = PG_DETOAST_DATUM_PACKED(group_value);
+                    Pointer orig = DatumGetPointer(group_value);
+                    data = (const unsigned char *) VARDATA_ANY(val);
+                    len = VARSIZE_ANY_EXHDR(val);
+                    
+                    blake3_hasher_init(&hasher);
+                    blake3_hasher_update(&hasher, data, len);
+                    blake3_hasher_finalize(&hasher, output, sizeof(output));
+                    
+                    if ((Pointer)val != orig)
+                        pfree(val);
+                    
+                    memcpy(&result.h1, output, 8);
+                    memcpy(&result.h2, output + 8, 8);
+                    return result;
+                }
+                else if (typlen == -2)
+                {
+                    /* C-string type */
+                    data = (const unsigned char *) DatumGetCString(group_value);
+                    len = strlen((const char *) data);
+                }
+                else
+                {
+                    /* Fixed-length pass-by-ref type */
+                    data = (const unsigned char *) DatumGetPointer(group_value);
+                    len = typlen;
+                }
+            }
             break;
     }
     

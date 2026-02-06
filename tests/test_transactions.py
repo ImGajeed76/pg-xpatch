@@ -18,7 +18,7 @@ Covers:
 - Concurrent DELETE serialization (H4 — fixed)
 - MVCC visibility via sequential scan (C4 — regression guard)
 - MVCC visibility via bitmap scan (H6 — fixed)
-- Speculative INSERT orphan (C1 — known bug, xfail)
+- Speculative INSERT orphan (C1 — fixed)
 - Sequential scan nblocks not updated (H3 — regression guard)
 - DELETE two-pass race with VACUUM (H5 — regression guard)
 - SERIALIZABLE snapshot visibility (M5 — regression guard)
@@ -711,11 +711,6 @@ class TestSpeculativeInsertOrphan:
     Bug: xpatch_tam.c:982-1023 (known bug C1)
     """
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="C1: speculative insert orphan — complete_speculative(false) "
-               "does not remove the row; may leave COUNT=2",
-    )
     def test_concurrent_on_conflict_do_nothing_no_orphan(
         self, db: psycopg.Connection, db2: psycopg.Connection, make_table
     ):
