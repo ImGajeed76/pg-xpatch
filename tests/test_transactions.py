@@ -526,10 +526,23 @@ class TestConcurrentDeleteSerialization:
         assert results.get("conn1") == "ok", f"conn1: {results.get('conn1')}"
         assert results.get("conn2") == "ok", f"conn2: {results.get('conn2')}"
 
-        # Verify table is in a consistent state
+        # Verify table is in a consistent state with a valid row count.
+        # conn1 deletes v1 (cascade: removes v1-v5), conn2 deletes v3
+        # (cascade: removes v3-v5).  Because the deletes serialize, the
+        # final state depends on ordering but must be one of:
+        #   - conn1 first: v1 cascade removes all 5, conn2 finds nothing → 0 rows
+        #   - conn2 first: v3 cascade removes v3-v5 → {1,2}, then conn1
+        #     cascade from v1 removes v1-v2 → 0 rows
+        # In practice both orderings leave 0 rows, but if the cascade
+        # didn't propagate fully the count would be wrong.
         rows = db.execute(
             f"SELECT version, content FROM {t} WHERE group_id = 1 ORDER BY version"
         ).fetchall()
+        versions = [r["version"] for r in rows]
+        assert len(rows) == 0, (
+            f"Expected 0 rows after concurrent cascade deletes of v1 and v3, "
+            f"got {len(rows)} with versions {versions}"
+        )
         for r in rows:
             assert r["content"] is not None
 
@@ -908,12 +921,16 @@ class TestSerializableIsolation:
     ):
         """Two SERIALIZABLE transactions writing to the same table should
         produce a serialization failure if they overlap.
+
+        Uses a barrier to guarantee both txns overlap their read+write
+        phases, avoiding flaky time.sleep-based staggering.
         """
         t = make_table()
         insert_versions(db, t, group_id=1, count=5)
 
         db2 = db_factory()
         results: dict[str, Any] = {}
+        barrier = threading.Barrier(2, timeout=10)
 
         def txn_insert(conn, name, version):
             try:
@@ -923,8 +940,9 @@ class TestSerializableIsolation:
                 )
                 # Read the table to establish a read dependency
                 conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()
-                time.sleep(0.2)
-                # Insert new row
+                # Wait for both txns to have their read snapshot
+                barrier.wait()
+                # Insert new row — both txns now have overlapping snapshots
                 conn.execute(
                     f"INSERT INTO {t} (group_id, version, content) "
                     f"VALUES (1, {version}, 'ser-{name}')"
@@ -943,7 +961,6 @@ class TestSerializableIsolation:
         t1 = threading.Thread(target=txn_insert, args=(db, "conn1", 100))
         t2 = threading.Thread(target=txn_insert, args=(db2, "conn2", 200))
         t1.start()
-        time.sleep(0.05)
         t2.start()
         t1.join(timeout=10)
         t2.join(timeout=10)
