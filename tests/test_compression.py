@@ -599,3 +599,69 @@ class TestReconstructedMemoryLeak:
             v = row["version"]
             assert f"-v{v}-" in row["content"]
             assert len(row["content"]) == 50_000
+
+
+# ---------------------------------------------------------------------------
+# GUC: pg_xpatch.encode_threads
+# ---------------------------------------------------------------------------
+
+
+class TestEncodeThreadsGUC:
+    """``pg_xpatch.encode_threads`` is a PGC_USERSET GUC that controls
+    the number of parallel encoding threads used during INSERT.
+
+    Verify that setting it to different values doesn't break data integrity.
+    """
+
+    def test_encode_threads_zero_disables_parallelism(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Setting encode_threads=0 disables parallel encoding; data is correct."""
+        t = make_table()
+        db.execute("SET pg_xpatch.encode_threads = 0")
+        base = "Hello " * 1000
+        for v in range(1, 11):
+            content = base[:v * 50] + "CHANGED" + base[v * 50 + 7:]
+            insert_rows(db, t, [(1, v, content)])
+
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 10
+        for row in rows:
+            v = row["version"]
+            expected = base[:v * 50] + "CHANGED" + base[v * 50 + 7:]
+            assert row["content"] == expected
+
+    def test_encode_threads_nonzero_data_integrity(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Setting encode_threads=2 uses parallel encoding; data is still correct."""
+        t = make_table()
+        db.execute("SET pg_xpatch.encode_threads = 2")
+        base = "World " * 1000
+        for v in range(1, 11):
+            content = base[:v * 50] + "MODIFIED" + base[v * 50 + 8:]
+            insert_rows(db, t, [(1, v, content)])
+
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 10
+        for row in rows:
+            v = row["version"]
+            expected = base[:v * 50] + "MODIFIED" + base[v * 50 + 8:]
+            assert row["content"] == expected
+
+    def test_encode_threads_guc_is_settable(self, db: psycopg.Connection):
+        """The GUC can be read and set per-session."""
+        row = db.execute("SHOW pg_xpatch.encode_threads").fetchone()
+        original = row[list(row.keys())[0]]
+        assert original is not None
+
+        db.execute("SET pg_xpatch.encode_threads = 8")
+        row = db.execute("SHOW pg_xpatch.encode_threads").fetchone()
+        assert row[list(row.keys())[0]] == "8"
+
+        # Reset to original
+        db.execute("RESET pg_xpatch.encode_threads")

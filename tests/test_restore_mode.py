@@ -10,14 +10,25 @@ Covers:
 - Physical storage verification in restore mode
 - fix_restored_configs() behavior
 - Edge cases: gaps, boundary values, round-trip
+- Full pg_dump/pg_restore round-trip
 """
 
 from __future__ import annotations
 
+import subprocess
+
 import psycopg
 import pytest
 
-from conftest import insert_rows, insert_versions, row_count
+from conftest import (
+    CONTAINER_NAME,
+    insert_rows,
+    insert_versions,
+    row_count,
+    _docker_exec,
+    _admin_conn,
+    _connect,
+)
 
 
 class TestExplicitXpSeq:
@@ -458,3 +469,174 @@ class TestFixRestoredConfigs:
             "SELECT * FROM xpatch.table_config WHERE table_name = 'nonexistent_table_xyz'"
         ).fetchone()
         assert orphan is None, "Orphan config should have been removed"
+
+
+# ---------------------------------------------------------------------------
+# Full pg_dump / pg_restore round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestPgDumpRestore:
+    """End-to-end pg_dump/pg_restore round-trip verifying that data,
+    configuration, and _xp_seq values survive the cycle.
+
+    Uses ``pg_dump -Fc`` (custom format) and ``pg_restore`` running inside
+    the Docker container.
+    """
+
+    def test_dump_restore_round_trip(self, db: psycopg.Connection, make_table):
+        """Data + config survive a pg_dump → pg_restore cycle."""
+        # -- Setup: create table, insert data, configure --
+        t = make_table(keyframe_every=5, compress_depth=2, enable_zstd=False)
+        for g in (1, 2):
+            for v in range(1, 8):
+                insert_rows(db, t, [(g, v, f"g{g}-v{v}")])
+
+        # Record original data and config
+        orig_rows = db.execute(
+            f"SELECT group_id, version, content, _xp_seq "
+            f"FROM {t} ORDER BY group_id, version"
+        ).fetchall()
+        orig_config = db.execute(
+            f"SELECT * FROM xpatch.describe('{t}'::regclass)"
+        ).fetchall()
+        orig_props = {r["property"]: r["value"] for r in orig_config}
+
+        # Get the dump_configs SQL for reconfiguration after restore
+        dump_sql = db.execute("SELECT xpatch.dump_configs()").fetchone()
+        config_sql = dump_sql[list(dump_sql.keys())[0]]
+
+        src_db = db.info.dbname
+        dst_db = f"{src_db}_restored"
+
+        try:
+            # -- pg_dump inside the container --
+            _docker_exec(
+                f"su postgres -c 'pg_dump -Fc -d {src_db} -f /tmp/xpatch_dump.fc'",
+                timeout=30,
+            )
+
+            # -- Create destination DB + pg_restore --
+            with _admin_conn() as admin:
+                admin.execute(f"CREATE DATABASE {dst_db}")
+
+            _docker_exec(
+                f"su postgres -c 'pg_restore -d {dst_db} /tmp/xpatch_dump.fc'",
+                timeout=30,
+                check=False,  # pg_restore may warn about pre-existing objects
+            )
+
+            # -- Connect to restored DB, fix configs, verify --
+            restored = _connect(dst_db)
+            try:
+                # fix_restored_configs repairs OIDs that changed during restore
+                restored.execute("SELECT xpatch.fix_restored_configs()")
+
+                # Re-apply configuration (dump_configs output)
+                if config_sql:
+                    for stmt in config_sql.split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            restored.execute(stmt)
+
+                # Verify row count
+                restored_rows = restored.execute(
+                    f"SELECT group_id, version, content, _xp_seq "
+                    f"FROM {t} ORDER BY group_id, version"
+                ).fetchall()
+                assert len(restored_rows) == len(orig_rows), (
+                    f"Row count mismatch: original={len(orig_rows)}, "
+                    f"restored={len(restored_rows)}"
+                )
+
+                # Verify data integrity (content matches exactly)
+                for orig, rest in zip(orig_rows, restored_rows):
+                    assert orig["group_id"] == rest["group_id"]
+                    assert orig["version"] == rest["version"]
+                    assert orig["content"] == rest["content"], (
+                        f"Content mismatch at g={orig['group_id']} v={orig['version']}: "
+                        f"original={orig['content']!r}, restored={rest['content']!r}"
+                    )
+
+                # Verify _xp_seq values are preserved
+                for orig, rest in zip(orig_rows, restored_rows):
+                    assert orig["_xp_seq"] == rest["_xp_seq"], (
+                        f"_xp_seq mismatch at g={orig['group_id']} v={orig['version']}: "
+                        f"original={orig['_xp_seq']}, restored={rest['_xp_seq']}"
+                    )
+
+                # Verify INSERT still works after restore
+                insert_rows(restored, t, [(1, 100, "post-restore")])
+                cnt = row_count(restored, t)
+                assert cnt == len(orig_rows) + 1
+
+            finally:
+                restored.close()
+
+        finally:
+            # Cleanup
+            _docker_exec("rm -f /tmp/xpatch_dump.fc", check=False)
+            with _admin_conn() as admin:
+                admin.execute(f"DROP DATABASE IF EXISTS {dst_db} WITH (FORCE)")
+
+    def test_dump_restore_preserves_config(self, db: psycopg.Connection, make_table):
+        """Table configuration (keyframe_every, etc.) can be restored."""
+        t = make_table(keyframe_every=3, compress_depth=3, enable_zstd=True)
+        insert_versions(db, t, group_id=1, count=5)
+
+        # Get dump_configs SQL
+        dump_sql = db.execute("SELECT xpatch.dump_configs()").fetchone()
+        config_sql = dump_sql[list(dump_sql.keys())[0]]
+        assert config_sql is not None, "dump_configs() returned NULL"
+
+        src_db = db.info.dbname
+        dst_db = f"{src_db}_cfgtest"
+
+        try:
+            _docker_exec(
+                f"su postgres -c 'pg_dump -Fc -d {src_db} -f /tmp/xpatch_cfg.fc'",
+                timeout=30,
+            )
+
+            with _admin_conn() as admin:
+                admin.execute(f"CREATE DATABASE {dst_db}")
+
+            _docker_exec(
+                f"su postgres -c 'pg_restore -d {dst_db} /tmp/xpatch_cfg.fc'",
+                timeout=30,
+                check=False,
+            )
+
+            restored = _connect(dst_db)
+            try:
+                restored.execute("SELECT xpatch.fix_restored_configs()")
+
+                # Re-apply configuration
+                if config_sql:
+                    for stmt in config_sql.split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            restored.execute(stmt)
+
+                # Verify config
+                cfg = restored.execute(
+                    f"SELECT * FROM xpatch.describe('{t}'::regclass)"
+                ).fetchall()
+                props = {r["property"]: r["value"] for r in cfg}
+                assert props["keyframe_every"] == "3"
+                assert props["compress_depth"] == "3"
+                assert props["enable_zstd"] == "true"
+
+                # Verify data still reads correctly
+                rows = restored.execute(
+                    f"SELECT version, content FROM {t} ORDER BY version"
+                ).fetchall()
+                assert len(rows) == 5
+                for row in rows:
+                    assert row["content"] == f"Version {row['version']} content"
+            finally:
+                restored.close()
+        finally:
+            _docker_exec("rm -f /tmp/xpatch_cfg.fc", check=False)
+            with _admin_conn() as admin:
+                admin.execute(f"DROP DATABASE IF EXISTS {dst_db} WITH (FORCE)")
