@@ -221,11 +221,28 @@ def _pg_kill(container: str = CONTAINER_NAME) -> None:
         "kill -9 $(head -1 /var/lib/postgresql/data/postmaster.pid)",
         container=container, check=False,
     )
+    # Clean up stale PID file so pg_ctl start won't refuse
+    import time as _time
+    _time.sleep(0.5)
+    _docker_exec(
+        "rm -f /var/lib/postgresql/data/postmaster.pid",
+        container=container, check=False,
+    )
 
 
 def _pg_start(container: str = CONTAINER_NAME, timeout: int = 30) -> None:
     """Start PostgreSQL inside the container (after a kill/stop)."""
-    _docker_exec("pg-start", container=container, timeout=timeout)
+    # Remove stale lock files from prior SIGKILL
+    _docker_exec(
+        "rm -f /var/lib/postgresql/data/postmaster.pid "
+        "/var/run/postgresql/.s.PGSQL.5432.lock "
+        "/var/run/postgresql/.s.PGSQL.5432",
+        container=container, check=False,
+    )
+    _docker_exec(
+        "su postgres -c 'pg_ctl -D $PGDATA -l $PGDATA/logfile start -w -t 30'",
+        container=container, timeout=timeout,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -315,9 +332,15 @@ def pg_container() -> str:
     return CONTAINER_NAME
 
 
+def _get_worker_id(request: pytest.FixtureRequest) -> str:
+    """Get xdist worker_id, falling back to 'master' when xdist is not loaded."""
+    return getattr(request.config, "workerinput", {}).get("workerid", "master")
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _check_postgres(worker_id: str) -> None:
+def _check_postgres(request: pytest.FixtureRequest) -> None:
     """Fail fast if PostgreSQL is not reachable. Runs only on the first xdist worker."""
+    worker_id = _get_worker_id(request)
     if worker_id not in ("master", "gw0"):
         return
     try:
@@ -332,13 +355,14 @@ def _check_postgres(worker_id: str) -> None:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _cleanup_orphaned_databases(worker_id: str) -> Generator[None, None, None]:
+def _cleanup_orphaned_databases(request: pytest.FixtureRequest) -> Generator[None, None, None]:
     """
     Drop leftover ``xptest_*`` databases before and after the run.
 
     Only the controller / first xdist worker performs cleanup to avoid
     race conditions where one worker drops another worker's active database.
     """
+    worker_id = _get_worker_id(request)
     if worker_id in ("master", "gw0"):
         _drop_orphans()
     yield
@@ -450,7 +474,7 @@ def make_table(db: psycopg.Connection) -> Callable[..., str]:
     created: list[str] = []
 
     def _make(
-        columns: str = "group_id INT, version INT, content TEXT",
+        columns: str = "group_id INT, version INT, content TEXT NOT NULL",
         *,
         group_by: str = "group_id",
         order_by: str = "version",
