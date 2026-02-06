@@ -339,11 +339,6 @@ class TestVacuumWalCrashRecovery:
     """
 
     @pytest.mark.crash_test
-    @pytest.mark.xfail(
-        strict=False,
-        reason="C2: VACUUM does not WAL-log tuple removals — crash after "
-               "VACUUM may resurrect dead tuples",
-    )
     def test_vacuum_survives_crash(self, db: psycopg.Connection, make_table, pg_ctl):
         """After DELETE + VACUUM + crash, dead tuples should NOT reappear.
 
