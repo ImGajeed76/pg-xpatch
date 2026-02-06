@@ -140,13 +140,46 @@ BEGIN
         END IF;
     END IF;
     
-    -- Validate order_by column exists
+    -- Validate order_by column exists and has a suitable type
     IF order_by IS NOT NULL THEN
         IF NOT EXISTS (
             SELECT 1 FROM pg_attribute 
             WHERE attrelid = v_relid AND attname = order_by AND NOT attisdropped
         ) THEN
             RAISE EXCEPTION 'Column "%" does not exist in table "%"', order_by, table_name;
+        END IF;
+        -- E17: Validate order_by column is an integer or timestamp type
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = v_relid AND attname = order_by AND NOT attisdropped
+              AND atttypid IN (
+                  'int2'::regtype, 'int4'::regtype, 'int8'::regtype,
+                  'timestamp'::regtype, 'timestamptz'::regtype
+              )
+        ) THEN
+            RAISE EXCEPTION USING
+                errcode = 'datatype_mismatch',
+                message = format('order_by column "%s" must be an integer or timestamp type', order_by),
+                hint = 'Use a column of type SMALLINT, INTEGER, BIGINT, TIMESTAMP, or TIMESTAMPTZ.';
+        END IF;
+    ELSE
+        -- E13: If order_by is NULL, verify auto-detection can succeed
+        -- (there must be at least one INT or TIMESTAMP column)
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = v_relid AND NOT attisdropped
+              AND attname != '_xp_seq'
+              AND attnum > 0
+              AND atttypid IN (
+                  'int2'::regtype, 'int4'::regtype, 'int8'::regtype,
+                  'timestamp'::regtype, 'timestamptz'::regtype
+              )
+        ) THEN
+            RAISE EXCEPTION USING
+                errcode = 'invalid_parameter_value',
+                message = 'xpatch tables require an order_by column',
+                hint = 'Add an INTEGER, BIGINT, or TIMESTAMP column for versioning, '
+                       'or specify order_by explicitly.';
         END IF;
     END IF;
     

@@ -13,9 +13,9 @@ Covers:
 - DELETE within transactions and savepoints
 - Concurrent insert serialization via advisory locks
 - Multi-group transaction atomicity
-- MVCC visibility via index scan (H1 — uncommitted rows, known bug)
-- SELECT FOR SHARE / FOR KEY SHARE (M11 — known bug)
-- Concurrent DELETE serialization (H4 — known bug)
+- MVCC visibility via index scan (H1 — fixed)
+- SELECT FOR SHARE / FOR KEY SHARE (M11 — fixed)
+- Concurrent DELETE serialization (H4 — fixed)
 """
 
 from __future__ import annotations
@@ -391,16 +391,12 @@ class TestConcurrentInserts:
 
 
 class TestMvccVisibilityIndexScan:
-    """``xpatch_tuple_fetch_row_version`` (used by index scans) has a TODO:
-    it assumes ALL tuples are visible, ignoring transaction isolation.
+    """``xpatch_tuple_fetch_row_version`` now calls HeapTupleSatisfiesVisibility
+    to respect transaction isolation on index-scan paths.
 
-    Bug: xpatch_tam.c:1537-1542
+    Bug: xpatch_tam.c:1537-1542 (fixed)
     """
 
-    @pytest.mark.xfail(
-        reason="H1: fetch_row_version sees uncommitted rows from other transactions",
-        strict=True,
-    )
     def test_uncommitted_row_invisible_via_index_scan(
         self, db: psycopg.Connection, db2: psycopg.Connection, make_table
     ):
@@ -430,22 +426,17 @@ class TestMvccVisibilityIndexScan:
 
 
 # ---------------------------------------------------------------------------
-# M11 — SELECT FOR SHARE / FOR KEY SHARE (known bug: slot not populated)
+# M11 — SELECT FOR SHARE / FOR KEY SHARE (fixed: slot now populated)
 # ---------------------------------------------------------------------------
 
 
 class TestSelectForLock:
-    """``xpatch_tuple_lock`` delegates to ``heap_lock_tuple`` but does not
-    populate the TupleTableSlot afterward.  The executor gets a locked
-    but empty/garbage slot.
+    """``xpatch_tuple_lock`` now copies and converts the locked tuple into
+    the TupleTableSlot via ``xpatch_physical_to_logical``.
 
-    Bug: xpatch_tam.c:1463-1471
+    Bug: xpatch_tam.c:1463-1471 (fixed)
     """
 
-    @pytest.mark.xfail(
-        reason="M11: tuple_lock doesn't populate the slot — SELECT FOR SHARE returns garbage",
-        strict=True,
-    )
     def test_select_for_share_returns_data(
         self, db: psycopg.Connection, xpatch_table
     ):
@@ -462,10 +453,6 @@ class TestSelectForLock:
         assert len(rows) == 1
         assert rows[0]["content"] == "locked-row"
 
-    @pytest.mark.xfail(
-        reason="M11: tuple_lock doesn't populate the slot — SELECT FOR KEY SHARE returns garbage",
-        strict=True,
-    )
     def test_select_for_key_share_returns_data(
         self, db: psycopg.Connection, xpatch_table
     ):
@@ -484,22 +471,17 @@ class TestSelectForLock:
 
 
 # ---------------------------------------------------------------------------
-# H4 — Concurrent DELETE serialization (known bug: incomplete wait path)
+# H4 — Concurrent DELETE serialization (fixed: uses XactLockTableWait)
 # ---------------------------------------------------------------------------
 
 
 class TestConcurrentDeleteSerialization:
-    """When ``wait=true`` in the DELETE path and another transaction is
-    actively deleting the same tuple, the code should wait using
-    ``XactLockTableWait``.  Instead it returns ``TM_BeingModified``.
+    """The DELETE wait path now calls ``XactLockTableWait`` and re-checks
+    the tuple after the other transaction finishes.
 
-    Bug: xpatch_tam.c:1137-1139
+    Bug: xpatch_tam.c:1137-1139 (fixed)
     """
 
-    @pytest.mark.xfail(
-        reason="H4: DELETE wait=true returns TM_BeingModified instead of waiting",
-        strict=True,
-    )
     def test_concurrent_delete_same_group_serializes(
         self, db: psycopg.Connection, db_factory, make_table
     ):

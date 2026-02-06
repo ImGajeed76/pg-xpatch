@@ -984,7 +984,17 @@ xpatch_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
                                 BulkInsertState bistate,
                                 uint32 specToken)
 {
-    /* Speculative insert not fully supported - fall back to regular insert */
+    /*
+     * Delegate to regular insert for the speculative phase.
+     * This is called by INSERT ... ON CONFLICT when no conflict is found
+     * during the initial index check.  The tuple is inserted speculatively;
+     * if a conflict is later detected, complete_speculative(false) is called.
+     *
+     * Note: The real fix for the ON CONFLICT infinite loop was in
+     * xpatch_index_fetch_tuple — using HeapTupleSatisfiesVisibility instead
+     * of a simplified check that didn't correctly handle the SnapshotDirty
+     * used by the ON CONFLICT executor path.
+     */
     xpatch_tuple_insert(relation, slot, cid, options, bistate);
 }
 
@@ -992,7 +1002,24 @@ static void
 xpatch_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
                                   uint32 specToken, bool succeeded)
 {
-    /* Speculative completion - nothing special needed */
+    /*
+     * Complete the speculative insertion.
+     *
+     * succeeded=true:  The speculative insert is confirmed — nothing to do
+     *                  since xpatch_tuple_insert already committed the row.
+     * succeeded=false: A conflict was detected after our speculative insert.
+     *                  Ideally we would roll back the row, but since xpatch
+     *                  uses advisory locks and sequence numbers, the row is
+     *                  already committed to the heap.  The advisory lock will
+     *                  be released at transaction end.  This case should be
+     *                  rare since the executor checks for conflicts before
+     *                  calling tuple_insert_speculative.
+     */
+    if (!succeeded)
+    {
+        elog(WARNING, "xpatch: speculative insert aborted — "
+             "row may need cleanup on transaction abort");
+    }
 }
 
 static void
@@ -1134,9 +1161,60 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
             }
             return TM_WouldBlock;
         }
-        /* If wait is true, we should wait for the other transaction, but for
-         * simplicity we'll return TM_BeingModified. A full implementation
-         * would use XactLockTableWait. */
+
+        /*
+         * Wait for the other transaction to finish, then re-check.
+         * Release the buffer lock before waiting to avoid deadlocks.
+         */
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        XactLockTableWait(xmax, relation, &target_tuple.t_self,
+                          XLTW_Delete);
+
+        /*
+         * Re-read the tuple after waiting — the other transaction may
+         * have committed (making the tuple deleted) or aborted (making
+         * the xmax invalid).
+         */
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buffer);
+        itemId = PageGetItemId(page, offnum);
+
+        if (!ItemIdIsNormal(itemId))
+        {
+            /* Tuple was removed entirely */
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
+            if (tmfd)
+            {
+                tmfd->traversed = false;
+                tmfd->xmax = xmax;
+            }
+            return TM_Updated;
+        }
+
+        target_tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+        target_tuple.t_len = ItemIdGetLength(itemId);
+        xmax = HeapTupleHeaderGetRawXmax(target_tuple.t_data);
+
+        if (HeapTupleHeaderIsHeapOnly(target_tuple.t_data) ||
+            !TransactionIdIsValid(xmax) ||
+            TransactionIdDidAbort(xmax))
+        {
+            /* The other transaction aborted — xmax is no longer valid.
+             * Proceed with our delete. */
+        }
+        else if (TransactionIdDidCommit(xmax))
+        {
+            /* The other transaction committed the delete */
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
+            if (tmfd)
+            {
+                tmfd->traversed = false;
+                tmfd->xmax = xmax;
+            }
+            return TM_Updated;
+        }
     }
     
     /* Get group value if configured */
@@ -1444,28 +1522,44 @@ xpatch_tuple_lock(Relation relation, ItemPointer tid,
     HeapTupleData tuple;
 
     /*
-     * xpatch tables don't support UPDATE.
-     * LockTupleExclusive is used by UPDATE.
-     */
-    if (mode == LockTupleExclusive)
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("UPDATE is not supported on xpatch tables"),
-                 errhint("xpatch tables are append-only. Insert a new version instead.")));
-    }
-
-    /*
-     * DELETE is supported (with cascade semantics).
-     * LockTupleNoKeyExclusive is used by DELETE - allow it.
-     * For all lock modes, delegate to heap_lock_tuple.
+     * Allow all lock modes through to heap_lock_tuple.
+     *
+     * LockTupleExclusive is used not only by UPDATE but also by the
+     * executor's EvalPlanQual (EPQ) re-check after TM_Updated from
+     * tuple_delete in concurrent scenarios.  Rejecting it here would
+     * break concurrent DELETE.
+     *
+     * Actual UPDATE attempts are caught by xpatch_tuple_update() which
+     * raises FeatureNotSupported.
      */
     tuple.t_self = *tid;
     result = heap_lock_tuple(relation, &tuple, cid, mode, wait_policy,
                              false, &buffer, tmfd);
 
-    if (BufferIsValid(buffer))
+    if (result == TM_Ok && BufferIsValid(buffer))
+    {
+        XPatchConfig *config;
+        HeapTuple copy;
+
+        config = xpatch_get_config(relation);
+
+        /*
+         * heap_lock_tuple fills in tuple.t_data etc. while holding the
+         * buffer pin.  Copy the tuple before releasing the buffer, then
+         * convert from physical to logical format so the caller sees the
+         * correct user-visible columns.
+         */
+        copy = heap_copytuple(&tuple);
         ReleaseBuffer(buffer);
+
+        xpatch_physical_to_logical(relation, config, copy, slot);
+        slot->tts_tid = *tid;
+        heap_freetuple(copy);
+    }
+    else if (BufferIsValid(buffer))
+    {
+        ReleaseBuffer(buffer);
+    }
 
     return result;
 }
@@ -1535,11 +1629,17 @@ xpatch_tuple_fetch_row_version(Relation relation, ItemPointer tid,
     tuple.t_self = *tid;
 
     /*
-     * TODO: Implement proper MVCC visibility checking.
-     * Currently assumes all tuples are visible. For production use,
-     * should call HeapTupleSatisfiesVisibility() or similar to respect
-     * transaction isolation and handle deleted tuples correctly.
+     * MVCC visibility check: respect transaction isolation by verifying
+     * the tuple is visible under the given snapshot before returning it.
      */
+    if (snapshot != NULL &&
+        !HeapTupleSatisfiesVisibility(&tuple, snapshot, buffer))
+    {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+        ExecClearTuple(slot);
+        return false;
+    }
 
     /* Make a copy before releasing the buffer */
     copy = heap_copytuple(&tuple);
@@ -2322,56 +2422,22 @@ xpatch_index_fetch_tuple(struct IndexFetchTableData *scan,
     tuple.t_self = *tid;
 
     /*
-     * Simplified visibility check - only validates XMIN/XMAX transaction states.
-     * 
-     * A production-ready implementation should use HeapTupleSatisfiesVisibility()
-     * with the provided snapshot to properly handle:
-     * - Snapshot isolation levels
-     * - In-progress transactions
-     * - Concurrent UPDATE/DELETE visibility (when supported)
-     * - Vacuum cleanup decisions
-     * 
-     * Current implementation is sufficient for append-only workloads where
-     * tuples are never modified or deleted.
+     * Use proper HeapTupleSatisfiesVisibility for MVCC-correct visibility.
+     * This is critical for ON CONFLICT, serializable isolation, and any
+     * snapshot-based query.  The simplified check that was here before
+     * caused infinite loops with ON CONFLICT because it didn't set the
+     * snapshot xmin/xmax fields the executor relies on.
      */
     if (snapshot != NULL)
     {
-        /* Basic visibility check - check XMIN */
-        TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple.t_data);
-        
-        if (TransactionIdIsCurrentTransactionId(xmin))
-        {
-            /* Inserted by current transaction - visible */
-            visible = true;
-        }
-        else if (TransactionIdDidCommit(xmin))
-        {
-            /* Inserter committed - visible (simplified, doesn't handle XMAX) */
-            visible = true;
-        }
-        else if (TransactionIdDidAbort(xmin))
-        {
-            /* Inserter aborted - not visible */
-            visible = false;
-        }
-        else
-        {
-            /* Transaction still in progress - assume visible for now */
-            visible = true;
-        }
-        
-        /* Check XMAX for deleted/updated tuples */
-        if (visible && !(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
+        visible = HeapTupleSatisfiesVisibility(&tuple, snapshot, buffer);
+
+        /* For all_dead hint: if tuple is dead to all snapshots, mark it */
+        if (!visible && all_dead)
         {
             TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
-            if (!TransactionIdIsCurrentTransactionId(xmax) && 
-                TransactionIdDidCommit(xmax))
-            {
-                /* Row was deleted by a committed transaction */
-                visible = false;
-                if (all_dead)
-                    *all_dead = true;
-            }
+            if (TransactionIdIsValid(xmax) && TransactionIdDidCommit(xmax))
+                *all_dead = true;
         }
     }
 
@@ -2558,15 +2624,18 @@ xpatch_scan_bitmap_next_tuple(TableScanDesc scan,
 }
 
 /* ----------------------------------------------------------------
- * Sample scan callbacks (minimal implementation)
+ * Sample scan callbacks
  * ---------------------------------------------------------------- */
 
 static bool
 xpatch_scan_sample_next_block(TableScanDesc scan,
                               struct SampleScanState *scanstate)
 {
-    /* Sample scans not supported */
-    return false;
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("TABLESAMPLE is not supported on xpatch tables"),
+             errhint("Use a regular SELECT with LIMIT or WHERE clause instead.")));
+    return false;  /* not reached */
 }
 
 static bool
@@ -2574,5 +2643,8 @@ xpatch_scan_sample_next_tuple(TableScanDesc scan,
                               struct SampleScanState *scanstate,
                               TupleTableSlot *slot)
 {
-    return false;
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("TABLESAMPLE is not supported on xpatch tables")));
+    return false;  /* not reached */
 }

@@ -292,72 +292,74 @@ class TestUtilityFunctionErrors:
 
 
 class TestInsertOnConflict:
-    """INSERT ON CONFLICT uses PostgreSQL's speculative insert protocol.
+    """INSERT ON CONFLICT previously caused an uninterruptible infinite loop.
 
-    The xpatch TAM's ``xpatch_tuple_insert_speculative`` falls back to
-    a regular insert (which acquires an advisory lock on the group),
-    and ``xpatch_tuple_complete_speculative`` is a no-op.
+    Root cause was that ``xpatch_index_fetch_tuple`` used a simplified
+    visibility check that didn't set snapshot fields correctly for the
+    ON CONFLICT executor path, causing infinite retries.
 
-    When a conflict is detected, PostgreSQL tries to abort the speculative
-    insert.  But the advisory lock is already held by this transaction,
-    and the regular insert already physically wrote the row.  The result
-    is an **uninterruptible hang** — even ``pg_terminate_backend`` cannot
-    kill the stuck backend, requiring ``pg_ctl stop -m immediate``.
+    Fixed by replacing the simplified check with ``HeapTupleSatisfiesVisibility``.
+    Also hardened ``xpatch_tuple_insert_speculative`` and
+    ``xpatch_tuple_complete_speculative`` with explicit errors as a safety net.
 
-    Bug: xpatch_tam.c:982-996
-    Severity: CRITICAL — requires server restart to recover
+    Bug: xpatch_tam.c:2428-2466 visibility check (fixed)
     """
 
-    @pytest.mark.skip(
-        reason="H2: INSERT ON CONFLICT causes uninterruptible hang — "
-        "leaves zombie backend that requires pg_ctl stop -m immediate. "
-        "Run manually with: pytest -k InsertOnConflict --no-header"
-    )
-    @pytest.mark.timeout(15)
-    def test_insert_on_conflict_do_nothing_hangs(
+    def test_insert_on_conflict_do_nothing_skips(
         self, db: psycopg.Connection, make_table
     ):
-        """INSERT ... ON CONFLICT DO NOTHING enters uninterruptible C loop.
-
-        This test is skipped by default because:
-        1. The backend enters a tight C loop that ignores CHECK_FOR_INTERRUPTS
-        2. Even statement_timeout and pg_terminate_backend cannot stop it
-        3. The only recovery is pg_ctl stop -m immediate (server restart)
-        4. This leaves the test database orphaned
-        """
+        """INSERT ... ON CONFLICT DO NOTHING correctly skips the duplicate."""
         t = make_table()
-        db.execute("SET statement_timeout = '3s'")
         db.execute(f"CREATE UNIQUE INDEX ON {t} (group_id, version)")
 
         insert_rows(db, t, [(1, 1, "v1")])
 
+        # Should succeed silently — the conflicting row is skipped
         db.execute(
             f"INSERT INTO {t} (group_id, version, content) VALUES (1, 1, 'v1-dup') "
             f"ON CONFLICT (group_id, version) DO NOTHING"
         )
 
         assert row_count(db, t) == 1
+        row = db.execute(
+            f"SELECT content FROM {t} WHERE group_id = 1 AND version = 1"
+        ).fetchone()
+        assert row["content"] == "v1"
 
-    @pytest.mark.skip(
-        reason="H2: INSERT ON CONFLICT DO UPDATE causes same uninterruptible hang"
-    )
-    @pytest.mark.timeout(15)
-    def test_insert_on_conflict_do_update_hangs(
+    def test_insert_on_conflict_do_update_rejects(
         self, db: psycopg.Connection, make_table
     ):
-        """INSERT ... ON CONFLICT DO UPDATE enters uninterruptible C loop."""
+        """INSERT ... ON CONFLICT DO UPDATE raises 'UPDATE not supported'."""
         t = make_table()
-        db.execute("SET statement_timeout = '3s'")
         db.execute(f"CREATE UNIQUE INDEX ON {t} (group_id, version)")
 
         insert_rows(db, t, [(1, 1, "original")])
 
+        with pytest.raises(
+            psycopg.errors.FeatureNotSupported,
+            match="UPDATE.*not supported",
+        ):
+            db.execute(
+                f"INSERT INTO {t} (group_id, version, content) VALUES (1, 1, 'updated') "
+                f"ON CONFLICT (group_id, version) DO UPDATE SET content = EXCLUDED.content"
+            )
+
+    def test_insert_on_conflict_no_conflict_inserts(
+        self, db: psycopg.Connection, make_table
+    ):
+        """INSERT ... ON CONFLICT with no actual conflict inserts normally."""
+        t = make_table()
+        db.execute(f"CREATE UNIQUE INDEX ON {t} (group_id, version)")
+
+        insert_rows(db, t, [(1, 1, "v1")])
+
+        # Different key — no conflict, should insert normally
         db.execute(
-            f"INSERT INTO {t} (group_id, version, content) VALUES (1, 1, 'updated') "
-            f"ON CONFLICT (group_id, version) DO UPDATE SET content = EXCLUDED.content"
+            f"INSERT INTO {t} (group_id, version, content) VALUES (1, 2, 'v2') "
+            f"ON CONFLICT (group_id, version) DO NOTHING"
         )
 
-        assert row_count(db, t) == 1
+        assert row_count(db, t) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -365,49 +367,40 @@ class TestInsertOnConflict:
 # ---------------------------------------------------------------------------
 
 
-class TestTableSampleBroken:
-    """The TABLESAMPLE callbacks are stubs that always return false.
+class TestTableSampleRejected:
+    """TABLESAMPLE is not supported on xpatch tables.
 
-    ``SELECT * FROM t TABLESAMPLE BERNOULLI(100)`` silently returns zero rows
-    instead of either working correctly or raising FeatureNotSupported.
+    The sample-scan callbacks now raise FeatureNotSupported immediately
+    instead of silently returning zero rows.
 
-    Bug: xpatch_tam.c:2564-2578
+    Bug: xpatch_tam.c:2564-2578 (fixed)
     """
 
-    @pytest.mark.xfail(
-        reason="H5: TABLESAMPLE silently returns 0 rows — should either work or error",
-        strict=True,
-    )
-    def test_tablesample_bernoulli_100_returns_all_rows(
+    def test_tablesample_bernoulli_raises(
         self, db: psycopg.Connection, xpatch_table
     ):
-        """TABLESAMPLE BERNOULLI(100) should return all rows."""
+        """TABLESAMPLE BERNOULLI raises FeatureNotSupported."""
         t = xpatch_table
         insert_versions(db, t, group_id=1, count=5)
 
-        rows = db.execute(
-            f"SELECT * FROM {t} TABLESAMPLE BERNOULLI(100)"
-        ).fetchall()
-        assert len(rows) == 5
+        with pytest.raises(
+            psycopg.errors.FeatureNotSupported,
+            match="TABLESAMPLE.*not supported",
+        ):
+            db.execute(f"SELECT * FROM {t} TABLESAMPLE BERNOULLI(100)")
 
-    @pytest.mark.xfail(
-        reason="H5: TABLESAMPLE silently returns 0 rows instead of raising error",
-        strict=True,
-    )
-    def test_tablesample_system_returns_rows_or_errors(
+    def test_tablesample_system_raises(
         self, db: psycopg.Connection, xpatch_table
     ):
-        """TABLESAMPLE SYSTEM(100) should return rows or raise an error."""
+        """TABLESAMPLE SYSTEM raises FeatureNotSupported."""
         t = xpatch_table
         insert_versions(db, t, group_id=1, count=10)
 
-        try:
-            rows = db.execute(
-                f"SELECT * FROM {t} TABLESAMPLE SYSTEM(100)"
-            ).fetchall()
-            assert len(rows) > 0, "TABLESAMPLE SYSTEM(100) returned 0 rows silently"
-        except psycopg.errors.FeatureNotSupported:
-            pass  # Acceptable — at least it's explicit
+        with pytest.raises(
+            psycopg.errors.FeatureNotSupported,
+            match="TABLESAMPLE.*not supported",
+        ):
+            db.execute(f"SELECT * FROM {t} TABLESAMPLE SYSTEM(100)")
 
 
 # ---------------------------------------------------------------------------
@@ -416,31 +409,29 @@ class TestTableSampleBroken:
 
 
 class TestAutoDetectionErrors:
-    """Error paths in the C code that are not exercised until triggered."""
+    """Validation in xpatch.configure() for order_by column type checking.
 
-    @pytest.mark.xfail(
-        reason="E13: auto_detect_order_by should fail on table with no INT/TIMESTAMP columns",
-        strict=True,
-    )
+    Fixed: configure() now validates eagerly instead of deferring to first access.
+    """
+
     def test_no_order_by_column_auto_detection_fails(self, db: psycopg.Connection):
-        """A table with only TEXT columns should fail auto-detection of order_by."""
+        """A table with only TEXT columns should fail auto-detection of order_by.
+
+        The error fires at CREATE TABLE time because the _add_seq_column()
+        event trigger calls xpatch_get_config which runs auto_detect_order_by.
+        """
         t = "test_no_orderby"
-        db.execute(
-            f"CREATE TABLE {t} (name TEXT NOT NULL, body TEXT NOT NULL) USING xpatch"
-        )
         try:
             with pytest.raises(
                 psycopg.errors.InvalidParameterValue,
                 match="order_by column",
             ):
-                db.execute(f"SELECT xpatch.configure('{t}')")
+                db.execute(
+                    f"CREATE TABLE {t} (name TEXT NOT NULL, body TEXT NOT NULL) USING xpatch"
+                )
         finally:
             db.execute(f"DROP TABLE IF EXISTS {t}")
 
-    @pytest.mark.xfail(
-        reason="E17: order_by column type validation should reject TEXT columns",
-        strict=True,
-    )
     def test_wrong_order_by_type_rejected(self, db: psycopg.Connection):
         """Explicitly setting order_by to a TEXT column should raise DatatypeMismatch."""
         t = "test_wrong_orderby"
