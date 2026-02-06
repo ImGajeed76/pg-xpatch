@@ -48,7 +48,7 @@
 #include "utils/snapmgr.h"
 
 /* Extension version */
-#define PG_XPATCH_VERSION "0.2.0"
+#define PG_XPATCH_VERSION "0.4.0"
 
 /* Default configuration values */
 #define XPATCH_DEFAULT_KEYFRAME_EVERY   100
@@ -58,5 +58,11 @@
 
 /* GUC variables (declared in pg_xpatch.c) */
 extern int xpatch_cache_size_mb;
+
+/* GUC variables for insert cache (declared in xpatch_insert_cache.c) */
+extern int xpatch_insert_cache_slots;
+
+/* GUC variables for encode pool (declared in xpatch_encode_pool.c) */
+extern int xpatch_encode_threads;
 
 #endif /* PG_XPATCH_H */

@@ -33,9 +33,12 @@
 #include "xpatch_compress.h"
 #include "xpatch_cache.h"
 #include "xpatch_seq_cache.h"
+#include "xpatch_insert_cache.h"
+#include "xpatch_stats_cache.h"
 
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
+#include "access/heaptoast.h"
 #include "access/hio.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
@@ -709,66 +712,7 @@ xpatch_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
  * Tuple modification callbacks
  * ---------------------------------------------------------------- */
 
-/*
- * Compute a 64-bit hash for group-level advisory locking.
- * Combines relation OID with group value to create unique lock ID per group.
- */
-static uint64
-xpatch_compute_group_lock_id(Oid relid, Datum group_value)
-{
-    uint64 h = 14695981039346656037ULL;  /* FNV-1a offset basis */
-    uint64 group_hash = (uint64) group_value;
-    
-    /* Mix relid into hash */
-    h ^= (uint64) relid;
-    h *= 1099511628211ULL;  /* FNV-1a prime */
-    
-    /* Mix group_value into hash */
-    h ^= group_hash;
-    h *= 1099511628211ULL;
-    
-    return h;
-}
-
-/*
- * Compare two version datums safely without integer overflow.
- * Returns: negative if v1 < v2, zero if v1 == v2, positive if v1 > v2
- */
-static int
-xpatch_compare_versions(Datum v1, Datum v2, Oid typid)
-{
-    switch (typid)
-    {
-        case INT2OID:
-            {
-                int16 a = DatumGetInt16(v1);
-                int16 b = DatumGetInt16(v2);
-                return (a > b) ? 1 : ((a < b) ? -1 : 0);
-            }
-        case INT4OID:
-            {
-                int32 a = DatumGetInt32(v1);
-                int32 b = DatumGetInt32(v2);
-                return (a > b) ? 1 : ((a < b) ? -1 : 0);
-            }
-        case INT8OID:
-            {
-                int64 a = DatumGetInt64(v1);
-                int64 b = DatumGetInt64(v2);
-                return (a > b) ? 1 : ((a < b) ? -1 : 0);
-            }
-        case TIMESTAMPOID:
-        case TIMESTAMPTZOID:
-            {
-                Timestamp a = DatumGetTimestamp(v1);
-                Timestamp b = DatumGetTimestamp(v2);
-                return (a > b) ? 1 : ((a < b) ? -1 : 0);
-            }
-        default:
-            /* Fallback for unknown types - assume valid order */
-            return 1;
-    }
-}
+/* xpatch_compute_group_lock_id is now in xpatch_hash.h */
 
 static void
 xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
@@ -779,10 +723,11 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
     HeapTuple physical_tuple;
     MemoryContext oldcxt;
     MemoryContext insert_mcxt;
-    Datum group_value = (Datum) 0;
+    volatile Datum group_value = (Datum) 0;
     TupleDesc tupdesc = RelationGetDescr(relation);
     uint64 group_lock_id;
-    bool restore_mode = false;
+    volatile int32 allocated_seq = 0;  /* For rollback on failure */
+    volatile Oid group_typid = InvalidOid;
 
     elog(DEBUG1, "XPATCH: tuple_insert - rel=%s", RelationGetRelationName(relation));
     config = xpatch_get_config(relation);
@@ -792,30 +737,19 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
     xpatch_validate_schema(relation, config);
     elog(DEBUG1, "xpatch_tuple_insert: schema validated");
 
-    /*
-     * Check for restore mode: if _xp_seq is explicitly provided with a 
-     * positive value, we're in restore mode (e.g., from pg_restore/COPY).
-     * In restore mode, we skip version validation because the data is
-     * known-good from the dump and may be interleaved across groups.
-     */
-    if (config->xp_seq_attnum != InvalidAttrNumber)
-    {
-        bool isnull;
-        Datum seq_datum = slot_getattr(slot, config->xp_seq_attnum, &isnull);
-        if (!isnull && DatumGetInt32(seq_datum) > 0)
-        {
-            restore_mode = true;
-            elog(DEBUG1, "xpatch_tuple_insert: restore mode detected (_xp_seq explicitly provided)");
-        }
-    }
-
-    /* Get group value if configured */
+    /* Get group value and type if configured */
     if (config->group_by_attnum != InvalidAttrNumber)
     {
         bool isnull;
+        Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+        group_typid = group_attr->atttypid;
         group_value = slot_getattr(slot, config->group_by_attnum, &isnull);
         if (isnull)
-            group_value = (Datum) 0;
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmsg("NULL value not allowed in group column \"%s\"",
+                            NameStr(group_attr->attname)),
+                     errhint("The group_by column must have a non-NULL value for each row.")));
     }
 
     /*
@@ -824,95 +758,101 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
      * same group could both see the same max_version and create duplicates.
      * The lock is released at transaction end.
      */
-    group_lock_id = xpatch_compute_group_lock_id(RelationGetRelid(relation), group_value);
-    DirectFunctionCall1(pg_advisory_xact_lock_int8, Int64GetDatum((int64) group_lock_id));
-    
-    elog(DEBUG1, "xpatch_tuple_insert: acquired advisory lock for group (lock_id=%lu)", 
-         (unsigned long) group_lock_id);
-
-    /* 
-     * VALIDATE VERSION: Must be greater than max version in group.
-     * Skip in restore mode - the data is known-good from the dump.
-     */
-    if (!restore_mode)
     {
-        bool max_is_null;
-        Datum max_version;
-        Datum new_version;
-        bool new_is_null;
-
-        new_version = slot_getattr(slot, config->order_by_attnum, &new_is_null);
-        
-        if (new_is_null)
-        {
-            ereport(ERROR,
-                    (errcode(ERRCODE_NOT_NULL_VIOLATION),
-                     errmsg("xpatch: order_by column \"%s\" cannot be NULL",
-                            config->order_by)));
-        }
-
-        max_version = xpatch_get_max_version(relation, config, group_value, &max_is_null);
-
-        if (!max_is_null)
-        {
-            /* Compare versions using safe comparison (no overflow) */
-            Form_pg_attribute attr = TupleDescAttr(tupdesc, config->order_by_attnum - 1);
-            int cmp = xpatch_compare_versions(new_version, max_version, attr->atttypid);
-
-            if (cmp <= 0)
-            {
-                ereport(ERROR,
-                        (errcode(ERRCODE_CHECK_VIOLATION),
-                         errmsg("xpatch: new version must be greater than existing max version"),
-                         errhint("The order_by column \"%s\" must be strictly increasing within each group.",
-                                 config->order_by)));
-            }
-        }
+        /* group_isnull is always false here - we reject NULL groups above */
+        XPatchGroupHash group_hash = xpatch_compute_group_hash(group_value, group_typid, false);
+        group_lock_id = xpatch_compute_group_lock_id(RelationGetRelid(relation), group_hash);
     }
+    DirectFunctionCall1(pg_advisory_xact_lock_int8, Int64GetDatum((int64) group_lock_id));
 
-    elog(DEBUG1, "xpatch_tuple_insert: version validated, creating physical tuple");
+    elog(DEBUG1, "xpatch_tuple_insert: acquired advisory lock for group (lock_id=%lu)",
+         (unsigned long) group_lock_id);
 
     /* Use a temporary context for insert operations */
     insert_mcxt = AllocSetContextCreate(CurrentMemoryContext,
                                         "xpatch insert",
                                         ALLOCSET_DEFAULT_SIZES);
-    oldcxt = MemoryContextSwitchTo(insert_mcxt);
-
-    /* Convert logical tuple to physical (delta-compressed) format */
-    physical_tuple = xpatch_logical_to_physical(relation, config, slot);
-
-    MemoryContextSwitchTo(oldcxt);
-
+    
     /*
-     * Insert the tuple using low-level heap functions WITH WAL LOGGING.
-     * We can't use simple_heap_insert() because it checks for heap AM.
-     * We manually do what heap_insert() does: insert + WAL log.
+     * IMPORTANT: Wrap the tuple creation and insert in PG_TRY/CATCH.
+     * If any error occurs after the sequence is allocated but before the
+     * insert succeeds, we need to rollback the sequence to prevent gaps.
+     * Gaps in the sequence chain cause corruption because subsequent deltas
+     * may reference non-existent rows.
      */
+    PG_TRY();
     {
-        Buffer buffer;
-        Buffer vmbuffer = InvalidBuffer;
-        Size len;
-        Page page;
-        bool need_wal;
-        bool all_visible_cleared = false;
-        XLogRecPtr recptr;
-        uint8 info;
+        oldcxt = MemoryContextSwitchTo(insert_mcxt);
+
+        /* Convert logical tuple to physical (delta-compressed) format */
+        physical_tuple = xpatch_logical_to_physical(relation, config, slot, (int32 *) &allocated_seq);
+
+        MemoryContextSwitchTo(oldcxt);
+
+        /*
+         * TOAST handling: If the tuple is too large to fit on a page, we need
+         * to move large attributes to the TOAST table. heap_toast_insert_or_update()
+         * handles this automatically and returns a new tuple with TOAST pointers.
+         *
+         * TOAST_TUPLE_THRESHOLD is typically ~2KB; tuples larger than this are
+         * candidates for compression and/or out-of-line storage.
+         */
+        if (relation->rd_rel->reltoastrelid != InvalidOid &&
+            HeapTupleHasExternal(physical_tuple))
+        {
+            /* Already has external refs - need to flatten first */
+            physical_tuple = toast_flatten_tuple(physical_tuple, tupdesc);
+        }
         
-        /* Prepare the tuple header */
-        physical_tuple->t_data->t_infomask &= ~(HEAP_XACT_MASK);
-        physical_tuple->t_data->t_infomask2 &= ~(HEAP2_XACT_MASK);
-        physical_tuple->t_data->t_infomask |= HEAP_XMAX_INVALID;
-        HeapTupleHeaderSetXmin(physical_tuple->t_data, GetCurrentTransactionId());
-        HeapTupleHeaderSetCmin(physical_tuple->t_data, cid);
-        HeapTupleHeaderSetXmax(physical_tuple->t_data, 0);
-        physical_tuple->t_tableOid = RelationGetRelid(relation);
-        
-        /* Get tuple length */
-        len = MAXALIGN(physical_tuple->t_len);
-        
-        /* Get a buffer with enough space */
-        buffer = RelationGetBufferForTuple(relation, len, InvalidBuffer,
-                                           options, NULL, &vmbuffer, NULL, 0);
+        if (relation->rd_rel->reltoastrelid != InvalidOid &&
+            physical_tuple->t_len > TOAST_TUPLE_THRESHOLD)
+        {
+            HeapTuple toasted_tuple;
+            
+            elog(DEBUG1, "xpatch: tuple size %zu exceeds TOAST threshold %zu, toasting",
+                 (Size) physical_tuple->t_len, (Size) TOAST_TUPLE_THRESHOLD);
+            
+            toasted_tuple = heap_toast_insert_or_update(relation, physical_tuple, NULL, options);
+            
+            if (toasted_tuple != physical_tuple)
+            {
+                heap_freetuple(physical_tuple);
+                physical_tuple = toasted_tuple;
+            }
+            
+            elog(DEBUG1, "xpatch: after TOAST, tuple size is %zu", (Size) physical_tuple->t_len);
+        }
+
+        /*
+         * Insert the tuple using low-level heap functions WITH WAL LOGGING.
+         * We can't use simple_heap_insert() because it checks for heap AM.
+         * We manually do what heap_insert() does: insert + WAL log.
+         */
+        {
+            Buffer buffer;
+            Buffer vmbuffer = InvalidBuffer;
+            Size len;
+            Page page;
+            bool need_wal;
+            bool all_visible_cleared = false;
+            XLogRecPtr recptr;
+            uint8 info;
+            
+            /* Prepare the tuple header */
+            physical_tuple->t_data->t_infomask &= ~(HEAP_XACT_MASK);
+            physical_tuple->t_data->t_infomask2 &= ~(HEAP2_XACT_MASK);
+            physical_tuple->t_data->t_infomask |= HEAP_XMAX_INVALID;
+            HeapTupleHeaderSetXmin(physical_tuple->t_data, GetCurrentTransactionId());
+            HeapTupleHeaderSetCmin(physical_tuple->t_data, cid);
+            HeapTupleHeaderSetXmax(physical_tuple->t_data, 0);
+            physical_tuple->t_tableOid = RelationGetRelid(relation);
+            
+            /* Get tuple length */
+            len = MAXALIGN(physical_tuple->t_len);
+            
+            /* Get a buffer with enough space */
+            buffer = RelationGetBufferForTuple(relation, len, InvalidBuffer,
+                                               options, NULL, &vmbuffer, NULL, 0);
         
         page = BufferGetPage(buffer);
         
@@ -1002,16 +942,40 @@ xpatch_tuple_insert(Relation relation, TupleTableSlot *slot,
             PageSetLSN(page, recptr);
         }
         
-        END_CRIT_SECTION();
-        
-        if (BufferIsValid(vmbuffer))
-            ReleaseBuffer(vmbuffer);
-        UnlockReleaseBuffer(buffer);
-    }
+            END_CRIT_SECTION();
+            
+            if (BufferIsValid(vmbuffer))
+                ReleaseBuffer(vmbuffer);
+            UnlockReleaseBuffer(buffer);
+        }
 
-    /* Cleanup */
-    heap_freetuple(physical_tuple);
-    MemoryContextDelete(insert_mcxt);
+        /* Cleanup on success */
+        heap_freetuple(physical_tuple);
+        MemoryContextDelete(insert_mcxt);
+    }
+    PG_CATCH();
+    {
+        /*
+         * INSERT FAILED - Rollback the sequence allocation to prevent gaps.
+         * This is critical for maintaining delta chain integrity.
+         *
+         * Note: We only rollback if we actually allocated a sequence
+         * (allocated_seq > 0 and not in restore mode).
+         */
+        if (allocated_seq > 0)
+        {
+            elog(DEBUG1, "xpatch: insert failed, rolling back sequence %d", allocated_seq);
+            xpatch_seq_cache_rollback_seq(RelationGetRelid(relation),
+                                          group_value, group_typid, allocated_seq);
+        }
+        
+        /* Clean up memory context */
+        MemoryContextDelete(insert_mcxt);
+        
+        /* Re-throw the error */
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
 }
 
 static void
@@ -1079,7 +1043,8 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
     ItemId itemId;
     HeapTupleData target_tuple;
     Datum group_value = (Datum) 0;
-    bool group_isnull;
+    Oid group_typid = InvalidOid;
+    bool group_isnull = false;
     uint64 group_lock_id;
     Oid relid;
     BlockNumber blkno;
@@ -1177,6 +1142,8 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
     /* Get group value if configured */
     if (config->group_by_attnum != InvalidAttrNumber)
     {
+        Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+        group_typid = group_attr->atttypid;
         group_value = heap_getattr(&target_tuple, config->group_by_attnum, 
                                    tupdesc, &group_isnull);
         if (group_isnull)
@@ -1189,7 +1156,10 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
     /*
      * Step 2: Acquire advisory lock on the group to prevent concurrent modifications
      */
-    group_lock_id = xpatch_compute_group_lock_id(relid, group_value);
+    {
+        XPatchGroupHash group_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
+        group_lock_id = xpatch_compute_group_lock_id(relid, group_hash);
+    }
     DirectFunctionCall1(pg_advisory_xact_lock_int8, Int64GetDatum((int64) group_lock_id));
     
     elog(DEBUG1, "xpatch: delete acquired advisory lock (lock_id=%lu)", 
@@ -1411,20 +1381,13 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
      * Step 5: Invalidate caches
      */
     xpatch_cache_invalidate_rel(relid);
+    xpatch_insert_cache_invalidate_rel(relid);
     
     /*
      * Step 6: Update seq cache - new max_seq is target_seq - 1
-     * Get the group column type OID for proper hash computation.
+     * group_typid was already set when we fetched the group value earlier.
      */
     {
-        Oid group_typid = InvalidOid;
-        
-        if (config->group_by_attnum != InvalidAttrNumber)
-        {
-            Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
-            group_typid = group_attr->atttypid;
-        }
-        
         if (target_seq > 1)
         {
             xpatch_seq_cache_set_max_seq(relid, group_value, group_typid, target_seq - 1);
@@ -1433,6 +1396,20 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
         {
             /* Deleted all rows in group - remove from cache */
             xpatch_seq_cache_set_max_seq(relid, group_value, group_typid, 0);
+        }
+        
+        /*
+         * Step 7: Refresh stats cache for the affected group.
+         * 
+         * We cannot accurately decrement because we don't know the original
+         * uncompressed size. Instead, we refresh this group's stats by
+         * rescanning just this group. The advisory lock ensures no concurrent
+         * INSERTs to this group during the refresh.
+         */
+        {
+            XPatchGroupHash stats_group_hash;
+            stats_group_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
+            xpatch_stats_cache_refresh_groups(relid, &stats_group_hash, 1);
         }
     }
     
@@ -1678,6 +1655,17 @@ xpatch_relation_set_new_filelocator(Relation rel,
                                     MultiXactId *minmulti)
 {
     SMgrRelation srel;
+    Oid relid = RelationGetRelid(rel);
+
+    /*
+     * Invalidate caches for this relation.
+     * This is called during TRUNCATE (which replaces the file) and during
+     * CREATE TABLE (which has no cache entries yet - safe to call).
+     */
+    xpatch_cache_invalidate_rel(relid);      /* Content cache */
+    xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
+    xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
+    xpatch_stats_cache_delete_table(relid);  /* Stats cache - delete on TRUNCATE */
 
     /*
      * Initialize the physical storage for the new relation.
@@ -1698,6 +1686,8 @@ xpatch_relation_nontransactional_truncate(Relation rel)
     /* Invalidate all cache entries for this relation */
     xpatch_cache_invalidate_rel(relid);      /* Content cache */
     xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
+    xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
+    xpatch_stats_cache_delete_table(relid); /* Stats cache */
 
     /* Delegate to heap */
     RelationTruncate(rel, 0);
@@ -1855,6 +1845,7 @@ xpatch_relation_vacuum(Relation rel, struct VacuumParams *params,
     {
         xpatch_cache_invalidate_rel(relid);
         xpatch_seq_cache_invalidate_rel(relid);
+        xpatch_insert_cache_invalidate_rel(relid);
         cache_invalidated = true;
     }
 

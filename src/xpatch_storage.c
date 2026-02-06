@@ -39,16 +39,25 @@
 #include "xpatch_compress.h"
 #include "xpatch_cache.h"
 #include "xpatch_seq_cache.h"
+#include "xpatch_insert_cache.h"
+#include "xpatch_encode_pool.h"
+#include "xpatch_stats_cache.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
+#include "catalog/index.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "executor/tuptable.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/typcache.h"
 #include "funcapi.h"
 
@@ -503,8 +512,265 @@ xpatch_get_max_version(Relation rel, XPatchConfig *config,
 }
 
 /*
- * Fetch a physical row by group and sequence number using direct buffer access.
- * Searches for tuple where _xp_seq = target_seq.
+ * Helper: Fetch tuple by TID with visibility check.
+ * Returns a palloc'd HeapTuple if the tuple at the given TID is valid and visible,
+ * NULL otherwise.
+ */
+static HeapTuple
+fetch_tuple_by_tid(Relation rel, ItemPointer tid)
+{
+    Buffer buffer;
+    Page page;
+    ItemId itemId;
+    HeapTupleData tuple;
+    HeapTuple result = NULL;
+    BlockNumber blkno;
+    OffsetNumber offnum;
+    
+    blkno = ItemPointerGetBlockNumber(tid);
+    offnum = ItemPointerGetOffsetNumber(tid);
+    
+    /* Check block number is valid */
+    if (blkno >= RelationGetNumberOfBlocks(rel))
+        return NULL;
+    
+    buffer = ReadBuffer(rel, blkno);
+    LockBuffer(buffer, BUFFER_LOCK_SHARE);
+    
+    page = BufferGetPage(buffer);
+    
+    /* Check offset is valid */
+    if (offnum > PageGetMaxOffsetNumber(page))
+    {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+        return NULL;
+    }
+    
+    itemId = PageGetItemId(page, offnum);
+    
+    if (ItemIdIsNormal(itemId))
+    {
+        tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+        tuple.t_len = ItemIdGetLength(itemId);
+        tuple.t_tableOid = RelationGetRelid(rel);
+        ItemPointerCopy(tid, &tuple.t_self);
+        
+        /* MVCC visibility check */
+        {
+            TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple.t_data);
+            
+            /* Skip if inserter hasn't committed and isn't us */
+            if (TransactionIdIsCurrentTransactionId(xmin) ||
+                TransactionIdDidCommit(xmin))
+            {
+                /* Check if tuple is deleted */
+                if ((tuple.t_data->t_infomask & HEAP_XMAX_INVALID) ||
+                    !TransactionIdDidCommit(HeapTupleHeaderGetRawXmax(tuple.t_data)))
+                {
+                    result = heap_copytuple(&tuple);
+                }
+            }
+        }
+    }
+    
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+    ReleaseBuffer(buffer);
+    
+    return result;
+}
+
+/*
+ * Helper: Find index OID for the _xp_seq index on a table.
+ * Returns the OID of the index, or InvalidOid if not found.
+ * 
+ * Looks for either:
+ * - <tablename>_xp_seq_idx (basic index on _xp_seq)
+ * - <tablename>_xp_group_seq_idx (composite index on (group_by, _xp_seq))
+ */
+static Oid
+find_xp_seq_index(Relation rel, XPatchConfig *config)
+{
+    List *indexList;
+    ListCell *lc;
+    Oid result = InvalidOid;
+    const char *relname = RelationGetRelationName(rel);
+    char basic_idx_name[NAMEDATALEN];
+    char composite_idx_name[NAMEDATALEN];
+    
+    snprintf(basic_idx_name, NAMEDATALEN, "%s_xp_seq_idx", relname);
+    snprintf(composite_idx_name, NAMEDATALEN, "%s_xp_group_seq_idx", relname);
+    
+    indexList = RelationGetIndexList(rel);
+    
+    foreach(lc, indexList)
+    {
+        Oid indexOid = lfirst_oid(lc);
+        Relation indexRel = index_open(indexOid, AccessShareLock);
+        const char *indexName = RelationGetRelationName(indexRel);
+        
+        /* Prefer composite index if group_by is configured */
+        if (config->group_by_attnum != InvalidAttrNumber &&
+            strcmp(indexName, composite_idx_name) == 0)
+        {
+            result = indexOid;
+            index_close(indexRel, AccessShareLock);
+            break;
+        }
+        
+        /* Fall back to basic index */
+        if (strcmp(indexName, basic_idx_name) == 0)
+        {
+            result = indexOid;
+        }
+        
+        index_close(indexRel, AccessShareLock);
+    }
+    
+    list_free(indexList);
+    return result;
+}
+
+/*
+ * Helper: Fetch tuple using index scan on _xp_seq.
+ * This is O(log n) compared to O(n) for full table scan.
+ */
+static HeapTuple
+fetch_by_seq_using_index(Relation rel, XPatchConfig *config,
+                         Datum group_value, int32 target_seq, ItemPointer out_tid)
+{
+    Oid indexOid;
+    Relation indexRel;
+    IndexScanDesc scan;
+    ScanKeyData scankeys[2];
+    int nkeys;
+    HeapTuple result = NULL;
+    TupleDesc tupdesc;
+    
+    indexOid = find_xp_seq_index(rel, config);
+    if (!OidIsValid(indexOid))
+    {
+        elog(DEBUG1, "xpatch: no _xp_seq index found, falling back to sequential scan");
+        return NULL;  /* No index - caller will fall back to seq scan */
+    }
+    
+    tupdesc = RelationGetDescr(rel);
+    indexRel = index_open(indexOid, AccessShareLock);
+    
+    /* Set up scan keys */
+    nkeys = 0;
+    
+    /* If we have a composite index (group_by, _xp_seq), use both keys */
+    if (config->group_by_attnum != InvalidAttrNumber)
+    {
+        Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+        Oid eqop = InvalidOid;
+        
+        /* Get equality operator for the group column type */
+        eqop = OpernameGetOprid(list_make1(makeString("=")), 
+                                group_attr->atttypid, group_attr->atttypid);
+        
+        if (OidIsValid(eqop))
+        {
+            ScanKeyInit(&scankeys[nkeys],
+                        1,  /* First column in composite index is group_by */
+                        BTEqualStrategyNumber,
+                        get_opcode(eqop),
+                        group_value);
+            nkeys++;
+            
+            ScanKeyInit(&scankeys[nkeys],
+                        2,  /* Second column is _xp_seq */
+                        BTEqualStrategyNumber,
+                        F_INT4EQ,
+                        Int32GetDatum(target_seq));
+            nkeys++;
+        }
+    }
+    else
+    {
+        /* Basic index on just _xp_seq */
+        ScanKeyInit(&scankeys[nkeys],
+                    1,  /* First (and only) column is _xp_seq */
+                    BTEqualStrategyNumber,
+                    F_INT4EQ,
+                    Int32GetDatum(target_seq));
+        nkeys++;
+    }
+    
+    /* Start index scan */
+    scan = index_beginscan(rel, indexRel, GetActiveSnapshot(), nkeys, 0);
+    index_rescan(scan, scankeys, nkeys, NULL, 0);
+    
+    /* Fetch the tuple using index_getnext_tid + heap fetch */
+    while (true)
+    {
+        ItemPointer tid;
+        HeapTupleData tuple;
+        Buffer buffer;
+        bool found;
+        
+        tid = index_getnext_tid(scan, ForwardScanDirection);
+        if (tid == NULL)
+            break;
+        
+        /* Fetch the heap tuple */
+        tuple.t_self = *tid;
+        found = heap_fetch(rel, GetActiveSnapshot(), &tuple, &buffer, false);
+        
+        if (!found)
+            continue;
+        
+        /* For composite index, we've already filtered by group, so this is our tuple */
+        /* For basic index, we need to verify the group matches */
+        if (config->group_by_attnum != InvalidAttrNumber && nkeys == 1)
+        {
+            /* Basic index only - need to check group manually */
+            bool group_isnull;
+            Datum tuple_group;
+            Form_pg_attribute attr;
+            
+            tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
+            
+            if (group_isnull)
+            {
+                ReleaseBuffer(buffer);
+                continue;
+            }
+            
+            attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+            if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
+            {
+                ReleaseBuffer(buffer);
+                continue;
+            }
+        }
+        
+        /* Found it! Copy the TID for caching */
+        if (out_tid)
+            ItemPointerCopy(tid, out_tid);
+        
+        result = heap_copytuple(&tuple);
+        ReleaseBuffer(buffer);
+        break;
+    }
+    
+    index_endscan(scan);
+    index_close(indexRel, AccessShareLock);
+    
+    return result;
+}
+
+/*
+ * Fetch a physical row by group and sequence number.
+ * 
+ * OPTIMIZED VERSION - uses three strategies in order:
+ * 1. Seq-to-TID cache lookup - O(1) hash table lookup
+ * 2. Index scan on _xp_seq - O(log n) B-tree lookup
+ * 3. Sequential scan as fallback - O(n) if no index exists
+ * 
+ * The seq-to-TID cache is populated on successful lookups to speed up
+ * subsequent requests for the same (group, seq) pair.
  */
 HeapTuple
 xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
@@ -512,69 +778,129 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
 {
     HeapTuple result = NULL;
     TupleDesc tupdesc;
-    BlockNumber nblocks;
-    BlockNumber blkno;
-    Buffer buffer;
-    Page page;
-    OffsetNumber offnum;
-    OffsetNumber maxoff;
-    ItemId itemId;
-    HeapTupleData tuple;
-    Datum tuple_group;
-    bool group_isnull;
-    Form_pg_attribute attr;
+    Oid group_typid = InvalidOid;
+    ItemPointerData cached_tid;
+    ItemPointerData found_tid;
     
     tupdesc = RelationGetDescr(rel);
-    nblocks = RelationGetNumberOfBlocks(rel);
     
-    /* Scan all blocks */
-    for (blkno = 0; blkno < nblocks && result == NULL; blkno++)
+    /* Get group column type for cache operations */
+    if (config->group_by_attnum != InvalidAttrNumber)
     {
-        buffer = ReadBuffer(rel, blkno);
-        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        Form_pg_attribute group_attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+        group_typid = group_attr->atttypid;
+    }
+    
+    /* Strategy 1: Check seq-to-TID cache for O(1) lookup */
+    if (xpatch_seq_cache_get_seq_tid(RelationGetRelid(rel), group_value, group_typid,
+                                      target_seq, &cached_tid))
+    {
+        elog(DEBUG2, "xpatch: fetch_by_seq cache HIT for seq=%d", target_seq);
         
-        page = BufferGetPage(buffer);
-        maxoff = PageGetMaxOffsetNumber(page);
+        /* Fetch tuple by cached TID */
+        result = fetch_tuple_by_tid(rel, &cached_tid);
         
-        for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+        if (result != NULL)
         {
-            itemId = PageGetItemId(page, offnum);
+            /* Verify the tuple still has the right seq (in case of VACUUM/UPDATE) */
+            bool seq_isnull;
+            Datum seq_datum = heap_getattr(result, config->xp_seq_attnum, tupdesc, &seq_isnull);
             
-            if (!ItemIdIsNormal(itemId))
-                continue;
-            
-            tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
-            tuple.t_len = ItemIdGetLength(itemId);
-            tuple.t_tableOid = RelationGetRelid(rel);
-            ItemPointerSet(&tuple.t_self, blkno, offnum);
-            
-            /* Check group if specified */
-            if (config->group_by_attnum != InvalidAttrNumber)
+            if (!seq_isnull && DatumGetInt32(seq_datum) == target_seq)
             {
-                tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
-                
-                if (group_isnull)
-                    continue;
-                
-                attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
-                if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
-                    continue;
+                /* Cache hit valid - return the tuple */
+                return result;
             }
             
-            /* Check sequence number from _xp_seq column */
+            /* Cache stale - TID no longer points to our seq. Free and continue. */
+            heap_freetuple(result);
+            result = NULL;
+            elog(DEBUG2, "xpatch: fetch_by_seq cache STALE for seq=%d", target_seq);
+        }
+    }
+    
+    /* Strategy 2: Use index scan - O(log n) */
+    ItemPointerSetInvalid(&found_tid);
+    result = fetch_by_seq_using_index(rel, config, group_value, target_seq, &found_tid);
+    
+    if (result != NULL)
+    {
+        /* Populate the cache for future lookups */
+        xpatch_seq_cache_set_seq_tid(RelationGetRelid(rel), group_value, group_typid,
+                                      target_seq, &found_tid);
+        return result;
+    }
+    
+    /* Strategy 3: Fall back to sequential scan - O(n) */
+    elog(DEBUG1, "xpatch: fetch_by_seq falling back to sequential scan for seq=%d", target_seq);
+    {
+        BlockNumber nblocks;
+        BlockNumber blkno;
+        Buffer buffer;
+        Page page;
+        OffsetNumber offnum;
+        OffsetNumber maxoff;
+        ItemId itemId;
+        HeapTupleData tuple;
+        Datum tuple_group;
+        bool group_isnull;
+        Form_pg_attribute attr;
+        
+        nblocks = RelationGetNumberOfBlocks(rel);
+        
+        /* Scan all blocks */
+        for (blkno = 0; blkno < nblocks && result == NULL; blkno++)
+        {
+            buffer = ReadBuffer(rel, blkno);
+            LockBuffer(buffer, BUFFER_LOCK_SHARE);
+            
+            page = BufferGetPage(buffer);
+            maxoff = PageGetMaxOffsetNumber(page);
+            
+            for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
             {
-                bool seq_isnull;
-                Datum seq_datum = heap_getattr(&tuple, config->xp_seq_attnum, tupdesc, &seq_isnull);
-                if (!seq_isnull && DatumGetInt32(seq_datum) == target_seq)
+                itemId = PageGetItemId(page, offnum);
+                
+                if (!ItemIdIsNormal(itemId))
+                    continue;
+                
+                tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+                tuple.t_len = ItemIdGetLength(itemId);
+                tuple.t_tableOid = RelationGetRelid(rel);
+                ItemPointerSet(&tuple.t_self, blkno, offnum);
+                
+                /* Check group if specified */
+                if (config->group_by_attnum != InvalidAttrNumber)
                 {
-                    result = heap_copytuple(&tuple);
-                    break;
+                    tuple_group = heap_getattr(&tuple, config->group_by_attnum, tupdesc, &group_isnull);
+                    
+                    if (group_isnull)
+                        continue;
+                    
+                    attr = TupleDescAttr(tupdesc, config->group_by_attnum - 1);
+                    if (!xpatch_datums_equal(group_value, tuple_group, attr->atttypid, attr->attcollation))
+                        continue;
+                }
+                
+                /* Check sequence number from _xp_seq column */
+                {
+                    bool seq_isnull;
+                    Datum seq_datum = heap_getattr(&tuple, config->xp_seq_attnum, tupdesc, &seq_isnull);
+                    if (!seq_isnull && DatumGetInt32(seq_datum) == target_seq)
+                    {
+                        result = heap_copytuple(&tuple);
+                        
+                        /* Cache the TID for future lookups */
+                        xpatch_seq_cache_set_seq_tid(RelationGetRelid(rel), group_value, group_typid,
+                                                      target_seq, &tuple.t_self);
+                        break;
+                    }
                 }
             }
+            
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
         }
-        
-        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-        ReleaseBuffer(buffer);
     }
     
     return result;
@@ -719,9 +1045,17 @@ xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
     physical_tuple = xpatch_fetch_by_seq(rel, config, group_value, seq);
     if (physical_tuple == NULL)
     {
-        ereport(ERROR,
-                (errcode(ERRCODE_DATA_CORRUPTED),
-                 errmsg("xpatch: could not find row with sequence %d", seq)));
+        /*
+         * Row not found - this could happen if:
+         * 1. A previous INSERT failed after allocating a sequence number
+         * 2. The row was deleted (which shouldn't normally happen in xpatch)
+         * 3. Data corruption
+         *
+         * We return NULL here instead of throwing an error so callers can
+         * handle this gracefully (e.g., by falling back to keyframe encoding).
+         */
+        elog(WARNING, "xpatch: could not find row with sequence %d (gap in chain?)", seq);
+        return NULL;
     }
     
     /* 3. Get the delta/compressed value from the tuple */
@@ -813,7 +1147,7 @@ xpatch_reconstruct_column_with_tuple(Relation rel, XPatchConfig *config,
  */
 HeapTuple
 xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
-                           TupleTableSlot *slot)
+                           TupleTableSlot *slot, int32 *out_seq)
 {
     TupleDesc tupdesc;
     int natts;
@@ -844,6 +1178,17 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     bool restore_mode = false;
     int32 user_seq = 0;
     Oid group_typid = InvalidOid;
+    int insert_cache_slot = -1;
+    bool insert_cache_is_new = false;
+    XPatchGroupHash insert_cache_hash = {0};  /* For ownership validation */
+    int64 total_raw_size = 0;      /* For stats tracking */
+    int64 total_compressed_size = 0; /* For stats tracking */
+    int total_delta_tags = 0;      /* Sum of best_tag values for avg_compression_depth */
+    int num_delta_columns_processed = 0; /* Count of delta columns for averaging */
+    
+    /* Initialize out_seq to 0 (will be set later if allocation succeeds) */
+    if (out_seq)
+        *out_seq = 0;
     
     tupdesc = RelationGetDescr(rel);
     natts = tupdesc->natts;
@@ -851,12 +1196,11 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     /* Ensure slot is materialized early so we can check _xp_seq */
     slot_getallattrs(slot);
     
-    /* Get group value if configured */
+    /* Get group value if configured (NULL groups are rejected in xpatch_tam.c) */
     if (config->group_by_attnum != InvalidAttrNumber)
     {
         group_value = slot_getattr(slot, config->group_by_attnum, &isnull);
-        if (isnull)
-            group_value = (Datum) 0;
+        /* isnull should never be true here - validated at insert time */
     }
     
     /* Get group column type OID for proper hash computation */
@@ -867,8 +1211,9 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
     }
     
     /*
-     * Check for restore mode: if user explicitly provides _xp_seq, use it.
+     * Restore mode: if user explicitly provides _xp_seq > 0, use it.
      * This enables pg_restore / COPY FROM with explicit sequence numbers.
+     * Normal inserts (without explicit _xp_seq) auto-allocate.
      */
     if (config->xp_seq_attnum != InvalidAttrNumber)
     {
@@ -881,19 +1226,19 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                 restore_mode = true;
                 new_seq = user_seq;
                 elog(DEBUG1, "xpatch: restore mode - using explicit _xp_seq=%d", new_seq);
-                
+
                 /*
                  * Update the seq cache if this seq is higher than what we have.
                  * This ensures subsequent auto-generated inserts continue correctly.
                  */
                 {
                     bool cache_found;
-                    int32 cached_max = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel), 
+                    int32 cached_max = xpatch_seq_cache_get_max_seq(RelationGetRelid(rel),
                                                                      group_value, group_typid,
                                                                      &cache_found);
                     if (!cache_found || new_seq > cached_max)
                     {
-                        xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value, 
+                        xpatch_seq_cache_set_max_seq(RelationGetRelid(rel), group_value,
                                                      group_typid, new_seq);
                     }
                 }
@@ -919,12 +1264,42 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
         }
     }
     
+    /* 
+     * Output the allocated sequence so caller can rollback on failure.
+     * This must be done BEFORE any operation that might fail, so the
+     * caller knows which sequence to rollback.
+     */
+    if (out_seq && !restore_mode)
+        *out_seq = new_seq;
+    
     /* Determine if this is a keyframe */
     is_keyframe = (new_seq == 1) || (new_seq % config->keyframe_every == 1);
     
     elog(DEBUG1, "xpatch: inserting seq %d, is_keyframe=%d%s", new_seq, is_keyframe,
          restore_mode ? " (restore mode)" : "");
     
+    /*
+     * Acquire FIFO insert cache slot for this (table, group) pair.
+     * Needed for both keyframes (to keep FIFO warm) and deltas (to read bases).
+     * Not used in restore mode (bulk restore bypasses FIFO).
+     * On cold start (is_new=true), populate the FIFO with reconstructed content.
+     */
+    if (!restore_mode && config->num_delta_columns > 0)
+    {
+        insert_cache_slot = xpatch_insert_cache_get_slot(
+            RelationGetRelid(rel), group_value, group_typid,
+            config->compress_depth, config->num_delta_columns,
+            &insert_cache_is_new, &insert_cache_hash);
+        
+        if (insert_cache_is_new && insert_cache_slot >= 0 && new_seq > 1 && !is_keyframe)
+        {
+            /* Cold start: populate FIFO with previous rows */
+            int32 max_seq_for_populate = new_seq - 1;
+            xpatch_insert_cache_populate(insert_cache_slot, rel, config,
+                                         group_value, max_seq_for_populate);
+        }
+    }
+
     /* Allocate arrays for physical tuple */
     values = palloc(natts * sizeof(Datum));
     nulls = palloc(natts * sizeof(bool));
@@ -981,38 +1356,127 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
             }
             else
             {
-                /* Delta: try compress_depth previous versions and pick best
+                /*
+                 * Delta encoding: use FIFO insert cache + parallel encoding.
+                 *
+                 * 1. Get bases from the FIFO insert cache (pre-materialized)
+                 * 2. If FIFO is cold, fall back to reconstruction
+                 * 3. Dispatch encoding to thread pool (or sequential if disabled)
+                 * 4. Pick smallest result
+                 *
                  * Tag convention: tag=N means delta against N rows back
                  *   tag=1: previous row
                  *   tag=2: 2 rows back
                  *   etc.
                  */
+                InsertCacheBases *fifo_bases;
+                EncodeBatch batch;
+                int best_result_idx = -1;
+
                 best_delta = NULL;
                 best_size = SIZE_MAX;
                 best_tag = 1;
-                
-                for (tag = 1; tag <= config->compress_depth; tag++)
+
+                /* Allocate bases struct sized to actual compress_depth */
+                fifo_bases = InsertCacheBasesAlloc(config->compress_depth);
+
+                /* Try to get bases from FIFO cache first */
+                if (insert_cache_slot >= 0)
                 {
-                    base_seq = new_seq - tag;
-                    
-                    if (base_seq < 1)
-                        break;
-                    
-                    /* Get base content (may trigger reconstruction) */
-                    base_content = xpatch_reconstruct_column(rel, config, group_value,
-                                                              base_seq, delta_col_index);
-                    
-                    /* Encode delta against this base */
-                    if (base_content == NULL)
+                    xpatch_insert_cache_get_bases(insert_cache_slot,
+                                                  RelationGetRelid(rel),
+                                                  insert_cache_hash,
+                                                  new_seq, delta_col_index,
+                                                  fifo_bases);
+                }
+
+                if (fifo_bases->count > 0)
+                {
+                    /*
+                     * WARM PATH: Bases available from FIFO cache.
+                     * Dispatch parallel encoding via thread pool.
+                     */
+                    memset(&batch, 0, sizeof(batch));
+                    batch.new_data = (const uint8_t *) VARDATA_ANY(raw_content);
+                    batch.new_len = VARSIZE_ANY_EXHDR(raw_content);
+                    batch.enable_zstd = config->enable_zstd;
+                    batch.num_tasks = fifo_bases->count;
+                    batch.capacity = fifo_bases->count;
+                    batch.tasks = palloc0(fifo_bases->count * sizeof(EncodeTask));
+                    batch.results = palloc0(fifo_bases->count * sizeof(EncodeResult));
+
+                    for (tag = 0; tag < fifo_bases->count; tag++)
                     {
-                        candidate = xpatch_encode_delta(tag,
-                                                        NULL, 0,
-                                                        (uint8 *) VARDATA_ANY(raw_content),
-                                                        VARSIZE_ANY_EXHDR(raw_content),
-                                                        config->enable_zstd);
+                        batch.tasks[tag].tag = fifo_bases->bases[tag].tag;
+                        batch.tasks[tag].base_data = fifo_bases->bases[tag].data;
+                        batch.tasks[tag].base_len = fifo_bases->bases[tag].size;
                     }
-                    else
+
+                    /* Initialize encode pool on first use if configured */
+                    if (xpatch_encode_threads > 0 && fifo_bases->count > 1)
+                        xpatch_encode_pool_init();
+
+                    /* Execute batch (parallel if pool available, sequential otherwise) */
+                    xpatch_encode_pool_execute(&batch);
+
+                    /* Find smallest result */
+                    for (tag = 0; tag < batch.num_tasks; tag++)
                     {
+                        if (batch.results[tag].valid && batch.results[tag].size > 0)
+                        {
+                            if (batch.results[tag].size < best_size)
+                            {
+                                best_size = batch.results[tag].size;
+                                best_tag = batch.results[tag].tag;
+                                best_result_idx = tag;
+                            }
+                        }
+                    }
+
+                    /* Copy winning result to palloc'd bytea */
+                    if (best_result_idx >= 0)
+                    {
+                        Size total_size = batch.results[best_result_idx].size + VARHDRSZ;
+                        best_delta = (bytea *) palloc(total_size);
+                        SET_VARSIZE(best_delta, total_size);
+                        memcpy(VARDATA(best_delta),
+                               batch.results[best_result_idx].data,
+                               batch.results[best_result_idx].size);
+                    }
+
+                    /* Free all encode results (Rust allocator) */
+                    xpatch_encode_pool_free_results(&batch);
+
+                    /* Free palloc'd task/result arrays */
+                    pfree(batch.tasks);
+                    pfree(batch.results);
+
+                    /* Free palloc'd base copies from FIFO */
+                    for (tag = 0; tag < fifo_bases->count; tag++)
+                    {
+                        if (fifo_bases->bases[tag].data)
+                            pfree((void *) fifo_bases->bases[tag].data);
+                    }
+                }
+                else
+                {
+                    /*
+                     * COLD PATH: No FIFO bases available.
+                     * Fall back to sequential reconstruction (same as before).
+                     * This only happens on cold start before FIFO is populated.
+                     */
+                    for (tag = 1; tag <= config->compress_depth; tag++)
+                    {
+                        base_seq = new_seq - tag;
+
+                        if (base_seq < 1)
+                            break;
+
+                        base_content = xpatch_reconstruct_column(rel, config, group_value,
+                                                                  base_seq, delta_col_index);
+                        if (base_content == NULL)
+                            continue;
+
                         candidate = xpatch_encode_delta(tag,
                                                         (uint8 *) VARDATA_ANY(base_content),
                                                         VARSIZE_ANY_EXHDR(base_content),
@@ -1020,34 +1484,59 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                                                         VARSIZE_ANY_EXHDR(raw_content),
                                                         config->enable_zstd);
                         pfree(base_content);
-                    }
-                    
-                    if (candidate != NULL)
-                    {
-                        candidate_size = VARSIZE(candidate);
-                        
-                        if (candidate_size < best_size)
+
+                        if (candidate != NULL)
                         {
-                            if (best_delta != NULL)
-                                pfree(best_delta);
-                            best_delta = candidate;
-                            best_size = candidate_size;
-                            best_tag = tag;
-                        }
-                        else
-                        {
-                            pfree(candidate);
+                            candidate_size = VARSIZE(candidate);
+
+                            if (candidate_size < best_size)
+                            {
+                                if (best_delta != NULL)
+                                    pfree(best_delta);
+                                best_delta = candidate;
+                                best_size = candidate_size;
+                                best_tag = tag;
+                            }
+                            else
+                            {
+                                pfree(candidate);
+                            }
                         }
                     }
                 }
-                
+
+                /* Free the dynamically allocated bases struct */
+                pfree(fifo_bases);
+
                 compressed = best_delta;
-                
+
+                /*
+                 * If no valid delta was found (all bases missing or compression failed),
+                 * fall back to keyframe encoding. This makes xpatch self-healing for
+                 * gaps created by failed inserts.
+                 */
+                if (compressed == NULL)
+                {
+                    elog(DEBUG1, "xpatch: no valid base found for delta, falling back to keyframe for col %d",
+                         delta_col_index);
+
+                    compressed = xpatch_encode_delta(XPATCH_KEYFRAME_TAG,
+                                                      NULL, 0,
+                                                      (uint8 *) VARDATA_ANY(raw_content),
+                                                      VARSIZE_ANY_EXHDR(raw_content),
+                                                      config->enable_zstd);
+                    best_tag = XPATCH_KEYFRAME_TAG;
+                }
+
                 elog(DEBUG1, "xpatch: delta col %d: raw=%zu compressed=%zu tag=%d",
                      delta_col_index,
                      VARSIZE_ANY_EXHDR(raw_content),
                      compressed ? VARSIZE_ANY_EXHDR(compressed) : 0,
                      best_tag);
+                
+                /* Track delta tags for avg_compression_depth calculation */
+                total_delta_tags += best_tag;
+                num_delta_columns_processed++;
             }
             
             if (compressed == NULL)
@@ -1072,11 +1561,71 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
             {
                 cache_content = datum_to_bytea(slot_getattr(slot, attnum, &isnull), typid, false);
                 xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid, new_seq, attnum, cache_content);
+                
+                /* Track sizes for stats */
+                total_raw_size += VARSIZE_ANY_EXHDR(cache_content);
+                total_compressed_size += VARSIZE(compressed);
+                
+                /* Push into FIFO insert cache for future inserts */
+                if (insert_cache_slot >= 0)
+                {
+                    xpatch_insert_cache_push(insert_cache_slot,
+                                             RelationGetRelid(rel),
+                                             insert_cache_hash,
+                                             new_seq, delta_col_index,
+                                             (const uint8 *) VARDATA_ANY(cache_content),
+                                             VARSIZE_ANY_EXHDR(cache_content));
+                }
+                
                 pfree(cache_content);
             }
             
             pfree(raw_content);
         }
+    }
+    
+    /* Commit the FIFO entry after all delta columns are written */
+    if (insert_cache_slot >= 0 && !restore_mode)
+    {
+        xpatch_insert_cache_commit_entry(insert_cache_slot,
+                                         RelationGetRelid(rel),
+                                         insert_cache_hash,
+                                         new_seq);
+    }
+    
+    /*
+     * Update stats cache with this insert's info.
+     * Skip in restore mode (bulk restore should use refresh_stats afterward).
+     */
+    if (!restore_mode && config->num_delta_columns > 0)
+    {
+        XPatchGroupHash stats_hash;
+        double avg_delta_tag = 0.0;
+        
+        /* Use existing hash if available, otherwise compute it */
+        if (insert_cache_slot >= 0)
+        {
+            stats_hash = insert_cache_hash;
+        }
+        else
+        {
+            /* NULL groups are rejected at insert time, so always pass false */
+            stats_hash = xpatch_compute_group_hash(group_value, group_typid, false);
+        }
+        
+        /* Compute average delta tag across all delta columns */
+        if (num_delta_columns_processed > 0)
+            avg_delta_tag = (double) total_delta_tags / num_delta_columns_processed;
+        
+        xpatch_stats_cache_update_group(
+            RelationGetRelid(rel),
+            stats_hash,
+            is_keyframe,
+            new_seq,
+            total_raw_size,
+            total_compressed_size,
+            avg_delta_tag
+        );
     }
     
     /* Build the physical tuple */

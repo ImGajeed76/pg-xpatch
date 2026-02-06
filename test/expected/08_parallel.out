@@ -1,20 +1,45 @@
-SET
-CREATE TABLE
+-- Test 08: Parallel Scan
+-- 
+-- This test verifies that parallel scans work correctly.
+-- The _xp_seq column is automatically added by the event trigger when
+-- tables are created with USING xpatch. This allows parallel workers
+-- to independently reconstruct delta-compressed content.
+-- Suppress NOTICE messages for cleaner test output
+SET client_min_messages = warning;
+-- Create a table (no need to add _xp_seq - it's added automatically)
+CREATE TABLE test_parallel (
+    id INT,
+    version INT,
+    data TEXT NOT NULL
+) USING xpatch;
+SELECT xpatch.configure('test_parallel',
+    group_by => 'id',
+    order_by => 'version',
+    delta_columns => ARRAY['data']::text[]
+);
  configure 
 -----------
  
 (1 row)
 
-INSERT 0 2000
+-- Insert data: 50 groups x 10 versions = 500 rows
+INSERT INTO test_parallel (id, version, data)
+SELECT id, version, 'Data for id=' || id || ' version=' || version || ' ' || repeat('x', 100)
+FROM generate_series(1, 50) id, generate_series(1, 10) version;
+-- Verify row count before enabling parallel
+SELECT count(*) as total_rows FROM test_parallel;
  total_rows 
 ------------
-       2000
+        500
 (1 row)
 
-SET
-SET
-SET
-SET
+-- Configure parallel query settings to force parallel execution
+SET max_parallel_workers_per_gather = 2;
+SET parallel_tuple_cost = 0;
+SET parallel_setup_cost = 0;
+SET min_parallel_table_scan_size = 0;
+-- Test 1: Show that parallel scan is planned
+EXPLAIN (COSTS OFF) SELECT count(*) FROM test_parallel;
                       QUERY PLAN                      
 ------------------------------------------------------
  Finalize Aggregate
@@ -24,74 +49,48 @@ SET
                ->  Parallel Seq Scan on test_parallel
 (5 rows)
 
- parallel_count 
-----------------
-           2000
+-- Test 2: Execute with parallel scan and verify correct count
+SELECT count(*) as count_result FROM test_parallel;
+ count_result 
+--------------
+          500
 (1 row)
 
-                QUERY PLAN                
-------------------------------------------
- Gather
-   Workers Planned: 2
-   ->  Parallel Seq Scan on test_parallel
-         Filter: (id <= 10)
-(4 rows)
-
+-- Test 3: Verify data retrieval works correctly with parallel scan
+SELECT count(*) as rows_retrieved,
+       sum(length(data)) as total_data_length
+FROM test_parallel WHERE id <= 10;
  rows_retrieved | total_data_length 
 ----------------+-------------------
-            200 |             24930
+            100 |             12420
 (1 row)
 
-                   QUERY PLAN                   
-------------------------------------------------
- HashAggregate
-   Group Key: id
-   ->  Gather
-         Workers Planned: 2
-         ->  Parallel Seq Scan on test_parallel
-(5 rows)
-
- id  | versions | latest 
------+----------+--------
-   1 |       20 |     20
-  50 |       20 |     20
- 100 |       20 |     20
+-- Test 4: Verify aggregation works with parallel scan
+SELECT id, count(*) as versions, max(version) as latest
+FROM test_parallel 
+WHERE id IN (1, 25, 50)
+GROUP BY id
+ORDER BY id;
+ id | versions | latest 
+----+----------+--------
+  1 |       10 |     10
+ 25 |       10 |     10
+ 50 |       10 |     10
 (3 rows)
 
-                QUERY PLAN                 
--------------------------------------------
- Gather
-   Workers Planned: 2
-   ->  Parallel Seq Scan on test_parallel
-         Filter: (data ~~ '%id=50%'::text)
-(4 rows)
-
+-- Test 5: Verify filter on delta column works with parallel scan
+SELECT id, version FROM test_parallel 
+WHERE data LIKE '%id=25 version=5%'
+ORDER BY id, version;
  id | version 
 ----+---------
- 50 |      10
+ 25 |       5
 (1 row)
 
-RESET
-RESET
-RESET
-RESET
-SET
- sequential_count 
-------------------
-             2000
-(1 row)
-
-SET
-SET
-SET
-SET
- parallel_count 
-----------------
-           2000
-(1 row)
-
-RESET
-RESET
-RESET
-RESET
-DROP TABLE
+-- Reset parallel settings
+RESET max_parallel_workers_per_gather;
+RESET parallel_tuple_cost;
+RESET parallel_setup_cost;
+RESET min_parallel_table_scan_size;
+-- Clean up
+DROP TABLE test_parallel;

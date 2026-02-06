@@ -16,7 +16,7 @@ DROP TABLE IF EXISTS test_idx_existing;
 CREATE TABLE test_idx_basic (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 -- Check that _xp_seq index was created automatically
@@ -38,7 +38,7 @@ SELECT indexname FROM pg_indexes WHERE tablename = 'test_idx_basic';
 CREATE TABLE test_idx_configured (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 -- Before configure: should have basic _xp_seq index
@@ -74,7 +74,7 @@ WHERE tablename = 'test_idx_configured' AND indexname LIKE '%xp_seq_idx';
 CREATE TABLE test_idx_existing (
     id INT,
     ver INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 -- Configure FIRST so we can have multiple groups

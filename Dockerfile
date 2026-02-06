@@ -1,5 +1,5 @@
 # pg-xpatch production image
-# PostgreSQL 16 with pg-xpatch extension pre-installed
+# PostgreSQL with pg-xpatch extension pre-installed
 #
 # Usage:
 #   docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=secret ghcr.io/imgajeed76/pg-xpatch:latest
@@ -7,17 +7,20 @@
 # Then connect and enable:
 #   psql -h localhost -U postgres -c "CREATE EXTENSION pg_xpatch;"
 
-FROM postgres:16 AS builder
+ARG PG_MAJOR=16
+FROM postgres:${PG_MAJOR} AS builder
 
+ARG PG_MAJOR=16
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    postgresql-server-dev-16 \
+    postgresql-server-dev-${PG_MAJOR} \
     curl \
-    git \
-    clang \
+    ca-certificates \
     pkg-config \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust
@@ -32,15 +35,18 @@ WORKDIR /build
 # Copy source
 COPY . .
 
-# Build
-RUN make clean && make && make install
+# Build without LLVM bitcode (simpler, JIT not critical for this extension)
+RUN make clean && make USE_PGXS=1 WITH_LLVM=no && make install USE_PGXS=1 WITH_LLVM=no
 
 # --- Production image ---
-FROM postgres:16
+ARG PG_MAJOR=16
+FROM postgres:${PG_MAJOR}
+
+ARG PG_MAJOR=16
 
 # Copy built extension from builder
-COPY --from=builder /usr/lib/postgresql/16/lib/pg_xpatch.so /usr/lib/postgresql/16/lib/
-COPY --from=builder /usr/share/postgresql/16/extension/pg_xpatch.control /usr/share/postgresql/16/extension/
-COPY --from=builder /usr/share/postgresql/16/extension/pg_xpatch--*.sql /usr/share/postgresql/16/extension/
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pg_xpatch.so /usr/lib/postgresql/${PG_MAJOR}/lib/
+COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/pg_xpatch.control /usr/share/postgresql/${PG_MAJOR}/extension/
+COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/pg_xpatch--*.sql /usr/share/postgresql/${PG_MAJOR}/extension/
 
 RUN echo "shared_preload_libraries = 'pg_xpatch'" >> /usr/share/postgresql/postgresql.conf.sample

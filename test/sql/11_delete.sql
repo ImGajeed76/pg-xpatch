@@ -11,7 +11,7 @@ SET client_min_messages = warning;
 CREATE TABLE test_delete_basic (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_delete_basic',
@@ -46,7 +46,7 @@ DROP TABLE test_delete_basic;
 CREATE TABLE test_delete_cascade (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_delete_cascade',
@@ -86,7 +86,7 @@ DROP TABLE test_delete_cascade;
 CREATE TABLE test_delete_all (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_delete_all',
@@ -124,7 +124,7 @@ DROP TABLE test_delete_all;
 CREATE TABLE test_delete_reinsert (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_delete_reinsert',
@@ -159,7 +159,7 @@ DROP TABLE test_delete_reinsert;
 CREATE TABLE test_update_blocked (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_update_blocked',
@@ -186,7 +186,7 @@ DROP TABLE test_update_blocked;
 
 CREATE TABLE test_delete_no_group (
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_delete_no_group',

@@ -38,6 +38,8 @@
 #include "xpatch_tam.h"
 #include "xpatch_cache.h"
 #include "xpatch_seq_cache.h"
+#include "xpatch_insert_cache.h"
+#include "xpatch_encode_pool.h"
 #include "xpatch_compress.h"
 #include "xpatch_config.h"
 
@@ -124,13 +126,41 @@ _PG_init(void)
             NULL, NULL, NULL
         );
 
+        DefineCustomIntVariable(
+            "pg_xpatch.insert_cache_slots",
+            "Number of FIFO insert cache slots",
+            "Controls how many (table, group) pairs can have active insert caches simultaneously",
+            &xpatch_insert_cache_slots,
+            XPATCH_DEFAULT_INSERT_CACHE_SLOTS,  /* default 16 */
+            1,                                   /* min */
+            256,                                 /* max */
+            PGC_POSTMASTER,
+            0,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.encode_threads",
+            "Number of worker threads for parallel delta encoding",
+            "Controls the thread pool size for parallel encoding during INSERT (0 = sequential)",
+            &xpatch_encode_threads,
+            XPATCH_DEFAULT_ENCODE_THREADS,  /* default 0 (disabled) */
+            0,                               /* min */
+            XPATCH_MAX_ENCODE_THREADS,       /* max 64 */
+            PGC_USERSET,                     /* can be changed per-session */
+            0,
+            NULL, NULL, NULL
+        );
+
         /* Request shared memory for caches - hooks into shmem_request_hook */
         xpatch_cache_request_shmem();
         xpatch_seq_cache_request_shmem();
+        xpatch_insert_cache_request_shmem();
 
-        elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries (xpatch library %s, cache %d MB, group_cache %d MB, tid_cache %d MB)",
+        elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries (xpatch library %s, cache %d MB, group_cache %d MB, tid_cache %d MB, insert_cache_slots %d, encode_threads %d)",
              PG_XPATCH_VERSION, xpatch_lib_version(), xpatch_cache_size_mb,
-             xpatch_group_cache_size_mb, xpatch_tid_cache_size_mb);
+             xpatch_group_cache_size_mb, xpatch_tid_cache_size_mb,
+             xpatch_insert_cache_slots, xpatch_encode_threads);
     }
     else
     {

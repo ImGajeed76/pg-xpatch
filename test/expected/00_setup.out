@@ -1,22 +1,38 @@
-SET
-DROP EXTENSION
-CREATE EXTENSION
-SET
+-- Test 00: Extension Setup
+-- Verify pg_xpatch extension loads correctly and all components are registered
+-- Suppress NOTICE messages for cleaner test output
+SET client_min_messages = warning;
+-- Clean up any existing test tables and extension
+DROP EXTENSION IF EXISTS pg_xpatch CASCADE;
+-- Create the extension
+CREATE EXTENSION pg_xpatch;
+-- Restore default message level
+SET client_min_messages = notice;
+-- Verify extension is installed
+SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_xpatch';
   extname  | extversion 
 -----------+------------
- pg_xpatch | 0.1.0
+ pg_xpatch | 0.4.0
 (1 row)
 
+-- Verify access method is registered
+SELECT amname, amtype FROM pg_am WHERE amname = 'xpatch';
  amname | amtype 
 --------+--------
  xpatch | t
 (1 row)
 
+-- Verify version function works (just check it returns something)
+SELECT xpatch_version() IS NOT NULL AS version_ok;
  version_ok 
 ------------
  t
 (1 row)
 
+-- Verify utility functions exist
+SELECT proname FROM pg_proc 
+WHERE proname IN ('xpatch_stats', 'xpatch_inspect', 'xpatch_cache_stats')
+ORDER BY proname;
       proname       
 --------------------
  xpatch_cache_stats
@@ -24,16 +40,22 @@ SET
  xpatch_stats
 (3 rows)
 
+-- Verify the xpatch schema exists
+SELECT nspname FROM pg_namespace WHERE nspname = 'xpatch';
  nspname 
 ---------
  xpatch
 (1 row)
 
+-- Verify the table_config table exists
+SELECT tablename FROM pg_tables WHERE schemaname = 'xpatch' AND tablename = 'table_config';
   tablename   
 --------------
  table_config
 (1 row)
 
+-- Verify the configure function exists
+SELECT proname FROM pg_proc WHERE proname = 'configure' AND pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'xpatch');
   proname  
 -----------
  configure

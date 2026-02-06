@@ -15,7 +15,7 @@ DROP TABLE IF EXISTS test_edge_special;
 -- Test 1: Empty table operations
 -- ================================================================
 
-CREATE TABLE test_edge_empty (id INT, ver INT, data TEXT) USING xpatch;
+CREATE TABLE test_edge_empty (id INT, ver INT, data TEXT NOT NULL) USING xpatch;
 
 -- SELECT on empty table
 SELECT 
@@ -45,7 +45,7 @@ FROM test_edge_empty WHERE id = 1;
 -- Test 2: Single row table
 -- ================================================================
 
-CREATE TABLE test_edge_single (id INT, ver INT, data TEXT) USING xpatch;
+CREATE TABLE test_edge_single (id INT, ver INT, data TEXT NOT NULL) USING xpatch;
 INSERT INTO test_edge_single VALUES (1, 1, 'Only row');
 
 -- Single row is a keyframe (no delta)
@@ -68,7 +68,7 @@ CREATE TABLE test_edge_types (
     ver INT,
     json_data JSON,
     jsonb_data JSONB,
-    bytea_data BYTEA,
+    bytea_data BYTEA NOT NULL,
     array_data INT[],
     numeric_data NUMERIC(20,5),
     ts_data TIMESTAMP,
@@ -128,7 +128,7 @@ FROM test_edge_types WHERE ver = 2;
 -- Test 4: Large data values
 -- ================================================================
 
-CREATE TABLE test_edge_large (id INT, ver INT, data TEXT) USING xpatch;
+CREATE TABLE test_edge_large (id INT, ver INT, data TEXT NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_edge_large', group_by => 'id');
 
 -- Insert large text (1MB)
@@ -147,7 +147,7 @@ FROM test_edge_large WHERE ver = 2;
 -- Test 5: Special characters in data
 -- ================================================================
 
-CREATE TABLE test_edge_special (id INT, ver INT, data TEXT) USING xpatch;
+CREATE TABLE test_edge_special (id INT, ver INT, data TEXT NOT NULL) USING xpatch;
 
 -- Insert with special characters
 INSERT INTO test_edge_special VALUES (1, 1, E'Line1\nLine2\tTabbed');
@@ -174,15 +174,16 @@ FROM test_edge_special WHERE ver = 1;
 -- ================================================================
 
 DROP TABLE IF EXISTS test_edge_nulls;
-CREATE TABLE test_edge_nulls (id INT, ver INT, data TEXT, optional TEXT) USING xpatch;
+CREATE TABLE test_edge_nulls (id INT, ver INT, data TEXT NOT NULL, optional TEXT) USING xpatch;
 SELECT xpatch.configure('test_edge_nulls', group_by => 'id');
 
--- Insert with NULL values
+-- Insert with NULL values in non-delta column (optional)
+-- Note: data is NOT NULL because it's a delta column
 INSERT INTO test_edge_nulls VALUES (1, 1, 'Has data', NULL);
-INSERT INTO test_edge_nulls VALUES (1, 2, NULL, 'Has optional');
+INSERT INTO test_edge_nulls VALUES (1, 2, 'Also has data', 'Has optional');
 INSERT INTO test_edge_nulls VALUES (1, 3, 'Both', 'Both');
 
--- Verify NULL handling
+-- Verify NULL handling in non-delta column
 SELECT 
     CASE WHEN optional IS NULL 
          THEN 'PASS: NULL preserved v1' 
@@ -191,9 +192,9 @@ SELECT
 FROM test_edge_nulls WHERE ver = 1;
 
 SELECT 
-    CASE WHEN data IS NULL 
-         THEN 'PASS: NULL preserved v2' 
-         ELSE 'FAIL: NULL not preserved v2' 
+    CASE WHEN optional IS NOT NULL 
+         THEN 'PASS: Value preserved v2' 
+         ELSE 'FAIL: Value not preserved v2' 
     END as result
 FROM test_edge_nulls WHERE ver = 2;
 
@@ -202,7 +203,7 @@ FROM test_edge_nulls WHERE ver = 2;
 -- ================================================================
 
 DROP TABLE IF EXISTS test_edge_many_groups;
-CREATE TABLE test_edge_many_groups (id INT, ver INT, data TEXT) USING xpatch;
+CREATE TABLE test_edge_many_groups (id INT, ver INT, data TEXT NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_edge_many_groups', group_by => 'id');
 
 -- Create 1000 groups with 1 row each
@@ -223,7 +224,7 @@ FROM xpatch_stats('test_edge_many_groups');
 -- ================================================================
 
 DROP TABLE IF EXISTS test_edge_deep;
-CREATE TABLE test_edge_deep (id INT, ver INT, data TEXT) USING xpatch;
+CREATE TABLE test_edge_deep (id INT, ver INT, data TEXT NOT NULL) USING xpatch;
 SELECT xpatch.configure('test_edge_deep', group_by => 'id', keyframe_every => 10);
 
 -- Create 100 versions for one group

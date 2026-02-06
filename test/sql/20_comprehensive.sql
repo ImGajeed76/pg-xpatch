@@ -13,8 +13,8 @@ SET client_min_messages = warning;
 CREATE TABLE test_nulls (
     doc_id INT,
     version INT,
-    content TEXT,
-    metadata TEXT
+    content TEXT NOT NULL,
+    metadata TEXT NOT NULL NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_nulls',
@@ -50,7 +50,7 @@ DROP TABLE test_nulls;
 CREATE TABLE test_special_chars (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_special_chars',
@@ -98,7 +98,7 @@ DROP TABLE test_special_chars;
 CREATE TABLE test_long_chain (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_long_chain',
@@ -135,7 +135,7 @@ DROP TABLE test_long_chain;
 CREATE TABLE test_multi_group (
     group_id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_multi_group',
@@ -173,7 +173,7 @@ DROP TABLE test_multi_group;
 CREATE TABLE test_delete_edge (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_delete_edge',
@@ -219,7 +219,7 @@ DROP TABLE test_delete_edge;
 CREATE TABLE test_indexes (
     doc_id INT,
     version INT,
-    content TEXT,
+    content TEXT NOT NULL,
     category TEXT
 ) USING xpatch;
 
@@ -270,7 +270,7 @@ CREATE TABLE test_aggregates (
     group_id INT,
     version INT,
     value INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_aggregates',
@@ -315,7 +315,7 @@ DROP TABLE test_aggregates;
 CREATE TABLE test_docs (
     doc_id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_docs',
@@ -326,7 +326,7 @@ SELECT xpatch.configure('test_docs',
 
 CREATE TABLE test_metadata (
     doc_id INT PRIMARY KEY,
-    title TEXT
+    title TEXT NOT NULL
 );
 
 INSERT INTO test_docs VALUES (1, 1, 'v1');
@@ -368,7 +368,7 @@ DROP TABLE test_metadata;
 CREATE TABLE test_txn (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_txn',
@@ -428,7 +428,7 @@ DROP TABLE test_txn;
 CREATE TABLE test_orm (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_orm',
@@ -479,9 +479,9 @@ DROP TABLE test_orm;
 CREATE TABLE test_multi_delta (
     id INT,
     version INT,
-    title TEXT,
-    body TEXT,
-    metadata JSONB
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    metadata JSONB NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_multi_delta',
@@ -514,7 +514,7 @@ DROP TABLE test_multi_delta;
 CREATE TABLE test_concurrent (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_concurrent',
@@ -554,7 +554,7 @@ DROP TABLE IF EXISTS test_errors;
 CREATE TABLE test_errors (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_errors',
@@ -566,20 +566,18 @@ SELECT xpatch.configure('test_errors',
 INSERT INTO test_errors VALUES (1, 1, 'first');
 INSERT INTO test_errors VALUES (1, 2, 'second');
 
--- Test: INSERT with duplicate/lower version should fail
-\set ON_ERROR_STOP off
-INSERT INTO test_errors VALUES (1, 1, 'duplicate'); -- Should fail
-INSERT INTO test_errors VALUES (1, 0, 'lower'); -- Should fail
-\set ON_ERROR_STOP on
+-- Duplicate/lower version values are now allowed (auto-seq handles ordering)
+INSERT INTO test_errors VALUES (1, 1, 'duplicate version value');
+INSERT INTO test_errors VALUES (1, 0, 'lower version value');
 
 -- Test: UPDATE should fail
 \set ON_ERROR_STOP off
 UPDATE test_errors SET data = 'modified' WHERE id = 1 AND version = 1; -- Should fail
 \set ON_ERROR_STOP on
 
--- Verify table is still intact
-SELECT 'Table still intact after errors:' as test;
-SELECT * FROM test_errors ORDER BY version;
+-- Verify table has all 4 rows
+SELECT 'Table has all rows:' as test;
+SELECT id, version, data FROM test_errors ORDER BY _xp_seq;
 
 DROP TABLE test_errors;
 
@@ -592,7 +590,7 @@ DROP TABLE test_errors;
 CREATE TABLE test_stats (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_stats',

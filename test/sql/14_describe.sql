@@ -16,7 +16,7 @@ DROP TABLE IF EXISTS test_describe_unusual;
 CREATE TABLE test_describe_basic (
     id INT,
     version INT,
-    data TEXT
+    data TEXT NOT NULL
 ) USING xpatch;
 
 -- Insert some data
@@ -33,8 +33,8 @@ WHERE property IN ('config_source', 'group_by', 'order_by', '_xp_seq column', 'd
 CREATE TABLE test_describe_configured (
     doc_id INT,
     rev INT,
-    title TEXT,
-    body TEXT
+    title TEXT NOT NULL,
+    body TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_describe_configured', 
@@ -87,7 +87,7 @@ WHERE property LIKE 'column%';
 -- ================================================================
 
 DROP TABLE IF EXISTS test_describe_empty;
-CREATE TABLE test_describe_empty (id INT, ver INT, data TEXT) USING xpatch;
+CREATE TABLE test_describe_empty (id INT, ver INT, data TEXT NOT NULL) USING xpatch;
 
 -- Describe should work on empty table
 SELECT property, value FROM xpatch.describe('test_describe_empty')

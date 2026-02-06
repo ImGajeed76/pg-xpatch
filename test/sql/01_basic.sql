@@ -8,7 +8,7 @@ SET client_min_messages = warning;
 CREATE TABLE test_basic (
     id INT,
     version INT,
-    content TEXT
+    content TEXT NOT NULL
 ) USING xpatch;
 
 -- Insert some rows
@@ -32,8 +32,8 @@ SELECT COUNT(*) FROM test_basic;
 CREATE TABLE test_configured (
     doc_id INT,
     rev INT,
-    title TEXT,
-    body TEXT
+    title TEXT NOT NULL,
+    body TEXT NOT NULL
 ) USING xpatch;
 
 SELECT xpatch.configure('test_configured', 

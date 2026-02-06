@@ -13,6 +13,9 @@ OBJS = src/pg_xpatch.o \
        src/xpatch_compress.o \
        src/xpatch_cache.o \
        src/xpatch_seq_cache.o \
+       src/xpatch_insert_cache.o \
+       src/xpatch_encode_pool.o \
+       src/xpatch_stats_cache.o \
        src/xpatch_utils.o \
        lib/blake3/blake3.o \
        lib/blake3/blake3_dispatch.o \
@@ -50,14 +53,18 @@ SHLIB_LINK_INTERNAL = $(BLAKE3_ASM_OBJS)
 
 # Extension data files
 DATA = sql/pg_xpatch--0.1.0.sql sql/pg_xpatch--0.1.1.sql sql/pg_xpatch--0.2.0.sql \
-       sql/pg_xpatch--0.1.0--0.1.1.sql sql/pg_xpatch--0.1.1--0.2.0.sql
+       sql/pg_xpatch--0.2.1.sql sql/pg_xpatch--0.3.0.sql sql/pg_xpatch--0.3.1.sql \
+       sql/pg_xpatch--0.4.0.sql sql/pg_xpatch--0.1.0--0.1.1.sql \
+       sql/pg_xpatch--0.1.1--0.2.0.sql sql/pg_xpatch--0.2.0--0.2.1.sql \
+       sql/pg_xpatch--0.2.1--0.3.0.sql sql/pg_xpatch--0.3.0--0.3.1.sql \
+       sql/pg_xpatch--0.3.1--0.4.0.sql
 EXTRA_CLEAN = lib/libxpatch_c.a lib/xpatch.h lib/blake3/*.o
 
 # Regression tests
 REGRESS = 00_setup 01_basic 02_compression 03_reconstruction 04_keyframes \
           05_cache 06_errors 07_indexes 08_parallel 09_multi_delta 10_no_group \
           11_delete 12_vacuum 13_crash_recovery 14_describe 15_warm_cache \
-          16_auto_index 17_edge_cases 18_restore_mode 20_comprehensive
+          16_auto_index 17_edge_cases 18_restore_mode 19_stats_cache 20_comprehensive
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 # Link against static xpatch library

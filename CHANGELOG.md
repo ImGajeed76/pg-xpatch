@@ -2,6 +2,81 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
+## [0.4.0] - 2026-01-31
+
+### Added
+
+- **Stats cache**: Statistics are now stored in `xpatch.group_stats` table and updated incrementally on INSERT/DELETE. The `xpatch.stats()` function now returns instantly (~0.4ms) instead of scanning the entire table.
+
+- **New utility functions**:
+  - `xpatch.refresh_stats(table)` - Force recalculate stats by full table scan (rarely needed)
+  - `xpatch.physical(table)` - View raw physical storage including delta bytes
+  - `xpatch.stats_exist(table)` - Check if stats cache exists for a table
+
+### Changed
+
+- **Delta columns must be NOT NULL**: The `xpatch.configure()` function now validates that delta columns have a NOT NULL constraint. Attempting to configure a nullable column for delta compression will raise an error with a helpful message.
+
+- **Function naming**: All utility functions now use schema-qualified names (`xpatch.stats()`, `xpatch.inspect()`, `xpatch.cache_stats()`, `xpatch.version()`). The old unqualified names (`xpatch_stats()`, etc.) still work for backwards compatibility.
+
+### Fixed
+
+- **Advisory lock hashing**: Fixed a bug where TEXT group values would hash the pointer instead of the content when computing advisory lock IDs. Now uses BLAKE3 consistently.
+
+- **Raw size tracking in stats**: Stats refresh now decodes delta columns to get actual uncompressed sizes, consistent with INSERT tracking.
+
+- **Empty group handling**: When a group has 0 visible rows after DELETE, its stats are now properly deleted from `xpatch.group_stats`.
+
+- **NULL group validation**: Inserting a NULL value into the group_by column now raises a clear error instead of causing undefined behavior. The group column must have a non-NULL value for each row.
+
+## [0.3.1] - 2025-01-29
+
+### Fixed
+
+- **Critical: Insert cache race condition** - Fixed a race condition where insert cache slots could be evicted while another process was still using them, leading to delta encoding corruption and "xpatch decode error" on read. The fix validates ownership (relid + group_hash) after acquiring the lock; if the slot was evicted, operations gracefully fall back to reconstruction.
+
+### Added
+
+- **Insert cache stats function** - Added `xpatch_insert_cache_stats()` / `xpatch.insert_cache_stats()` to monitor insert cache health. Returns `slots_in_use`, `total_slots`, `hits`, `misses`, `evictions`, and `eviction_misses` (race condition detections).
+
+- **Eviction miss warning** - When a race condition is detected, a WARNING is logged once per backend suggesting to increase `pg_xpatch.insert_cache_slots` or reduce concurrent writers.
+
+## [0.3.0] - 2025-01-28 [YANKED - DO NOT USE]
+
+**WARNING: This version contains a critical bug that can cause data corruption under concurrent writes. Upgrade to v0.3.1 immediately.**
+
+### Added
+
+- **FIFO insert cache**: DSA-backed per-group ring buffer that caches the last `compress_depth` reconstructed row contents, eliminating O(depth) reconstruction on the warm INSERT path. Configurable via `pg_xpatch.insert_cache_slots` GUC (default 16).
+
+- **Lock-free encode thread pool**: Persistent pthread pool for parallelizing `xpatch_encode()` FFI calls with lock-free task dispatch via atomic fetch-add. Configurable via `pg_xpatch.encode_threads` GUC (default 0, opt-in).
+
+### Performance
+
+- **10.7x INSERT speedup** at depth=1000, 2KB payloads:
+  - v0.2.1 baseline: 16.3s for 1000 inserts
+  - Warm path sequential: 4.6s (3.5x faster)
+  - Warm path with encode_threads=4: 1.5s (10.7x faster)
+
+### Changed
+
+- **Removed version validation**: The `order_by` column is no longer enforced to be strictly increasing. Previously, inserting a duplicate or lower version number would error. Now, the user's version column is treated as regular data, and `_xp_seq` handles all internal ordering. This simplifies the insert path and removes the overhead of version checking.
+
+- **Simplified restore mode**: Explicit `_xp_seq` values are now always honored when provided (value > 0). The `pg_xpatch.restore_mode` GUC has been removed. This makes `pg_dump`/`pg_restore` work out of the box without any special configuration.
+
+- **Auto-seq mode**: Using `_xp_seq=0` as sentinel now skips version validation and enables warm insert path.
+
+### Fixed
+
+- **CI/CD release notes**: Docker image tag in release notes now correctly shows version without `v` prefix (e.g., `0.3.0` instead of `v0.3.0`).
+
+- **Cache invalidation**: Added insert cache invalidation to DELETE/TRUNCATE/VACUUM paths.
+
+### Removed
+
+- `pg_xpatch.restore_mode` GUC - no longer needed, restore mode is automatic when `_xp_seq` is explicitly provided
+- `xpatch_compare_versions()` internal function - version comparison no longer performed
+
 ## [0.1.0] - 2025-01-19
 
 Initial release.
@@ -42,6 +117,22 @@ Initial release.
 - Append-only (no UPDATE support - by design)
 - Basic MVCC only
 - PostgreSQL 16 only
+
+## [0.2.1] - 2025-01-22
+
+### Fixed
+
+- **TOAST support for large tuples**: Fixed "row is too big" error when inserting large content (>8KB). Now properly calls `heap_toast_insert_or_update()` to move large attributes to the TOAST table. Tested with files up to 1MB.
+- **Sequence gap on failed insert**: Fixed critical bug where failed INSERTs would consume sequence numbers, creating gaps in delta chains that caused corruption. Now uses `PG_TRY/CATCH` to rollback sequence allocation on failure.
+- **Keyframe fallback for missing base rows**: Delta encoding now gracefully handles missing base rows (from previous failed inserts) by falling back to keyframe encoding instead of erroring.
+- **O(n²) performance in `fetch_by_seq`**: Optimized from O(n²) sequential scan to O(log n) using index scan + seq-to-TID cache. INSERT speed improved ~18x (90 rows/s → 1600 rows/s).
+- **TRUNCATE cache invalidation**: Fixed cache not being invalidated on TRUNCATE. Added invalidation to `relation_set_new_filelocator()` callback.
+
+### Changed
+
+- `xpatch_logical_to_physical()` now returns allocated sequence via output parameter for rollback support
+- Added `xpatch_seq_cache_rollback_seq()` function to decrement sequence on failed insert
+- `xpatch_reconstruct_column()` now returns NULL instead of ERROR when row is missing
 
 ## [0.2.0] - 2025-01-20
 

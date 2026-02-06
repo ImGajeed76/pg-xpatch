@@ -1,0 +1,146 @@
+-- Test 18: Restore Mode for pg_dump/pg_restore
+-- Tests that explicit _xp_seq values are honored during INSERT/COPY.
+-- This enables pg_dump/pg_restore to work correctly with xpatch tables.
+-- Suppress NOTICE messages for cleaner test output
+SET client_min_messages = warning;
+-- =============================================================================
+-- Test 1: Normal insert - _xp_seq auto-allocated
+-- =============================================================================
+CREATE TABLE restore_test1 (
+    doc_id INT,
+    version INT,
+    _xp_seq INT,
+    content TEXT NOT NULL
+) USING xpatch;
+SELECT xpatch.configure('restore_test1', 
+    group_by => 'doc_id', 
+    order_by => 'version',
+    delta_columns => ARRAY['content']);
+ configure 
+-----------
+ 
+(1 row)
+
+-- Normal insert without _xp_seq (auto-generates _xp_seq = 1)
+INSERT INTO restore_test1 (doc_id, version, content) VALUES (1, 1, 'Version 1');
+-- Check _xp_seq was auto-generated
+SELECT doc_id, version, _xp_seq FROM restore_test1;
+ doc_id | version | _xp_seq 
+--------+---------+---------
+      1 |       1 |       1
+(1 row)
+
+-- =============================================================================
+-- Test 2: Explicit _xp_seq is honored (restore mode)
+-- =============================================================================
+-- Insert with explicit _xp_seq = 2 (simulates pg_restore)
+INSERT INTO restore_test1 (doc_id, version, _xp_seq, content) VALUES (1, 2, 2, 'Version 2');
+-- Verify explicit _xp_seq was used
+SELECT doc_id, version, _xp_seq FROM restore_test1 ORDER BY _xp_seq;
+ doc_id | version | _xp_seq 
+--------+---------+---------
+      1 |       1 |       1
+      1 |       2 |       2
+(2 rows)
+
+-- Auto-insert should continue from seq 3
+INSERT INTO restore_test1 (doc_id, version, content) VALUES (1, 3, 'Version 3');
+-- Verify seq 3 was assigned
+SELECT doc_id, version, _xp_seq FROM restore_test1 ORDER BY _xp_seq;
+ doc_id | version | _xp_seq 
+--------+---------+---------
+      1 |       1 |       1
+      1 |       2 |       2
+      1 |       3 |       3
+(3 rows)
+
+-- =============================================================================
+-- Test 3: Multi-group restore with interleaved data
+-- =============================================================================
+CREATE TABLE restore_test2 (
+    doc_id INT,
+    version INT,
+    _xp_seq INT,
+    content TEXT NOT NULL
+) USING xpatch;
+SELECT xpatch.configure('restore_test2', 
+    group_by => 'doc_id', 
+    order_by => 'version',
+    delta_columns => ARRAY['content']);
+ configure 
+-----------
+ 
+(1 row)
+
+-- Simulate COPY FROM / pg_restore: data comes in table order with explicit _xp_seq
+INSERT INTO restore_test2 (doc_id, version, _xp_seq, content) VALUES 
+    (1, 1, 1, 'Doc 1 v1'),
+    (1, 2, 2, 'Doc 1 v2'),
+    (1, 3, 3, 'Doc 1 v3'),
+    (2, 1, 1, 'Doc 2 v1'),
+    (2, 2, 2, 'Doc 2 v2');
+-- Verify all rows were inserted with correct _xp_seq
+SELECT doc_id, version, _xp_seq, content FROM restore_test2 ORDER BY doc_id, version;
+ doc_id | version | _xp_seq | content  
+--------+---------+---------+----------
+      1 |       1 |       1 | Doc 1 v1
+      1 |       2 |       2 | Doc 1 v2
+      1 |       3 |       3 | Doc 1 v3
+      2 |       1 |       1 | Doc 2 v1
+      2 |       2 |       2 | Doc 2 v2
+(5 rows)
+
+-- =============================================================================
+-- Test 4: dump_configs() generates correct SQL
+-- =============================================================================
+SELECT 'Testing dump_configs():' AS test;
+          test           
+-------------------------
+ Testing dump_configs():
+(1 row)
+
+-- Check that enable_zstd outputs as 'true'/'false' not 't'/'f'
+SELECT dc FROM xpatch.dump_configs() dc WHERE dc LIKE '%restore_test1%';
+                                                                                              dc                                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ SELECT xpatch.configure('public.restore_test1', group_by => 'doc_id', order_by => 'version', delta_columns => '{content}', keyframe_every => 100, compress_depth => 1, enable_zstd => true);
+(1 row)
+
+-- =============================================================================
+-- Test 5: Continue inserting after restore
+-- =============================================================================
+-- Insert new rows into restored table (auto-allocate continues from max)
+INSERT INTO restore_test2 (doc_id, version, content) VALUES 
+    (1, 4, 'Doc 1 v4 - post-restore'),
+    (2, 3, 'Doc 2 v3 - post-restore');
+-- Verify correct sequence numbers were assigned (4 and 3 respectively)
+SELECT doc_id, version, _xp_seq, content FROM restore_test2 ORDER BY doc_id, version;
+ doc_id | version | _xp_seq |         content         
+--------+---------+---------+-------------------------
+      1 |       1 |       1 | Doc 1 v1
+      1 |       2 |       2 | Doc 1 v2
+      1 |       3 |       3 | Doc 1 v3
+      1 |       4 |       4 | Doc 1 v4 - post-restore
+      2 |       1 |       1 | Doc 2 v1
+      2 |       2 |       2 | Doc 2 v2
+      2 |       3 |       3 | Doc 2 v3 - post-restore
+(7 rows)
+
+-- Verify reconstruction still works
+SELECT doc_id, version, content FROM restore_test2 WHERE doc_id = 1 AND version = 2;
+ doc_id | version | content  
+--------+---------+----------
+      1 |       2 | Doc 1 v2
+(1 row)
+
+-- =============================================================================
+-- Cleanup
+-- =============================================================================
+DROP TABLE restore_test1;
+DROP TABLE restore_test2;
+SELECT 'Restore mode tests completed successfully!' AS result;
+                   result                   
+--------------------------------------------
+ Restore mode tests completed successfully!
+(1 row)
+
