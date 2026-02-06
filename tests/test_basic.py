@@ -12,12 +12,16 @@ Covers:
 - NULL group_by value raises error
 - _xp_seq populated automatically
 - INSERT RETURNING
+- COPY FROM/TO
+- DROP TABLE config cleanup
 """
 
 from __future__ import annotations
 
 import psycopg
 import pytest
+
+import io
 
 from conftest import insert_rows, insert_versions, row_count
 
@@ -633,3 +637,174 @@ class TestEdgeCases:
             assert row["content"] == f"v{check_v}", (
                 f"Version {check_v}: expected 'v{check_v}', got '{row['content']}'"
             )
+
+
+# ---------------------------------------------------------------------------
+# COPY FROM/TO
+# ---------------------------------------------------------------------------
+
+
+class TestCopyFromTo:
+    """COPY exercises the multi_insert path in xpatch_tam.c."""
+
+    def test_copy_from_stdin(self, db: psycopg.Connection, make_table):
+        """COPY FROM STDIN inserts rows correctly through multi_insert."""
+        t = make_table()
+        # Build TSV data: group_id, version, content
+        lines = []
+        for v in range(1, 11):
+            lines.append(f"1\t{v}\tCopy version {v}")
+        tsv = "\n".join(lines) + "\n"
+
+        with db.cursor() as cur:
+            with cur.copy(
+                f"COPY {t} (group_id, version, content) FROM STDIN"
+            ) as copy:
+                copy.write(tsv.encode())
+
+        assert row_count(db, t) == 10
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        for row in rows:
+            assert row["content"] == f"Copy version {row['version']}"
+
+    def test_copy_to_stdout(self, db: psycopg.Connection, make_table):
+        """COPY TO STDOUT exports delta-reconstructed content."""
+        t = make_table()
+        for v in range(1, 6):
+            insert_rows(db, t, [(1, v, f"Export v{v}")])
+
+        buf = io.BytesIO()
+        with db.cursor() as cur:
+            with cur.copy(
+                f"COPY {t} (group_id, version, content) TO STDOUT"
+            ) as copy:
+                for data in copy:
+                    buf.write(data)
+
+        output = buf.getvalue().decode()
+        lines = [l for l in output.strip().split("\n") if l]
+        assert len(lines) == 5
+        for line in lines:
+            parts = line.split("\t")
+            assert len(parts) == 3
+            gid, ver, content = parts
+            assert content == f"Export v{ver}"
+
+    def test_copy_from_multiple_groups(self, db: psycopg.Connection, make_table):
+        """COPY FROM with multiple groups inserts correctly."""
+        t = make_table()
+        lines = []
+        for g in range(1, 4):
+            for v in range(1, 6):
+                lines.append(f"{g}\t{v}\tg{g}v{v}")
+        tsv = "\n".join(lines) + "\n"
+
+        with db.cursor() as cur:
+            with cur.copy(
+                f"COPY {t} (group_id, version, content) FROM STDIN"
+            ) as copy:
+                copy.write(tsv.encode())
+
+        assert row_count(db, t) == 15
+        for g in range(1, 4):
+            rows = db.execute(
+                f"SELECT version, content FROM {t} "
+                f"WHERE group_id = {g} ORDER BY version"
+            ).fetchall()
+            assert len(rows) == 5
+            for row in rows:
+                assert row["content"] == f"g{g}v{row['version']}"
+
+    def test_copy_round_trip(self, db: psycopg.Connection, make_table):
+        """COPY TO then COPY FROM produces identical data."""
+        t1 = make_table()
+        for v in range(1, 6):
+            insert_rows(db, t1, [(1, v, f"Round trip v{v}")])
+
+        # Export
+        buf = io.BytesIO()
+        with db.cursor() as cur:
+            with cur.copy(
+                f"COPY {t1} (group_id, version, content) TO STDOUT"
+            ) as copy:
+                for data in copy:
+                    buf.write(data)
+
+        # Import into a new table
+        t2 = make_table()
+        buf.seek(0)
+        with db.cursor() as cur:
+            with cur.copy(
+                f"COPY {t2} (group_id, version, content) FROM STDIN"
+            ) as copy:
+                copy.write(buf.read())
+
+        # Verify identical
+        rows1 = db.execute(
+            f"SELECT version, content FROM {t1} ORDER BY version"
+        ).fetchall()
+        rows2 = db.execute(
+            f"SELECT version, content FROM {t2} ORDER BY version"
+        ).fetchall()
+        assert len(rows1) == len(rows2) == 5
+        for r1, r2 in zip(rows1, rows2):
+            assert r1["version"] == r2["version"]
+            assert r1["content"] == r2["content"]
+
+
+# ---------------------------------------------------------------------------
+# DROP TABLE config cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestDropTableCleanup:
+    """DROP TABLE triggers xpatch_cleanup_on_drop event trigger."""
+
+    def test_drop_table_removes_config(self, db: psycopg.Connection, make_table):
+        """Dropping an xpatch table removes its entry from xpatch.table_config."""
+        t = make_table()
+        insert_rows(db, t, [(1, 1, "before drop")])
+
+        # Verify config exists
+        cfg = db.execute(
+            f"SELECT * FROM xpatch.table_config WHERE table_name = '{t}'"
+        ).fetchone()
+        assert cfg is not None, "Config should exist before DROP"
+
+        # Drop the table
+        db.execute(f"DROP TABLE {t}")
+
+        # Verify config is cleaned up
+        cfg = db.execute(
+            f"SELECT * FROM xpatch.table_config WHERE table_name = '{t}'"
+        ).fetchone()
+        assert cfg is None, "Config should be removed after DROP TABLE"
+
+    def test_drop_table_cascade_removes_config(self, db: psycopg.Connection, make_table):
+        """DROP TABLE CASCADE also cleans up config."""
+        t = make_table()
+        insert_rows(db, t, [(1, 1, "cascade")])
+
+        db.execute(f"DROP TABLE {t} CASCADE")
+
+        cfg = db.execute(
+            f"SELECT * FROM xpatch.table_config WHERE table_name = '{t}'"
+        ).fetchone()
+        assert cfg is None, "Config should be removed after DROP TABLE CASCADE"
+
+    def test_drop_multiple_tables(self, db: psycopg.Connection, make_table):
+        """Dropping multiple xpatch tables cleans up all configs."""
+        t1 = make_table()
+        t2 = make_table()
+        insert_rows(db, t1, [(1, 1, "t1")])
+        insert_rows(db, t2, [(1, 1, "t2")])
+
+        db.execute(f"DROP TABLE {t1}, {t2}")
+
+        for t in (t1, t2):
+            cfg = db.execute(
+                f"SELECT * FROM xpatch.table_config WHERE table_name = '{t}'"
+            ).fetchone()
+            assert cfg is None, f"Config for {t} should be removed"
