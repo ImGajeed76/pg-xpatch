@@ -2578,31 +2578,38 @@ xpatch_scan_bitmap_next_tuple(TableScanDesc scan,
     LockBuffer(buffer, BUFFER_LOCK_SHARE);
     page = BufferGetPage(buffer);
 
-    /* Find next valid item, skipping dead/unused items without recursion */
+    /*
+     * Find next visible item, skipping dead/unused items and tuples that
+     * fail MVCC visibility.  Without this check, bitmap scans would return
+     * uncommitted or deleted tuples.
+     */
     while (true)
     {
+        if (xscan->bm_index >= xscan->bm_ntuples)
+        {
+            /* Exhausted items on this page */
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            return false;
+        }
+
         off = xscan->bm_offsets[xscan->bm_index++];
         itemId = PageGetItemId(page, off);
 
-        if (ItemIdIsNormal(itemId))
-            break;
+        if (!ItemIdIsNormal(itemId))
+            continue;
 
-        /* If we've exhausted items on this page, try next block */
-        if (xscan->bm_index >= xscan->bm_ntuples)
-        {
-            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-            /* Move to next block by clearing current block state */
-            xscan->bm_block = InvalidBlockNumber;
-            /* Recursion here is fine - it's just one level to get next block */
-            return xpatch_scan_bitmap_next_tuple(scan, tbmres, slot);
-        }
+        /* Extract tuple header for visibility check */
+        tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+        tuple.t_len = ItemIdGetLength(itemId);
+        tuple.t_tableOid = RelationGetRelid(scan->rs_rd);
+        ItemPointerSet(&tuple.t_self, xscan->bm_block, off);
+
+        /* MVCC visibility check — skip invisible tuples */
+        if (!xpatch_tuple_is_visible(&tuple, scan->rs_snapshot))
+            continue;
+
+        break;  /* Found a visible tuple */
     }
-
-    /* Extract the tuple */
-    tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
-    tuple.t_len = ItemIdGetLength(itemId);
-    tuple.t_tableOid = RelationGetRelid(scan->rs_rd);
-    ItemPointerSet(&tuple.t_self, xscan->bm_block, off);
 
     /* Make a copy before releasing lock */
     copy = heap_copytuple(&tuple);

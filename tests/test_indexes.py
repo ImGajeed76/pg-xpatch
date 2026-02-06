@@ -13,6 +13,7 @@ Covers:
 - Index on multiple columns (composite)
 - Deleted row invisible via index scan (MVCC regression)
 - REINDEX CONCURRENTLY (regression test)
+- Index-only scan after DELETE + visibilitymap (C3 — regression guard)
 """
 
 from __future__ import annotations
@@ -487,3 +488,70 @@ class TestReindexConcurrently:
             assert rows[1]["group_id"] == 2
         finally:
             db.execute("SET enable_seqscan = on")
+
+
+# ---------------------------------------------------------------------------
+# C3 — Index-only scan after DELETE + missing visibilitymap_clear()
+# ---------------------------------------------------------------------------
+
+
+class TestVisibilityMapAfterDelete:
+    """DELETE clears ``PageAllVisible`` on the heap page but doesn't call
+    ``visibilitymap_clear()`` (acknowledged in comment at xpatch_tam.c:1395-1399).
+
+    In practice, PostgreSQL's index-only scan still rechecks the heap page
+    when the page flag is cleared, so deleted rows are correctly filtered.
+    The visibility map inconsistency is corrected on the next VACUUM.
+
+    Regression test for C3 audit finding — passes today, guards against
+    future regressions.
+    """
+
+    def test_index_only_scan_after_delete_no_stale_data(
+        self, db: psycopg.Connection, make_table
+    ):
+        """After VACUUM sets all-visible, then DELETE, an index-only scan
+        should NOT return the deleted row.
+
+        Steps:
+        1. Insert rows and create a covering index
+        2. VACUUM to set all-visible bits (both page flag and visibility map)
+        3. DELETE a row (clears PageAllVisible but NOT visibilitymap)
+        4. Force index-only scan — should respect deletion
+        """
+        t = make_table()
+        for g in range(1, 4):
+            insert_versions(db, t, group_id=g, count=5)
+
+        # Create index that covers the query (group_id, version)
+        db.execute(f"CREATE INDEX {t}_cover ON {t} (group_id, version)")
+
+        # VACUUM to set all-visible bits in both heap pages and visibility map
+        db.execute(f"VACUUM {t}")
+        db.execute(f"ANALYZE {t}")
+
+        # Delete group 2 entirely
+        db.execute(f"DELETE FROM {t} WHERE group_id = 2 AND version = 1")
+
+        # Force index-only scan (if planner chooses it with covering index)
+        db.execute("SET enable_seqscan = off")
+        db.execute("SET enable_bitmapscan = off")
+        try:
+            # Check EXPLAIN to see if we actually got index-only scan
+            plan = db.execute(
+                f"EXPLAIN (COSTS OFF) "
+                f"SELECT group_id, version FROM {t} WHERE group_id = 2"
+            ).fetchall()
+            plan_text = "\n".join(r["QUERY PLAN"] for r in plan)
+
+            rows = db.execute(
+                f"SELECT group_id, version FROM {t} WHERE group_id = 2"
+            ).fetchall()
+
+            assert len(rows) == 0, (
+                f"Deleted rows visible via index-only scan after VACUUM "
+                f"(plan: {plan_text}): {rows}"
+            )
+        finally:
+            db.execute("SET enable_seqscan = on")
+            db.execute("SET enable_bitmapscan = on")

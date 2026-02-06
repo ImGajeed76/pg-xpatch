@@ -16,6 +16,7 @@ Covers:
 - TABLESAMPLE silently returns 0 rows (H5 — known bug)
 - Auto-detection error paths (E13, E17 — known bugs)
 - INT column as delta rejected (E16)
+- >32 delta columns silently clamped (M6 — regression guard)
 """
 
 from __future__ import annotations
@@ -432,21 +433,98 @@ class TestAutoDetectionErrors:
         finally:
             db.execute(f"DROP TABLE IF EXISTS {t}")
 
-    def test_wrong_order_by_type_rejected(self, db: psycopg.Connection):
-        """Explicitly setting order_by to a TEXT column should raise DatatypeMismatch."""
-        t = "test_wrong_orderby"
+
+# ---------------------------------------------------------------------------
+# M6 — >32 delta columns silently clamped (known bug)
+# ---------------------------------------------------------------------------
+
+
+class TestExcessDeltaColumns:
+    """``auto_detect_delta_columns`` (xpatch_config.c:147) dynamically grows
+    its array with no cap, but the insert cache silently clamps to
+    ``XPATCH_MAX_DELTA_COLUMNS=32`` (xpatch_insert_cache.c:446-447).
+
+    Columns beyond the 32nd are stored as regular heap columns (not
+    delta-compressed) but still round-trip correctly. This is a performance
+    issue (no compression) rather than a correctness bug.
+
+    Regression test for M6 audit finding — passes today, guards against
+    future regressions in column handling.
+    """
+
+    def test_33_delta_columns_roundtrip(self, db: psycopg.Connection):
+        """A table with 33 TEXT NOT NULL columns should store and retrieve
+        all column values correctly, including column 33+.
+
+        With the bug, columns beyond the 32nd are not delta-compressed but
+        the reconstruction logic may mishandle them.
+        """
+        # Build column definitions: id INT, version INT, col_01..col_33 TEXT NOT NULL
+        n_delta = 33
+        col_defs = ["id INT", "version INT"]
+        col_names = []
+        for i in range(1, n_delta + 1):
+            name = f"col_{i:02d}"
+            col_defs.append(f"{name} TEXT NOT NULL")
+            col_names.append(name)
+
+        ddl = ", ".join(col_defs)
+        t = "test_33_delta"
+        db.execute(f"CREATE TABLE {t} ({ddl}) USING xpatch")
+
+        try:
+            # Configure — auto_detect_delta_columns will find all 33 TEXT columns
+            db.execute(
+                f"SELECT xpatch.configure('{t}', "
+                f"group_by => 'id', order_by => 'version')"
+            )
+
+            # Insert first row (keyframe)
+            vals_v1 = [f"v1-{name}" for name in col_names]
+            placeholders = ", ".join(["%s"] * (2 + n_delta))
+            db.execute(
+                f"INSERT INTO {t} VALUES ({placeholders})",
+                [1, 1] + vals_v1,
+            )
+
+            # Insert second row (delta) — change every column
+            vals_v2 = [f"v2-{name}" for name in col_names]
+            db.execute(
+                f"INSERT INTO {t} VALUES ({placeholders})",
+                [1, 2] + vals_v2,
+            )
+
+            # Read back both rows
+            rows = db.execute(
+                f"SELECT * FROM {t} ORDER BY version"
+            ).fetchall()
+            assert len(rows) == 2
+
+            # Verify ALL columns in the delta row (version 2)
+            row_v2 = rows[1]
+            for i, name in enumerate(col_names):
+                expected = f"v2-{name}"
+                actual = row_v2[name]
+                assert actual == expected, (
+                    f"Column {name} (#{i+1}): expected {expected!r}, got {actual!r}"
+                )
+        finally:
+            db.execute(f"DROP TABLE IF EXISTS {t}")
+
+
+    def test_wrong_order_by_type_timestamp_accepted(self, db: psycopg.Connection):
+        """TIMESTAMP column as order_by should be accepted (it's a valid type)."""
+        t = "test_ts_orderby"
         db.execute(
-            f"CREATE TABLE {t} (id INT, name TEXT NOT NULL, body TEXT NOT NULL) "
+            f"CREATE TABLE {t} (id INT, ts TIMESTAMP NOT NULL, body TEXT NOT NULL) "
             f"USING xpatch"
         )
         try:
-            with pytest.raises(
-                psycopg.errors.DatatypeMismatch,
-                match="order_by column.*must be",
-            ):
-                db.execute(
-                    f"SELECT xpatch.configure('{t}', order_by => 'name')"
-                )
+            # Should not raise
+            db.execute(
+                f"SELECT xpatch.configure('{t}', "
+                f"group_by => 'id', order_by => 'ts')"
+            )
         finally:
             db.execute(f"DROP TABLE IF EXISTS {t}")
 

@@ -16,6 +16,8 @@ Covers:
 - MVCC visibility via index scan (H1 — fixed)
 - SELECT FOR SHARE / FOR KEY SHARE (M11 — fixed)
 - Concurrent DELETE serialization (H4 — fixed)
+- MVCC visibility via sequential scan (C4 — regression guard)
+- MVCC visibility via bitmap scan (H6 — fixed)
 """
 
 from __future__ import annotations
@@ -526,3 +528,167 @@ class TestConcurrentDeleteSerialization:
         ).fetchall()
         for r in rows:
             assert r["content"] is not None
+
+
+# ---------------------------------------------------------------------------
+# C4 — Sequential scan MVCC visibility (known bug: simplified check)
+# ---------------------------------------------------------------------------
+
+
+class TestMvccVisibilitySeqScan:
+    """``xpatch_tuple_is_visible`` (xpatch_tam.c:107-170) used by sequential
+    scans is a simplified MVCC check that doesn't call
+    ``HeapTupleSatisfiesVisibility``. Despite missing some edge cases
+    (FrozenTransactionId, CommandId, snapshot boundaries), it handles the
+    common Read Committed cases correctly.
+
+    Regression tests for C4 audit finding — these pass today but guard
+    against future regressions in the visibility logic.
+    """
+
+    def test_uncommitted_row_invisible_via_seq_scan(
+        self, db: psycopg.Connection, db2: psycopg.Connection, make_table
+    ):
+        """An uncommitted INSERT should not be visible via sequential scan.
+
+        Forces sequential scan by disabling index and bitmap scan.
+        From db2, the uncommitted row inserted by db should NOT be visible.
+        """
+        t = make_table()
+
+        db.autocommit = False
+        try:
+            db.execute(
+                f"INSERT INTO {t} (group_id, version, content) "
+                f"VALUES (1, 1, 'uncommitted')"
+            )
+
+            # Force sequential scan only
+            db2.execute("SET enable_indexscan = off")
+            db2.execute("SET enable_bitmapscan = off")
+            db2.execute("SET enable_seqscan = on")
+            rows = db2.execute(
+                f"SELECT * FROM {t}"
+            ).fetchall()
+
+            assert len(rows) == 0, (
+                f"Uncommitted row visible via sequential scan: {rows}"
+            )
+        finally:
+            db.rollback()
+            db.autocommit = True
+            db2.execute("SET enable_indexscan = on")
+            db2.execute("SET enable_bitmapscan = on")
+
+    def test_deleted_row_still_visible_to_other_txn_via_seq_scan(
+        self, db: psycopg.Connection, db2: psycopg.Connection, make_table
+    ):
+        """A row deleted in an uncommitted txn should still be visible to other
+        connections via sequential scan (Read Committed).
+
+        This tests the XMAX-in-progress path of the simplified MVCC check.
+        """
+        t = make_table()
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, content) "
+            f"VALUES (1, 1, 'visible')"
+        )
+
+        # db deletes within a transaction but does not commit
+        db.autocommit = False
+        try:
+            db.execute(f"DELETE FROM {t} WHERE group_id = 1 AND version = 1")
+            # db itself should see 0 rows
+            assert row_count(db, t) == 0
+
+            # db2 should still see the row (deleter hasn't committed)
+            db2.execute("SET enable_indexscan = off")
+            db2.execute("SET enable_bitmapscan = off")
+            db2.execute("SET enable_seqscan = on")
+            rows = db2.execute(
+                f"SELECT * FROM {t}"
+            ).fetchall()
+            assert len(rows) == 1, (
+                f"Row should still be visible to db2 via seq scan while delete is uncommitted"
+            )
+        finally:
+            db.rollback()
+            db.autocommit = True
+            db2.execute("SET enable_indexscan = on")
+            db2.execute("SET enable_bitmapscan = on")
+
+
+# ---------------------------------------------------------------------------
+# H6 — Bitmap scan MVCC visibility (known bug: zero MVCC checking)
+# ---------------------------------------------------------------------------
+
+
+class TestMvccVisibilityBitmapScan:
+    """``xpatch_scan_bitmap_next_tuple`` (xpatch_tam.c:2556-2624) now includes
+    MVCC visibility checking via ``xpatch_tuple_is_visible``.
+
+    Previously, bitmap scans returned every tuple that was ``ItemIdIsNormal``
+    regardless of transaction state (bug H6, fixed).
+    """
+
+    def test_uncommitted_row_invisible_via_bitmap_scan(
+        self, db: psycopg.Connection, db2: psycopg.Connection, make_table
+    ):
+        """An uncommitted INSERT should not be visible via bitmap scan."""
+        t = make_table()
+        # Insert some committed rows first so the planner has stats
+        for g in range(1, 6):
+            insert_versions(db, t, group_id=g, count=5)
+        db.execute(f"ANALYZE {t}")
+
+        db.autocommit = False
+        try:
+            # Insert an uncommitted row in group 99
+            db.execute(
+                f"INSERT INTO {t} (group_id, version, content) "
+                f"VALUES (99, 1, 'uncommitted-bm')"
+            )
+
+            # Force bitmap scan from db2
+            db2.execute("SET enable_seqscan = off")
+            db2.execute("SET enable_indexscan = off")
+            db2.execute("SET enable_bitmapscan = on")
+            rows = db2.execute(
+                f"SELECT * FROM {t} WHERE group_id = 99"
+            ).fetchall()
+
+            assert len(rows) == 0, (
+                f"Uncommitted row visible via bitmap scan: {rows}"
+            )
+        finally:
+            db.rollback()
+            db.autocommit = True
+            db2.execute("SET enable_seqscan = on")
+            db2.execute("SET enable_indexscan = on")
+
+    def test_deleted_row_invisible_via_bitmap_scan(
+        self, db: psycopg.Connection, make_table
+    ):
+        """A deleted-and-committed row should not be visible via bitmap scan."""
+        t = make_table()
+        for g in range(1, 6):
+            insert_versions(db, t, group_id=g, count=10)
+        db.execute(f"ANALYZE {t}")
+
+        # Delete group 3 entirely (cascade from version 1)
+        db.execute(f"DELETE FROM {t} WHERE group_id = 3 AND version = 1")
+
+        # Force bitmap scan
+        db.execute("SET enable_seqscan = off")
+        db.execute("SET enable_indexscan = off")
+        db.execute("SET enable_bitmapscan = on")
+        try:
+            rows = db.execute(
+                f"SELECT * FROM {t} WHERE group_id = 3"
+            ).fetchall()
+            assert len(rows) == 0, (
+                f"Deleted rows visible via bitmap scan: {rows}"
+            )
+        finally:
+            db.execute("SET enable_seqscan = on")
+            db.execute("SET enable_indexscan = on")
