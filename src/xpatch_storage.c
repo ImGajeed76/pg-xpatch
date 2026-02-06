@@ -219,7 +219,7 @@ bytea_to_datum(bytea *data, Oid typid)
  * Scan the table using direct buffer access to find the maximum sequence number.
  * Returns 0 if the group is empty.
  * 
- * Reads MAX(_xp_seq) from tuples directly - O(n) scan but only reads one int per tuple.
+ * Reads MAX(_xp_seq) from tuples directly - O(n) scan but only reads one int64 per tuple.
  * 
  * OPTIMIZATION: First checks the seq cache for O(1) lookup via hash table.
  * On cache miss, performs a full table scan and populates the cache.

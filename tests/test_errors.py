@@ -528,6 +528,25 @@ class TestExcessDeltaColumns:
         finally:
             db.execute(f"DROP TABLE IF EXISTS {t}")
 
+    def test_wrong_order_by_type_text_rejected(self, db: psycopg.Connection):
+        """TEXT column as order_by should be rejected (E17)."""
+        t = "test_text_orderby_e17"
+        db.execute(
+            f"CREATE TABLE {t} (id INT, label TEXT NOT NULL, body TEXT NOT NULL) "
+            f"USING xpatch"
+        )
+        try:
+            with pytest.raises(
+                psycopg.errors.DatatypeMismatch,
+                match="must be an integer or timestamp type",
+            ):
+                db.execute(
+                    f"SELECT xpatch.configure('{t}', "
+                    f"group_by => 'id', order_by => 'label')"
+                )
+        finally:
+            db.execute(f"DROP TABLE IF EXISTS {t}")
+
     def test_int_column_as_delta_rejected_on_insert(self, db: psycopg.Connection):
         """Inserting into an INT delta column raises DatatypeMismatch.
 
