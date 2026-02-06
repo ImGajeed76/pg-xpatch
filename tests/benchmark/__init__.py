@@ -1,3 +1,0 @@
-"""
-pg-xpatch benchmark tests.
-"""

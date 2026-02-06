@@ -1,3 +1,0 @@
-"""
-pg-xpatch unit tests.
-"""

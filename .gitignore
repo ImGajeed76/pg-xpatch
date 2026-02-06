@@ -42,3 +42,8 @@ test/regression.out
 
 # Debian packages
 *.deb
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

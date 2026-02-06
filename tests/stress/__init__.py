@@ -1,3 +1,0 @@
-"""
-pg-xpatch stress tests.
-"""

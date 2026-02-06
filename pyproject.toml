@@ -1,57 +1,47 @@
 [project]
-name = "xptest"
+name = "pg-xpatch-tests"
 version = "0.1.0"
-description = "Test runner for pg-xpatch PostgreSQL extension"
+description = "Test suite for pg-xpatch PostgreSQL extension"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "pg-xpatch contributors" }
 ]
-keywords = ["postgresql", "testing", "pg-xpatch"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Environment :: Console",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Topic :: Database",
-    "Topic :: Software Development :: Testing",
-]
 
 dependencies = [
-    "click>=8.0",
-    "rich>=13.0",
-    "psycopg[binary]>=3.1",
-    "pydantic>=2.0",
+    "pytest>=9.0",
+    "pytest-xdist>=3.8",
+    "pytest-timeout>=2.4",
+    "psycopg[binary]>=3.3",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "mypy>=1.0",
-    "ruff>=0.1",
-    "pytest>=7.0",
+    "mypy>=1.19",
+    "ruff>=0.15",
 ]
-
-[project.scripts]
-xptest = "xptest.cli:main"
-
-[project.urls]
-Homepage = "https://github.com/pg-xpatch/pg-xpatch"
-Repository = "https://github.com/pg-xpatch/pg-xpatch"
-Documentation = "https://github.com/pg-xpatch/pg-xpatch#readme"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-include = ["xptest*"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "stress: marks stress/load tests",
+    "benchmark: marks benchmark tests",
+    "crash_test: marks crash recovery tests (run sequentially, may kill PG)",
+]
+strict_markers = true
+addopts = "-v"
+timeout = 120
+timeout_method = "thread"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::ResourceWarning",
+]
 
 [tool.ruff]
 line-length = 100
