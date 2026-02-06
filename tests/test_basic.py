@@ -12,8 +12,10 @@ Covers:
 - NULL group_by value raises error
 - _xp_seq populated automatically
 - INSERT RETURNING
-- COPY FROM/TO
+- COPY FROM/TO (text and binary modes)
 - DROP TABLE config cleanup
+- ALTER TABLE (ADD/DROP/RENAME COLUMN) regression tests
+- Custom schema support (non-public schemas)
 """
 
 from __future__ import annotations
@@ -808,3 +810,244 @@ class TestDropTableCleanup:
                 f"SELECT * FROM xpatch.table_config WHERE table_name = '{t}'"
             ).fetchone()
             assert cfg is None, f"Config for {t} should be removed"
+
+
+# ---------------------------------------------------------------------------
+# ALTER TABLE — regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestAlterTable:
+    """ALTER TABLE ADD/DROP/RENAME COLUMN works correctly on xpatch tables.
+
+    Despite storing column attribute numbers (attnums) in the config cache,
+    PostgreSQL's relcache invalidation triggers config re-reads so attnums
+    stay correct after ALTER TABLE.
+    """
+
+    def test_add_column_then_insert(self, db: psycopg.Connection, make_table):
+        """Adding a column doesn't break subsequent INSERTs."""
+        t = make_table()
+        insert_rows(db, t, [(1, 1, "before-alter")])
+
+        db.execute(f"ALTER TABLE {t} ADD COLUMN metadata TEXT DEFAULT ''")
+
+        insert_rows(db, t, [(1, 2, "after-alter")],
+                    columns=["group_id", "version", "content"])
+
+        rows = db.execute(
+            f"SELECT version, content FROM {t} WHERE group_id = 1 ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0]["content"] == "before-alter"
+        assert rows[1]["content"] == "after-alter"
+
+    def test_drop_non_delta_column_then_insert(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Dropping a non-delta column doesn't break the table."""
+        t = make_table(
+            "group_id INT, version INT, extra INT, content TEXT NOT NULL",
+        )
+        insert_rows(db, t, [(1, 1, 42, "v1")],
+                    columns=["group_id", "version", "extra", "content"])
+
+        db.execute(f"ALTER TABLE {t} DROP COLUMN extra")
+
+        insert_rows(db, t, [(1, 2, "v2")],
+                    columns=["group_id", "version", "content"])
+
+        rows = db.execute(
+            f"SELECT version, content FROM {t} WHERE group_id = 1 ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[1]["content"] == "v2"
+
+    def test_rename_delta_column_then_insert(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Renaming a delta column doesn't break inserts or reads."""
+        t = make_table()
+        insert_rows(db, t, [(1, 1, "v1")])
+
+        db.execute(f"ALTER TABLE {t} RENAME COLUMN content TO body")
+
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, body) VALUES (1, 2, 'v2')"
+        )
+
+        rows = db.execute(
+            f"SELECT version, body FROM {t} WHERE group_id = 1 ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[1]["body"] == "v2"
+
+
+# ---------------------------------------------------------------------------
+# Custom schemas — regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestCustomSchemas:
+    """Tables in non-public schemas work correctly.
+
+    The index name lookup uses pg_class with schema filtering,
+    not just name matching.
+    """
+
+    def test_table_in_custom_schema(self, db: psycopg.Connection):
+        """A table in a non-public schema works correctly."""
+        schema = "test_schema"
+        table = "docs"
+
+        db.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+        try:
+            db.execute(
+                f"CREATE TABLE {schema}.{table} "
+                f"(group_id INT, version INT, content TEXT NOT NULL) USING xpatch"
+            )
+            db.execute(
+                f"SELECT xpatch.configure('{schema}.{table}', "
+                f"group_by => 'group_id', order_by => 'version')"
+            )
+
+            db.execute(
+                f"INSERT INTO {schema}.{table} (group_id, version, content) "
+                f"VALUES (1, 1, 'schema-test')"
+            )
+            db.execute(
+                f"INSERT INTO {schema}.{table} (group_id, version, content) "
+                f"VALUES (1, 2, 'schema-test-v2')"
+            )
+
+            rows = db.execute(
+                f"SELECT version, content FROM {schema}.{table} "
+                f"WHERE group_id = 1 ORDER BY version"
+            ).fetchall()
+            assert len(rows) == 2
+            assert rows[0]["content"] == "schema-test"
+            assert rows[1]["content"] == "schema-test-v2"
+        finally:
+            db.execute(f"DROP TABLE IF EXISTS {schema}.{table}")
+            db.execute(f"DROP SCHEMA IF EXISTS {schema}")
+
+    def test_same_table_name_different_schemas(self, db: psycopg.Connection):
+        """Two tables with same name in different schemas don't interfere."""
+        db.execute("CREATE SCHEMA IF NOT EXISTS schema_a")
+        db.execute("CREATE SCHEMA IF NOT EXISTS schema_b")
+        try:
+            for s in ("schema_a", "schema_b"):
+                db.execute(
+                    f"CREATE TABLE {s}.docs "
+                    f"(group_id INT, version INT, content TEXT NOT NULL) USING xpatch"
+                )
+                db.execute(
+                    f"SELECT xpatch.configure('{s}.docs', "
+                    f"group_by => 'group_id', order_by => 'version')"
+                )
+
+            db.execute(
+                "INSERT INTO schema_a.docs (group_id, version, content) "
+                "VALUES (1, 1, 'from-schema-a')"
+            )
+            db.execute(
+                "INSERT INTO schema_b.docs (group_id, version, content) "
+                "VALUES (1, 1, 'from-schema-b')"
+            )
+
+            rows_a = db.execute(
+                "SELECT content FROM schema_a.docs WHERE group_id = 1"
+            ).fetchall()
+            rows_b = db.execute(
+                "SELECT content FROM schema_b.docs WHERE group_id = 1"
+            ).fetchall()
+
+            assert rows_a[0]["content"] == "from-schema-a"
+            assert rows_b[0]["content"] == "from-schema-b"
+        finally:
+            db.execute("DROP TABLE IF EXISTS schema_a.docs")
+            db.execute("DROP TABLE IF EXISTS schema_b.docs")
+            db.execute("DROP SCHEMA IF EXISTS schema_a")
+            db.execute("DROP SCHEMA IF EXISTS schema_b")
+
+    def test_delta_chain_in_custom_schema(self, db: psycopg.Connection):
+        """Delta compression works correctly in a non-public schema."""
+        schema = "delta_schema"
+        db.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+        try:
+            db.execute(
+                f"CREATE TABLE {schema}.versioned "
+                f"(group_id INT, version INT, content TEXT NOT NULL) USING xpatch"
+            )
+            db.execute(
+                f"SELECT xpatch.configure('{schema}.versioned', "
+                f"group_by => 'group_id', order_by => 'version', keyframe_every => 5)"
+            )
+
+            for v in range(1, 8):
+                db.execute(
+                    f"INSERT INTO {schema}.versioned (group_id, version, content) "
+                    f"VALUES (1, {v}, 'Version {v} content for delta test')"
+                )
+
+            rows = db.execute(
+                f"SELECT version, content FROM {schema}.versioned "
+                f"WHERE group_id = 1 ORDER BY version"
+            ).fetchall()
+            assert len(rows) == 7
+            for i, r in enumerate(rows, 1):
+                assert r["content"] == f"Version {i} content for delta test"
+
+            stats = db.execute(
+                f"SELECT * FROM xpatch.stats('{schema}.versioned')"
+            ).fetchone()
+            assert stats["total_rows"] == 7
+            assert stats["delta_count"] > 0
+        finally:
+            db.execute(f"DROP TABLE IF EXISTS {schema}.versioned")
+            db.execute(f"DROP SCHEMA IF EXISTS {schema}")
+
+
+# ---------------------------------------------------------------------------
+# COPY binary mode — regression test
+# ---------------------------------------------------------------------------
+
+
+class TestCopyBinaryMode:
+    """Binary COPY TO/FROM works correctly because the multi_insert path
+    just loops over single inserts, and binary mode doesn't change the
+    slot materialization path.
+    """
+
+    def test_copy_binary_roundtrip(self, db: psycopg.Connection, make_table):
+        """COPY TO binary -> COPY FROM binary preserves data."""
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=5)
+
+        t2 = make_table()
+
+        buf = io.BytesIO()
+        with db.cursor().copy(
+            f"COPY (SELECT group_id, version, content FROM {t} ORDER BY version) "
+            f"TO STDOUT WITH (FORMAT BINARY)"
+        ) as copy:
+            for data in copy:
+                buf.write(data)
+
+        buf.seek(0)
+        with db.cursor().copy(
+            f"COPY {t2} (group_id, version, content) FROM STDIN WITH (FORMAT BINARY)"
+        ) as copy:
+            copy.write(buf.read())
+
+        rows_orig = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        rows_copy = db.execute(
+            f"SELECT version, content FROM {t2} ORDER BY version"
+        ).fetchall()
+
+        assert len(rows_copy) == len(rows_orig)
+        for orig, copied in zip(rows_orig, rows_copy):
+            assert orig["version"] == copied["version"]
+            assert orig["content"] == copied["content"]

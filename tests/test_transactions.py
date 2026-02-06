@@ -13,11 +13,19 @@ Covers:
 - DELETE within transactions and savepoints
 - Concurrent insert serialization via advisory locks
 - Multi-group transaction atomicity
+- MVCC visibility via index scan (H1 — uncommitted rows, known bug)
+- SELECT FOR SHARE / FOR KEY SHARE (M11 — known bug)
+- Concurrent DELETE serialization (H4 — known bug)
 """
 
 from __future__ import annotations
 
+import threading
+import time
+from typing import Any
+
 import psycopg
+import psycopg.errors
 import pytest
 
 from conftest import insert_rows, insert_versions, row_count
@@ -375,3 +383,164 @@ class TestConcurrentInserts:
         ).fetchall()
         assert rows[0]["content"] == "from db"
         assert rows[1]["content"] == "from db2"
+
+
+# ---------------------------------------------------------------------------
+# H1 — MVCC visibility via index scan (known bug: uncommitted rows visible)
+# ---------------------------------------------------------------------------
+
+
+class TestMvccVisibilityIndexScan:
+    """``xpatch_tuple_fetch_row_version`` (used by index scans) has a TODO:
+    it assumes ALL tuples are visible, ignoring transaction isolation.
+
+    Bug: xpatch_tam.c:1537-1542
+    """
+
+    @pytest.mark.xfail(
+        reason="H1: fetch_row_version sees uncommitted rows from other transactions",
+        strict=True,
+    )
+    def test_uncommitted_row_invisible_via_index_scan(
+        self, db: psycopg.Connection, db2: psycopg.Connection, make_table
+    ):
+        """An uncommitted INSERT should not be visible via index scan."""
+        t = make_table()
+        db.execute(f"CREATE UNIQUE INDEX {t}_uk ON {t} (group_id, version)")
+
+        db.autocommit = False
+        try:
+            db.execute(
+                f"INSERT INTO {t} (group_id, version, content) "
+                f"VALUES (1, 1, 'uncommitted')"
+            )
+
+            # From db2 with index scan forced, the uncommitted row should NOT be visible
+            db2.execute("SET enable_seqscan = off")
+            rows = db2.execute(
+                f"SELECT * FROM {t} WHERE group_id = 1 AND version = 1"
+            ).fetchall()
+
+            assert len(rows) == 0, (
+                f"Uncommitted row visible via index scan: {rows}"
+            )
+        finally:
+            db.rollback()
+            db.autocommit = True
+
+
+# ---------------------------------------------------------------------------
+# M11 — SELECT FOR SHARE / FOR KEY SHARE (known bug: slot not populated)
+# ---------------------------------------------------------------------------
+
+
+class TestSelectForLock:
+    """``xpatch_tuple_lock`` delegates to ``heap_lock_tuple`` but does not
+    populate the TupleTableSlot afterward.  The executor gets a locked
+    but empty/garbage slot.
+
+    Bug: xpatch_tam.c:1463-1471
+    """
+
+    @pytest.mark.xfail(
+        reason="M11: tuple_lock doesn't populate the slot — SELECT FOR SHARE returns garbage",
+        strict=True,
+    )
+    def test_select_for_share_returns_data(
+        self, db: psycopg.Connection, xpatch_table
+    ):
+        """SELECT ... FOR SHARE should return the actual row data."""
+        t = xpatch_table
+        insert_rows(db, t, [(1, 1, "locked-row")])
+
+        with db.transaction():
+            rows = db.execute(
+                f"SELECT group_id, version, content FROM {t} "
+                f"WHERE group_id = 1 FOR SHARE"
+            ).fetchall()
+
+        assert len(rows) == 1
+        assert rows[0]["content"] == "locked-row"
+
+    @pytest.mark.xfail(
+        reason="M11: tuple_lock doesn't populate the slot — SELECT FOR KEY SHARE returns garbage",
+        strict=True,
+    )
+    def test_select_for_key_share_returns_data(
+        self, db: psycopg.Connection, xpatch_table
+    ):
+        """SELECT ... FOR KEY SHARE should return the actual row data."""
+        t = xpatch_table
+        insert_rows(db, t, [(1, 1, "key-share-row")])
+
+        with db.transaction():
+            rows = db.execute(
+                f"SELECT group_id, version, content FROM {t} "
+                f"WHERE group_id = 1 FOR KEY SHARE"
+            ).fetchall()
+
+        assert len(rows) == 1
+        assert rows[0]["content"] == "key-share-row"
+
+
+# ---------------------------------------------------------------------------
+# H4 — Concurrent DELETE serialization (known bug: incomplete wait path)
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentDeleteSerialization:
+    """When ``wait=true`` in the DELETE path and another transaction is
+    actively deleting the same tuple, the code should wait using
+    ``XactLockTableWait``.  Instead it returns ``TM_BeingModified``.
+
+    Bug: xpatch_tam.c:1137-1139
+    """
+
+    @pytest.mark.xfail(
+        reason="H4: DELETE wait=true returns TM_BeingModified instead of waiting",
+        strict=True,
+    )
+    def test_concurrent_delete_same_group_serializes(
+        self, db: psycopg.Connection, db_factory, make_table
+    ):
+        """Two concurrent DELETEs on the same group should serialize correctly."""
+        t = make_table(keyframe_every=10)
+        insert_versions(db, t, group_id=1, count=5)
+
+        db2 = db_factory()
+        results: dict[str, Any] = {}
+
+        def delete_in_txn(conn, conn_name, version):
+            try:
+                conn.autocommit = False
+                conn.execute(
+                    f"DELETE FROM {t} WHERE group_id = 1 AND version = {version}"
+                )
+                time.sleep(0.5)
+                conn.commit()
+                results[conn_name] = "ok"
+            except Exception as e:
+                conn.rollback()
+                results[conn_name] = f"error: {e}"
+            finally:
+                conn.autocommit = True
+
+        t1 = threading.Thread(target=delete_in_txn, args=(db, "conn1", 1))
+        t2 = threading.Thread(target=delete_in_txn, args=(db2, "conn2", 3))
+
+        t1.start()
+        time.sleep(0.1)
+        t2.start()
+
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert results.get("conn1") == "ok", f"conn1: {results.get('conn1')}"
+        assert results.get("conn2") == "ok", f"conn2: {results.get('conn2')}"
+
+        # Verify table is in a consistent state
+        rows = db.execute(
+            f"SELECT version, content FROM {t} WHERE group_id = 1 ORDER BY version"
+        ).fetchall()
+        for r in rows:
+            assert r["content"] is not None

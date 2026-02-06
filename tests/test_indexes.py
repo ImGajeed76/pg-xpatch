@@ -11,6 +11,8 @@ Covers:
 - ANALYZE populates pg_stats
 - Index survives TRUNCATE
 - Index on multiple columns (composite)
+- Deleted row invisible via index scan (MVCC regression)
+- REINDEX CONCURRENTLY (regression test)
 """
 
 from __future__ import annotations
@@ -409,3 +411,79 @@ class TestIndexEdgeCases:
         finally:
             db.execute("SET enable_seqscan = on")
             db.execute("SET enable_indexscan = on")
+
+
+# ---------------------------------------------------------------------------
+# Deleted row visibility via index scan — regression test
+# ---------------------------------------------------------------------------
+
+
+class TestDeletedRowVisibilityViaIndex:
+    """Despite the TODO in fetch_row_version about missing MVCC checks,
+    deleted-and-committed rows ARE correctly invisible via index scan.
+
+    This works because xpatch's DELETE sets XMAX on the physical tuple,
+    and the index scan path checks ItemIdIsNormal + XMAX status.
+    """
+
+    def test_deleted_row_invisible_via_index_scan(
+        self, db: psycopg.Connection, make_table
+    ):
+        """After DELETE + COMMIT, index scan should not return deleted rows."""
+        t = make_table()
+        db.execute(f"CREATE UNIQUE INDEX {t}_uk ON {t} (group_id, version)")
+
+        insert_versions(db, t, group_id=1, count=3)
+
+        # Delete version 2 (cascades to version 3)
+        db.execute(f"DELETE FROM {t} WHERE group_id = 1 AND version = 2")
+        assert row_count(db, t) == 1
+
+        # Force index scan
+        db.execute("SET enable_seqscan = off")
+        try:
+            rows = db.execute(
+                f"SELECT version, content FROM {t} "
+                f"WHERE group_id = 1 AND version = 2"
+            ).fetchall()
+            assert len(rows) == 0, (
+                f"Deleted row (version=2) visible via index scan: {rows}"
+            )
+        finally:
+            db.execute("SET enable_seqscan = on")
+
+
+# ---------------------------------------------------------------------------
+# REINDEX CONCURRENTLY — regression test
+# ---------------------------------------------------------------------------
+
+
+class TestReindexConcurrently:
+    """Despite ``xpatch_index_validate_scan`` being a stub, REINDEX
+    CONCURRENTLY produces valid indexes because PostgreSQL rebuilds the
+    index from scratch using the table scan path (which works correctly).
+    """
+
+    def test_reindex_concurrently_produces_valid_index(
+        self, db: psycopg.Connection, make_table
+    ):
+        """After REINDEX CONCURRENTLY, index scans return correct results."""
+        t = make_table()
+        db.execute(f"CREATE INDEX {t}_ver_idx ON {t} (version)")
+
+        insert_versions(db, t, group_id=1, count=10)
+        insert_versions(db, t, group_id=2, count=10)
+
+        db.execute(f"REINDEX INDEX CONCURRENTLY {t}_ver_idx")
+
+        db.execute("SET enable_seqscan = off")
+        try:
+            rows = db.execute(
+                f"SELECT group_id, version FROM {t} "
+                f"WHERE version = 5 ORDER BY group_id"
+            ).fetchall()
+            assert len(rows) == 2
+            assert rows[0]["group_id"] == 1
+            assert rows[1]["group_id"] == 2
+        finally:
+            db.execute("SET enable_seqscan = on")

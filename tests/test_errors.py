@@ -12,6 +12,10 @@ Covers:
 - keyframe_every/compress_depth validation
 - NULL group value raises NotNullViolation
 - Utility functions on non-xpatch table raise errors
+- INSERT ON CONFLICT hangs (H2 — known bug)
+- TABLESAMPLE silently returns 0 rows (H5 — known bug)
+- Auto-detection error paths (E13, E17 — known bugs)
+- INT column as delta rejected (E16)
 """
 
 from __future__ import annotations
@@ -280,3 +284,203 @@ class TestUtilityFunctionErrors:
             ).fetchall()
         except psycopg.errors.Error:
             pass  # Raising an error would also be acceptable
+
+
+# ---------------------------------------------------------------------------
+# H2 — INSERT ON CONFLICT causes uninterruptible hang (known bug)
+# ---------------------------------------------------------------------------
+
+
+class TestInsertOnConflict:
+    """INSERT ON CONFLICT uses PostgreSQL's speculative insert protocol.
+
+    The xpatch TAM's ``xpatch_tuple_insert_speculative`` falls back to
+    a regular insert (which acquires an advisory lock on the group),
+    and ``xpatch_tuple_complete_speculative`` is a no-op.
+
+    When a conflict is detected, PostgreSQL tries to abort the speculative
+    insert.  But the advisory lock is already held by this transaction,
+    and the regular insert already physically wrote the row.  The result
+    is an **uninterruptible hang** — even ``pg_terminate_backend`` cannot
+    kill the stuck backend, requiring ``pg_ctl stop -m immediate``.
+
+    Bug: xpatch_tam.c:982-996
+    Severity: CRITICAL — requires server restart to recover
+    """
+
+    @pytest.mark.skip(
+        reason="H2: INSERT ON CONFLICT causes uninterruptible hang — "
+        "leaves zombie backend that requires pg_ctl stop -m immediate. "
+        "Run manually with: pytest -k InsertOnConflict --no-header"
+    )
+    @pytest.mark.timeout(15)
+    def test_insert_on_conflict_do_nothing_hangs(
+        self, db: psycopg.Connection, make_table
+    ):
+        """INSERT ... ON CONFLICT DO NOTHING enters uninterruptible C loop.
+
+        This test is skipped by default because:
+        1. The backend enters a tight C loop that ignores CHECK_FOR_INTERRUPTS
+        2. Even statement_timeout and pg_terminate_backend cannot stop it
+        3. The only recovery is pg_ctl stop -m immediate (server restart)
+        4. This leaves the test database orphaned
+        """
+        t = make_table()
+        db.execute("SET statement_timeout = '3s'")
+        db.execute(f"CREATE UNIQUE INDEX ON {t} (group_id, version)")
+
+        insert_rows(db, t, [(1, 1, "v1")])
+
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, content) VALUES (1, 1, 'v1-dup') "
+            f"ON CONFLICT (group_id, version) DO NOTHING"
+        )
+
+        assert row_count(db, t) == 1
+
+    @pytest.mark.skip(
+        reason="H2: INSERT ON CONFLICT DO UPDATE causes same uninterruptible hang"
+    )
+    @pytest.mark.timeout(15)
+    def test_insert_on_conflict_do_update_hangs(
+        self, db: psycopg.Connection, make_table
+    ):
+        """INSERT ... ON CONFLICT DO UPDATE enters uninterruptible C loop."""
+        t = make_table()
+        db.execute("SET statement_timeout = '3s'")
+        db.execute(f"CREATE UNIQUE INDEX ON {t} (group_id, version)")
+
+        insert_rows(db, t, [(1, 1, "original")])
+
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, content) VALUES (1, 1, 'updated') "
+            f"ON CONFLICT (group_id, version) DO UPDATE SET content = EXCLUDED.content"
+        )
+
+        assert row_count(db, t) == 1
+
+
+# ---------------------------------------------------------------------------
+# H5 — TABLESAMPLE silently returns zero rows (known bug)
+# ---------------------------------------------------------------------------
+
+
+class TestTableSampleBroken:
+    """The TABLESAMPLE callbacks are stubs that always return false.
+
+    ``SELECT * FROM t TABLESAMPLE BERNOULLI(100)`` silently returns zero rows
+    instead of either working correctly or raising FeatureNotSupported.
+
+    Bug: xpatch_tam.c:2564-2578
+    """
+
+    @pytest.mark.xfail(
+        reason="H5: TABLESAMPLE silently returns 0 rows — should either work or error",
+        strict=True,
+    )
+    def test_tablesample_bernoulli_100_returns_all_rows(
+        self, db: psycopg.Connection, xpatch_table
+    ):
+        """TABLESAMPLE BERNOULLI(100) should return all rows."""
+        t = xpatch_table
+        insert_versions(db, t, group_id=1, count=5)
+
+        rows = db.execute(
+            f"SELECT * FROM {t} TABLESAMPLE BERNOULLI(100)"
+        ).fetchall()
+        assert len(rows) == 5
+
+    @pytest.mark.xfail(
+        reason="H5: TABLESAMPLE silently returns 0 rows instead of raising error",
+        strict=True,
+    )
+    def test_tablesample_system_returns_rows_or_errors(
+        self, db: psycopg.Connection, xpatch_table
+    ):
+        """TABLESAMPLE SYSTEM(100) should return rows or raise an error."""
+        t = xpatch_table
+        insert_versions(db, t, group_id=1, count=10)
+
+        try:
+            rows = db.execute(
+                f"SELECT * FROM {t} TABLESAMPLE SYSTEM(100)"
+            ).fetchall()
+            assert len(rows) > 0, "TABLESAMPLE SYSTEM(100) returned 0 rows silently"
+        except psycopg.errors.FeatureNotSupported:
+            pass  # Acceptable — at least it's explicit
+
+
+# ---------------------------------------------------------------------------
+# E13/E17 — Auto-detection and type-validation error paths (known bugs)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoDetectionErrors:
+    """Error paths in the C code that are not exercised until triggered."""
+
+    @pytest.mark.xfail(
+        reason="E13: auto_detect_order_by should fail on table with no INT/TIMESTAMP columns",
+        strict=True,
+    )
+    def test_no_order_by_column_auto_detection_fails(self, db: psycopg.Connection):
+        """A table with only TEXT columns should fail auto-detection of order_by."""
+        t = "test_no_orderby"
+        db.execute(
+            f"CREATE TABLE {t} (name TEXT NOT NULL, body TEXT NOT NULL) USING xpatch"
+        )
+        try:
+            with pytest.raises(
+                psycopg.errors.InvalidParameterValue,
+                match="order_by column",
+            ):
+                db.execute(f"SELECT xpatch.configure('{t}')")
+        finally:
+            db.execute(f"DROP TABLE IF EXISTS {t}")
+
+    @pytest.mark.xfail(
+        reason="E17: order_by column type validation should reject TEXT columns",
+        strict=True,
+    )
+    def test_wrong_order_by_type_rejected(self, db: psycopg.Connection):
+        """Explicitly setting order_by to a TEXT column should raise DatatypeMismatch."""
+        t = "test_wrong_orderby"
+        db.execute(
+            f"CREATE TABLE {t} (id INT, name TEXT NOT NULL, body TEXT NOT NULL) "
+            f"USING xpatch"
+        )
+        try:
+            with pytest.raises(
+                psycopg.errors.DatatypeMismatch,
+                match="order_by column.*must be",
+            ):
+                db.execute(
+                    f"SELECT xpatch.configure('{t}', order_by => 'name')"
+                )
+        finally:
+            db.execute(f"DROP TABLE IF EXISTS {t}")
+
+    def test_int_column_as_delta_rejected_on_insert(self, db: psycopg.Connection):
+        """Inserting into an INT delta column raises DatatypeMismatch.
+
+        Regression guard for E16.  The error is raised at INSERT time (in the
+        C code's ``datum_to_bytea``), not during ``configure()``.
+        """
+        t = "test_int_delta_e16"
+        db.execute(
+            f"CREATE TABLE {t} "
+            f"(id INT, version INT, payload INT NOT NULL, filler TEXT NOT NULL) "
+            f"USING xpatch"
+        )
+        try:
+            db.execute(
+                f"SELECT xpatch.configure('{t}', "
+                f"order_by => 'version', "
+                f"delta_columns => '{{payload}}')"
+            )
+            with pytest.raises(psycopg.errors.DatatypeMismatch):
+                db.execute(
+                    f"INSERT INTO {t} (id, version, payload, filler) "
+                    f"VALUES (1, 1, 42, 'test')"
+                )
+        finally:
+            db.execute(f"DROP TABLE IF EXISTS {t}")
