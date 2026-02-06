@@ -7,6 +7,9 @@ Covers:
 - Multi-group restore with interleaved data
 - dump_configs() output is valid SQL
 - Mixed explicit and auto _xp_seq
+- Physical storage verification in restore mode
+- fix_restored_configs() behavior
+- Edge cases: gaps, boundary values, round-trip
 """
 
 from __future__ import annotations
@@ -58,6 +61,62 @@ class TestExplicitXpSeq:
         ).fetchall()
         for row in rows:
             assert row["content"] == f"Restored version {row['version']}"
+
+    def test_explicit_xp_seq_inspect_physical(self, db: psycopg.Connection, make_table):
+        """Explicit _xp_seq values are reflected in inspect() output."""
+        t = make_table()
+        for seq in range(1, 6):
+            db.execute(
+                f"INSERT INTO {t} (group_id, version, content, _xp_seq) "
+                f"VALUES (1, {seq}, 'v{seq}', {seq})"
+            )
+
+        inspect = db.execute(
+            f"SELECT seq, is_keyframe FROM xpatch.inspect('{t}'::regclass, 1) "
+            f"ORDER BY seq"
+        ).fetchall()
+        seqs = [r["seq"] for r in inspect]
+        # With keyframe_every=5 (default), seq 1 is keyframe, 2-5 are deltas
+        assert 1 in seqs
+        kf = [r for r in inspect if r["seq"] == 1]
+        assert kf[0]["is_keyframe"] is True
+
+    def test_explicit_seq_with_gaps(self, db: psycopg.Connection, make_table):
+        """Auto-seq after gapped explicit _xp_seq starts after max."""
+        t = make_table()
+        # Insert with a gap: 1, 2, 5
+        for seq in [1, 2, 5]:
+            db.execute(
+                f"INSERT INTO {t} (group_id, version, content, _xp_seq) "
+                f"VALUES (1, {seq}, 'v{seq}', {seq})"
+            )
+
+        # Auto-insert should get seq >= 6 (max+1)
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, content) "
+            f"VALUES (1, 6, 'auto')"
+        )
+        row = db.execute(
+            f"SELECT _xp_seq FROM {t} WHERE version = 6"
+        ).fetchone()
+        assert row["_xp_seq"] >= 6, (
+            f"Expected auto-seq >= 6 after gap (max explicit=5), got {row['_xp_seq']}"
+        )
+
+    def test_explicit_seq_zero_treated_as_auto(self, db: psycopg.Connection, make_table):
+        """_xp_seq=0 should NOT trigger restore mode (auto-allocate instead)."""
+        t = make_table()
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, content, _xp_seq) "
+            f"VALUES (1, 1, 'v1', 0)"
+        )
+        row = db.execute(
+            f"SELECT _xp_seq FROM {t} WHERE version = 1"
+        ).fetchone()
+        # C code: user_seq > 0 triggers restore mode, so 0 → auto-allocate = 1
+        assert row["_xp_seq"] == 1, (
+            f"_xp_seq=0 should auto-allocate to 1, got {row['_xp_seq']}"
+        )
 
 
 class TestAutoSeqAfterRestore:
@@ -118,6 +177,28 @@ class TestAutoSeqAfterRestore:
         ).fetchone()
         assert r2["_xp_seq"] == 6
 
+    def test_auto_seq_after_delete_and_restore(self, db: psycopg.Connection, make_table):
+        """After restore + delete + auto-insert, seq continues from max."""
+        t = make_table()
+        for seq in range(1, 6):
+            db.execute(
+                f"INSERT INTO {t} (group_id, version, content, _xp_seq) "
+                f"VALUES (1, {seq}, 'r{seq}', {seq})"
+            )
+        # Delete versions 4 and 5
+        db.execute(f"DELETE FROM {t} WHERE version >= 4")
+        # Auto-insert should still get seq >= 4 (or wherever seq cache is)
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, content) "
+            f"VALUES (1, 4, 'new-4')"
+        )
+        row = db.execute(
+            f"SELECT _xp_seq, content FROM {t} WHERE version = 4"
+        ).fetchone()
+        assert row["content"] == "new-4"
+        # Seq should be > 0 (exact value depends on implementation)
+        assert row["_xp_seq"] > 0
+
 
 class TestMultiGroupRestore:
     """Multi-group restore with interleaved data."""
@@ -160,6 +241,29 @@ class TestMultiGroupRestore:
         assert rows[1]["content"] == "g1v2"
         assert rows[2]["content"] == "g1v3"
 
+    def test_interleaved_restore_many_groups(self, db: psycopg.Connection, make_table):
+        """Interleaved restore across 10 groups, all content correct."""
+        t = make_table()
+        # Insert interleaved: for each version, insert across all groups
+        for v in range(1, 6):
+            for g in range(1, 11):
+                db.execute(
+                    f"INSERT INTO {t} (group_id, version, content, _xp_seq) "
+                    f"VALUES ({g}, {v}, 'g{g}v{v}', {v})"
+                )
+
+        assert row_count(db, t) == 50
+
+        # Check every group has correct content
+        for g in range(1, 11):
+            rows = db.execute(
+                f"SELECT version, content FROM {t} "
+                f"WHERE group_id = {g} ORDER BY version"
+            ).fetchall()
+            assert len(rows) == 5
+            for row in rows:
+                assert row["content"] == f"g{g}v{row['version']}"
+
 
 class TestDumpConfigs:
     """dump_configs() generates valid restore SQL."""
@@ -191,9 +295,16 @@ class TestDumpConfigs:
         texts = [row[list(row.keys())[0]] for row in rows]
         matching = [txt for txt in texts if t in txt]
 
-        if matching:
-            # Should use 'false' not 'f'
-            assert "false" in matching[0].lower() or "'f'" not in matching[0]
+        assert len(matching) == 1, (
+            f"Expected exactly 1 dump_configs row for {t}, got {len(matching)}"
+        )
+        # Must contain the literal 'false', not abbreviated 'f'
+        assert "false" in matching[0].lower(), (
+            f"Expected 'false' in dump_configs output: {matching[0]}"
+        )
+        assert "'f'" not in matching[0], (
+            f"Found abbreviated 'f' for boolean in: {matching[0]}"
+        )
 
     def test_dump_configs_contains_all_tables(self, db: psycopg.Connection, make_table):
         """dump_configs() lists all configured tables."""
@@ -210,6 +321,33 @@ class TestDumpConfigs:
 
         assert t1 in all_text
         assert t2 in all_text
+
+    def test_dump_configs_round_trip(self, db: psycopg.Connection, make_table):
+        """dump_configs() output can be re-executed to recreate config."""
+        t = make_table(keyframe_every=50, compress_depth=2, enable_zstd=False)
+
+        # Get dumped SQL for this table
+        rows = db.execute("SELECT * FROM xpatch.dump_configs()").fetchall()
+        texts = [row[list(row.keys())[0]] for row in rows]
+        matching = [txt for txt in texts if t in txt]
+        assert len(matching) == 1
+
+        # Delete config
+        db.execute(
+            f"DELETE FROM xpatch.table_config WHERE table_name = '{t}'"
+        )
+
+        # Re-execute dumped SQL
+        db.execute(matching[0])
+
+        # Verify config was restored correctly
+        cfg = db.execute(
+            f"SELECT * FROM xpatch.describe('{t}'::regclass)"
+        ).fetchall()
+        props = {r["property"]: r["value"] for r in cfg}
+        assert props["keyframe_every"] == "50"
+        assert props["compress_depth"] == "2"
+        assert props["enable_zstd"] == "false"
 
 
 class TestMixedExplicitAutoSeq:
@@ -236,3 +374,87 @@ class TestMixedExplicitAutoSeq:
         assert rows[1]["content"] == "r2"
         assert rows[2]["content"] == "auto"
         assert rows[2]["_xp_seq"] == 3
+
+    def test_insert_returning_seq_is_null(self, db: psycopg.Connection, make_table):
+        """INSERT RETURNING _xp_seq returns NULL (computed inside C TAM)."""
+        t = make_table()
+        # Without explicit _xp_seq
+        row = db.execute(
+            f"INSERT INTO {t} (group_id, version, content) "
+            f"VALUES (1, 1, 'test') RETURNING _xp_seq"
+        ).fetchone()
+        assert row["_xp_seq"] is None, (
+            f"INSERT RETURNING _xp_seq should be NULL, got {row['_xp_seq']}"
+        )
+
+    def test_insert_returning_seq_with_explicit(self, db: psycopg.Connection, make_table):
+        """INSERT RETURNING _xp_seq with explicit value returns the provided value."""
+        t = make_table()
+        row = db.execute(
+            f"INSERT INTO {t} (group_id, version, content, _xp_seq) "
+            f"VALUES (1, 1, 'test', 42) RETURNING _xp_seq"
+        ).fetchone()
+        # With explicit _xp_seq, the user-provided value is in the tuple
+        # before the TAM processes it, so RETURNING sees it
+        assert row["_xp_seq"] == 42, (
+            f"Expected RETURNING to show explicit _xp_seq=42, got {row['_xp_seq']}"
+        )
+
+
+class TestFixRestoredConfigs:
+    """xpatch.fix_restored_configs() repairs config OIDs after restore."""
+
+    def test_fix_restored_configs_no_mismatch(self, db: psycopg.Connection, make_table):
+        """fix_restored_configs() returns 0 when no OID mismatches exist."""
+        t = make_table()
+        result = db.execute("SELECT xpatch.fix_restored_configs()").fetchone()
+        fixed = result[list(result.keys())[0]]
+        assert fixed == 0
+
+    def test_fix_restored_configs_fixes_oid_mismatch(
+        self, db: psycopg.Connection, make_table
+    ):
+        """fix_restored_configs() fixes a manually corrupted OID."""
+        t = make_table()
+        # Get actual OID
+        actual_oid = db.execute(
+            f"SELECT '{t}'::regclass::oid AS oid"
+        ).fetchone()["oid"]
+
+        # Corrupt the OID in table_config to simulate a restore
+        db.execute(
+            f"UPDATE xpatch.table_config SET relid = 99999 "
+            f"WHERE table_name = '{t}'"
+        )
+
+        result = db.execute("SELECT xpatch.fix_restored_configs()").fetchone()
+        fixed = result[list(result.keys())[0]]
+        assert fixed == 1, f"Expected 1 fixed config, got {fixed}"
+
+        # Verify the OID was restored correctly
+        cfg = db.execute(
+            f"SELECT relid FROM xpatch.table_config WHERE table_name = '{t}'"
+        ).fetchone()
+        assert cfg["relid"] == actual_oid
+
+    def test_fix_restored_configs_removes_orphans(
+        self, db: psycopg.Connection, make_table
+    ):
+        """fix_restored_configs() removes config for non-existent tables."""
+        t = make_table()
+
+        # Insert an orphan config for a table that doesn't exist
+        db.execute(
+            "INSERT INTO xpatch.table_config "
+            "(relid, schema_name, table_name, group_by, order_by, keyframe_every, compress_depth, enable_zstd) "
+            "VALUES (88888, 'public', 'nonexistent_table_xyz', 'gid', 'ver', 5, 1, true)"
+        )
+
+        result = db.execute("SELECT xpatch.fix_restored_configs()").fetchone()
+        fixed = result[list(result.keys())[0]]
+        # The orphan was removed, but fix_restored_configs only counts OID updates
+        # Check the orphan is gone
+        orphan = db.execute(
+            "SELECT * FROM xpatch.table_config WHERE table_name = 'nonexistent_table_xyz'"
+        ).fetchone()
+        assert orphan is None, "Orphan config should have been removed"

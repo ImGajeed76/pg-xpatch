@@ -7,6 +7,7 @@ Covers:
 - Filter on delta column under parallel scan
 - Multiple workers produce same results as serial
 - Parallel scan with GROUP BY
+- Edge cases: empty table, LIMIT, single-group reconstruction, concurrent scans
 """
 
 from __future__ import annotations
@@ -35,6 +36,17 @@ def _disable_parallel(db: psycopg.Connection) -> None:
     db.execute("RESET min_parallel_index_scan_size")
 
 
+def _assert_parallel_plan(db: psycopg.Connection, query: str) -> None:
+    """Assert that the given query uses a parallel plan."""
+    plan = db.execute(
+        f"EXPLAIN (COSTS OFF) {query}"
+    ).fetchall()
+    plan_text = "\n".join(r["QUERY PLAN"] for r in plan)
+    assert "Parallel" in plan_text, (
+        f"Expected parallel plan but got:\n{plan_text}"
+    )
+
+
 class TestParallelScan:
     """Parallel sequential scan correctness."""
 
@@ -55,9 +67,10 @@ class TestParallelScan:
             plan = db.execute(
                 f"EXPLAIN (COSTS OFF) SELECT COUNT(*) FROM {t}"
             ).fetchall()
-            plan_text = "\n".join(r[list(r.keys())[0]] for r in plan)
-            # May or may not show parallel depending on row count
-            # Just verify it runs without error
+            plan_text = "\n".join(r["QUERY PLAN"] for r in plan)
+            assert "Parallel" in plan_text, (
+                f"Expected parallel plan with forced-zero costs, got:\n{plan_text}"
+            )
         finally:
             _disable_parallel(db)
 
@@ -145,3 +158,164 @@ class TestParallelScan:
             assert all(r["cnt"] == 10 for r in rows)
         finally:
             _disable_parallel(db)
+
+
+class TestParallelEdgeCases:
+    """Edge cases for parallel scan correctness."""
+
+    def test_parallel_empty_table(self, db: psycopg.Connection, make_table):
+        """Parallel scan on empty table returns 0 rows without error."""
+        t = make_table()
+        db.execute(f"ANALYZE {t}")
+        _enable_parallel(db)
+        try:
+            cnt = row_count(db, t)
+            assert cnt == 0
+            rows = db.execute(f"SELECT * FROM {t}").fetchall()
+            assert rows == []
+        finally:
+            _disable_parallel(db)
+
+    def test_parallel_with_limit(self, db: psycopg.Connection, make_table):
+        """LIMIT under parallel scan returns correct number of rows."""
+        t = make_table()
+        for g in range(1, 51):
+            insert_versions(db, t, group_id=g, count=10)
+        db.execute(f"ANALYZE {t}")
+
+        _enable_parallel(db)
+        try:
+            rows = db.execute(
+                f"SELECT group_id, version, content FROM {t} "
+                f"ORDER BY group_id, version LIMIT 10"
+            ).fetchall()
+            assert len(rows) == 10
+            # Verify ordering is correct
+            for i in range(1, len(rows)):
+                prev, curr = rows[i - 1], rows[i]
+                assert (prev["group_id"], prev["version"]) <= (
+                    curr["group_id"],
+                    curr["version"],
+                )
+        finally:
+            _disable_parallel(db)
+
+    def test_parallel_single_group_many_versions(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Parallel scan with a single group exercises shared reconstruction chain."""
+        t = make_table()
+        # 200 versions in one group — crosses multiple keyframe boundaries
+        insert_versions(db, t, group_id=1, count=200)
+        db.execute(f"ANALYZE {t}")
+
+        # Serial baseline
+        _disable_parallel(db)
+        db.execute("SET max_parallel_workers_per_gather = 0")
+        serial = db.execute(
+            f"SELECT group_id, version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        db.execute("RESET max_parallel_workers_per_gather")
+
+        # Parallel
+        _enable_parallel(db)
+        try:
+            parallel = db.execute(
+                f"SELECT group_id, version, content FROM {t} ORDER BY version"
+            ).fetchall()
+        finally:
+            _disable_parallel(db)
+
+        assert len(serial) == len(parallel) == 200
+        for s, p in zip(serial, parallel):
+            assert s["version"] == p["version"]
+            assert s["content"] == p["content"]
+
+    def test_parallel_filter_on_group_column(
+        self, db: psycopg.Connection, make_table
+    ):
+        """WHERE on group_id (non-delta) column under parallel scan."""
+        t = make_table()
+        for g in range(1, 51):
+            insert_versions(db, t, group_id=g, count=10)
+        db.execute(f"ANALYZE {t}")
+
+        _enable_parallel(db)
+        try:
+            rows = db.execute(
+                f"SELECT group_id, version, content FROM {t} "
+                f"WHERE group_id = 25 ORDER BY version"
+            ).fetchall()
+            assert len(rows) == 10
+            assert all(r["group_id"] == 25 for r in rows)
+            assert [r["version"] for r in rows] == list(range(1, 11))
+        finally:
+            _disable_parallel(db)
+
+    def test_parallel_xp_seq_correctness(self, db: psycopg.Connection, make_table):
+        """_xp_seq values are correct under parallel scan."""
+        t = make_table()
+        for g in range(1, 21):
+            insert_versions(db, t, group_id=g, count=10)
+        db.execute(f"ANALYZE {t}")
+
+        # Serial baseline
+        _disable_parallel(db)
+        db.execute("SET max_parallel_workers_per_gather = 0")
+        serial = db.execute(
+            f"SELECT group_id, version, _xp_seq FROM {t} ORDER BY group_id, version"
+        ).fetchall()
+        db.execute("RESET max_parallel_workers_per_gather")
+
+        # Parallel
+        _enable_parallel(db)
+        try:
+            parallel = db.execute(
+                f"SELECT group_id, version, _xp_seq FROM {t} ORDER BY group_id, version"
+            ).fetchall()
+        finally:
+            _disable_parallel(db)
+
+        assert len(serial) == len(parallel) == 200
+        for s, p in zip(serial, parallel):
+            assert s["_xp_seq"] == p["_xp_seq"], (
+                f"_xp_seq mismatch for group={s['group_id']} version={s['version']}: "
+                f"serial={s['_xp_seq']} parallel={p['_xp_seq']}"
+            )
+
+    def test_concurrent_parallel_scans(
+        self, db: psycopg.Connection, make_table, db_factory
+    ):
+        """Two connections running parallel scans simultaneously."""
+        t = make_table()
+        for g in range(1, 51):
+            insert_versions(db, t, group_id=g, count=10)
+        db.execute(f"ANALYZE {t}")
+
+        db2 = db_factory()
+
+        for conn in (db, db2):
+            _enable_parallel(conn)
+
+        try:
+            # Run parallel count on both connections
+            cnt1 = row_count(db, t)
+            cnt2 = row_count(db2, t)
+            assert cnt1 == 500
+            assert cnt2 == 500
+
+            # Run full selects on both connections
+            rows1 = db.execute(
+                f"SELECT group_id, version, content FROM {t} ORDER BY group_id, version"
+            ).fetchall()
+            rows2 = db2.execute(
+                f"SELECT group_id, version, content FROM {t} ORDER BY group_id, version"
+            ).fetchall()
+            assert len(rows1) == len(rows2) == 500
+            for r1, r2 in zip(rows1, rows2):
+                assert r1["group_id"] == r2["group_id"]
+                assert r1["version"] == r2["version"]
+                assert r1["content"] == r2["content"]
+        finally:
+            for conn in (db, db2):
+                _disable_parallel(conn)

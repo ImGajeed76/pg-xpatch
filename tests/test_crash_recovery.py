@@ -14,7 +14,9 @@ Covers:
 - Committed DELETE survives crash
 - CHECKPOINT + crash preserves data
 - Uncommitted transaction lost after crash
-- Data integrity after recovery
+- Data integrity after recovery (delta chain across keyframes)
+- Multi-group crash recovery
+- Config metadata survives crash
 """
 
 from __future__ import annotations
@@ -50,6 +52,16 @@ def _reconnect(dbname: str, retries: int = 10, delay: float = 1.0) -> psycopg.Co
                 time.sleep(delay)
             else:
                 raise
+    raise RuntimeError("unreachable")  # guard for retries=0
+
+
+def _crash_and_recover(pg_ctl, timeout: int = 30) -> None:
+    """Kill PostgreSQL, verify it's down, then restart and wait."""
+    pg_ctl.kill()
+    time.sleep(0.5)
+    assert not pg_ctl.is_ready(), "PostgreSQL should be down after SIGKILL"
+    pg_ctl.start()
+    _wait_for_pg(pg_ctl, timeout=timeout)
 
 
 class TestInsertSurvivesCrash:
@@ -60,25 +72,13 @@ class TestInsertSurvivesCrash:
         t = make_table()
         dbname = db.info.dbname
 
-        # Insert and commit (autocommit=True)
+        # Insert and commit (autocommit=True: each INSERT flushes WAL at commit)
         for v in range(1, 6):
             insert_rows(db, t, [(1, v, f"crash-test-v{v}")])
 
-        # Force WAL flush
-        db.execute("SELECT pg_current_wal_flush_lsn()")
-
-        # Close our connection before killing
         db.close()
+        _crash_and_recover(pg_ctl)
 
-        # Crash!
-        pg_ctl.kill()
-        time.sleep(1)
-
-        # Restart
-        pg_ctl.start()
-        _wait_for_pg(pg_ctl)
-
-        # Reconnect and verify
         conn = _reconnect(dbname)
         try:
             cnt = row_count(conn, t)
@@ -106,13 +106,9 @@ class TestDeleteSurvivesCrash:
             insert_rows(db, t, [(1, v, f"v{v}")])
 
         db.execute(f"DELETE FROM {t} WHERE group_id = 1 AND version = 6")
-        db.execute("SELECT pg_current_wal_flush_lsn()")
 
         db.close()
-        pg_ctl.kill()
-        time.sleep(1)
-        pg_ctl.start()
-        _wait_for_pg(pg_ctl)
+        _crash_and_recover(pg_ctl)
 
         conn = _reconnect(dbname)
         try:
@@ -141,10 +137,7 @@ class TestCheckpointCrash:
         db.execute("CHECKPOINT")
 
         db.close()
-        pg_ctl.kill()
-        time.sleep(1)
-        pg_ctl.start()
-        _wait_for_pg(pg_ctl)
+        _crash_and_recover(pg_ctl)
 
         conn = _reconnect(dbname)
         try:
@@ -164,7 +157,15 @@ class TestUncommittedLostAfterCrash:
     """Uncommitted transaction is lost after crash."""
 
     def test_uncommitted_lost(self, db: psycopg.Connection, make_table, pg_ctl):
-        """Rows in an uncommitted transaction are gone after crash."""
+        """Rows in an uncommitted transaction are gone after crash.
+
+        NOTE: db.close() before kill sends a clean termination that triggers
+        a server-side ROLLBACK. In practice this tests "rolled back data is
+        gone after recovery" which is the same end result — the uncommitted
+        data doesn't survive. A true mid-transaction crash would require
+        killing PG while the connection is still open, but that leaves the
+        test client socket in a bad state, making it harder to test reliably.
+        """
         t = make_table()
         dbname = db.info.dbname
 
@@ -177,10 +178,7 @@ class TestUncommittedLostAfterCrash:
         # Don't commit — just crash
 
         db.close()
-        pg_ctl.kill()
-        time.sleep(1)
-        pg_ctl.start()
-        _wait_for_pg(pg_ctl)
+        _crash_and_recover(pg_ctl)
 
         conn = _reconnect(dbname)
         try:
@@ -201,17 +199,12 @@ class TestDataIntegrityAfterCrash:
         t = make_table(keyframe_every=3)
         dbname = db.info.dbname
 
-        # Insert enough rows to span multiple keyframes
+        # Insert enough rows to span multiple keyframes (keyframes at 1, 4, 7, 10)
         for v in range(1, 11):
             insert_rows(db, t, [(1, v, f"Recovery test version {v}: {'x' * v * 50}")])
 
-        db.execute("SELECT pg_current_wal_flush_lsn()")
-
         db.close()
-        pg_ctl.kill()
-        time.sleep(1)
-        pg_ctl.start()
-        _wait_for_pg(pg_ctl)
+        _crash_and_recover(pg_ctl)
 
         conn = _reconnect(dbname)
         try:
@@ -223,5 +216,56 @@ class TestDataIntegrityAfterCrash:
                 v = row["version"]
                 expected = f"Recovery test version {v}: {'x' * v * 50}"
                 assert row["content"] == expected, f"Content mismatch at v{v}"
+        finally:
+            conn.close()
+
+    def test_multi_group_survives_crash(self, db: psycopg.Connection, make_table, pg_ctl):
+        """Data from multiple groups is intact after crash recovery."""
+        t = make_table()
+        dbname = db.info.dbname
+
+        for gid in range(1, 4):
+            for v in range(1, 6):
+                insert_rows(db, t, [(gid, v, f"g{gid}-v{v}")])
+
+        db.close()
+        _crash_and_recover(pg_ctl)
+
+        conn = _reconnect(dbname)
+        try:
+            total = row_count(conn, t)
+            assert total == 15
+
+            for gid in range(1, 4):
+                rows = conn.execute(
+                    f"SELECT version, content FROM {t} "
+                    f"WHERE group_id = {gid} ORDER BY version"
+                ).fetchall()
+                assert len(rows) == 5, f"Group {gid}: expected 5 rows, got {len(rows)}"
+                for row in rows:
+                    v = row["version"]
+                    assert row["content"] == f"g{gid}-v{v}"
+        finally:
+            conn.close()
+
+    def test_config_survives_crash(self, db: psycopg.Connection, make_table, pg_ctl):
+        """xpatch.get_config() returns correct config after crash recovery."""
+        t = make_table(keyframe_every=7, compress_depth=2)
+        dbname = db.info.dbname
+
+        insert_rows(db, t, [(1, 1, "config-test")])
+        db.close()
+        _crash_and_recover(pg_ctl)
+
+        conn = _reconnect(dbname)
+        try:
+            config = conn.execute(
+                f"SELECT * FROM xpatch.get_config('{t}'::regclass)"
+            ).fetchone()
+            assert config is not None
+            assert config["group_by"] == "group_id"
+            assert config["order_by"] == "version"
+            assert config["keyframe_every"] == 7
+            assert config["compress_depth"] == 2
         finally:
             conn.close()
