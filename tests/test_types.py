@@ -597,3 +597,163 @@ class TestBoundaryValues:
         assert rows[0]["score"] is None
         assert rows[1]["score"] == 42
         assert rows[2]["score"] is None
+
+
+# ---------------------------------------------------------------------------
+# H4 — TIMESTAMP order_by dangling pointer in xpatch_get_max_version
+# ---------------------------------------------------------------------------
+
+
+class TestTimestampOrderByDanglingPointer:
+    """``xpatch_get_max_version`` (xpatch_storage.c:460-462) stores
+    ``max_version`` from ``version_datum`` which for pass-by-reference types
+    (like TIMESTAMP) points into the buffer page.  After ``LockBuffer(UNLOCK)``
+    + ``ReleaseBuffer()``, the pointer is dangling.
+
+    Bug: xpatch_storage.c:460-462 (known bug H4)
+
+    On this platform, TIMESTAMP is 8 bytes and passed by value (fits in a
+    Datum), so the dangling pointer issue does not manifest.  These tests
+    serve as regression guards — they would fail on a platform where
+    TIMESTAMP is pass-by-reference.
+    """
+
+    def test_timestamp_keyframe_placement_correct(
+        self, db: psycopg.Connection, make_table
+    ):
+        """With TIMESTAMP order_by and keyframe_every=5, keyframes should
+        appear at the correct sequence positions (1, 6, 11).
+
+        If the dangling pointer returns garbage for max_version, the
+        keyframe logic may produce wrong placement.
+        """
+        t = make_table(
+            "gid INT, ts TIMESTAMP, content TEXT NOT NULL",
+            group_by="gid",
+            order_by="ts",
+            keyframe_every=5,
+        )
+        # Insert 12 versions with timestamps
+        for v in range(1, 13):
+            db.execute(
+                f"INSERT INTO {t} (gid, ts, content) VALUES "
+                f"(1, '2025-01-01 00:00:00'::timestamp + interval '{v} hours', "
+                f"'ts-version-{v}')"
+            )
+
+        # Check keyframe placement via inspect()
+        rows = db.execute(
+            f"SELECT * FROM xpatch.inspect('{t}'::regclass, 1) ORDER BY seq"
+        ).fetchall()
+        keyframe_seqs = [r["seq"] for r in rows if r["is_keyframe"]]
+        assert keyframe_seqs == [1, 6, 11], (
+            f"Expected keyframes at [1, 6, 11], got {keyframe_seqs} — "
+            f"possible dangling pointer in xpatch_get_max_version (H4)"
+        )
+
+    def test_timestamp_order_by_data_integrity(
+        self, db: psycopg.Connection, make_table
+    ):
+        """TIMESTAMP order_by with multiple versions reconstructs correctly
+        (regression guard for H4).
+        """
+        t = make_table(
+            "gid INT, ts TIMESTAMP, content TEXT NOT NULL",
+            group_by="gid",
+            order_by="ts",
+            keyframe_every=3,
+        )
+        for v in range(1, 11):
+            db.execute(
+                f"INSERT INTO {t} (gid, ts, content) VALUES "
+                f"(1, '2025-06-{v:02d} 12:00:00', 'data-{v}')"
+            )
+
+        rows = db.execute(
+            f"SELECT content FROM {t} ORDER BY ts"
+        ).fetchall()
+        assert len(rows) == 10
+        for i, row in enumerate(rows, 1):
+            assert row["content"] == f"data-{i}"
+
+
+# ---------------------------------------------------------------------------
+# M1 — NUMERIC group_by hashes pointer value instead of datum value
+# ---------------------------------------------------------------------------
+
+
+class TestNumericGroupByHash:
+    """``xpatch_hash.h`` (line 132-137) falls back to hashing the Datum
+    pointer for unknown pass-by-reference types like NUMERIC.  Two different
+    pointers to equal NUMERIC values would produce different hashes.
+
+    Bug: xpatch_hash.h:132-137 (known bug M1)
+
+    Regression guard — tests that NUMERIC group_by values are tracked
+    correctly as separate groups with correct data.
+    """
+
+    def test_numeric_group_by_separate_groups(
+        self, db: psycopg.Connection, make_table
+    ):
+        """NUMERIC group_by values should be tracked as separate groups."""
+        from decimal import Decimal
+
+        t = make_table(
+            "amount NUMERIC(10,2), ver INT, content TEXT NOT NULL",
+            group_by="amount",
+            order_by="ver",
+        )
+        insert_rows(db, t, [
+            (Decimal("1.00"), 1, "group-1-v1"),
+            (Decimal("1.00"), 2, "group-1-v2"),
+            (Decimal("2.50"), 1, "group-250-v1"),
+            (Decimal("2.50"), 2, "group-250-v2"),
+        ], columns=["amount", "ver", "content"])
+
+        # Each NUMERIC value should be a separate group
+        g1 = db.execute(
+            f"SELECT ver, content FROM {t} WHERE amount = 1.00 ORDER BY ver"
+        ).fetchall()
+        g2 = db.execute(
+            f"SELECT ver, content FROM {t} WHERE amount = 2.50 ORDER BY ver"
+        ).fetchall()
+
+        assert len(g1) == 2
+        assert len(g2) == 2
+        assert g1[0]["content"] == "group-1-v1"
+        assert g1[1]["content"] == "group-1-v2"
+        assert g2[0]["content"] == "group-250-v1"
+        assert g2[1]["content"] == "group-250-v2"
+
+    def test_numeric_group_by_many_groups(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Multiple NUMERIC groups with delta chains all reconstruct correctly."""
+        from decimal import Decimal
+
+        t = make_table(
+            "price NUMERIC(12,4), ver INT, description TEXT NOT NULL",
+            group_by="price",
+            order_by="ver",
+        )
+        # Create 10 groups with 5 versions each
+        for g in range(1, 11):
+            price = Decimal(f"{g}.{g:04d}")
+            for v in range(1, 6):
+                insert_rows(db, t, [
+                    (price, v, f"price-{g}-ver-{v}"),
+                ], columns=["price", "ver", "description"])
+
+        assert row_count(db, t) == 50
+
+        # Spot-check a few groups
+        for check_g in [1, 5, 10]:
+            price = Decimal(f"{check_g}.{check_g:04d}")
+            rows = db.execute(
+                f"SELECT ver, description FROM {t} "
+                f"WHERE price = {price} ORDER BY ver"
+            ).fetchall()
+            assert len(rows) == 5
+            for row in rows:
+                assert row["description"] == f"price-{check_g}-ver-{row['ver']}"

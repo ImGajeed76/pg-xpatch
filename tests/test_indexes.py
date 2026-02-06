@@ -555,3 +555,128 @@ class TestVisibilityMapAfterDelete:
         finally:
             db.execute("SET enable_seqscan = on")
             db.execute("SET enable_bitmapscan = on")
+
+
+# ---------------------------------------------------------------------------
+# M2/M3 — CREATE INDEX CONCURRENTLY (index_build_range_scan ignores
+# start_blockno/numblocks, index_validate_scan is a no-op)
+# ---------------------------------------------------------------------------
+
+
+class TestCreateIndexConcurrently:
+    """``index_build_range_scan`` (xpatch_tam.c) ignores ``start_blockno``
+    and ``numblocks`` parameters, always scanning from block 0.
+    ``index_validate_scan`` is a complete no-op.
+
+    CREATE INDEX CONCURRENTLY uses these callbacks:
+    1. Phase 1: ``index_build_range_scan`` to build initial index
+    2. Phase 2: ``index_validate_scan`` to verify missed tuples
+
+    Despite these limitations, the index typically ends up correct because
+    Phase 1 scans all blocks (overly broad but not missing anything), and
+    Phase 2 being a no-op means it can't catch concurrent inserts that
+    happened during Phase 1.
+
+    Bugs: xpatch_tam.c (known bugs M2, M3)
+
+    Regression guards — tests that CREATE INDEX CONCURRENTLY produces
+    functionally correct indexes.
+    """
+
+    def test_create_index_concurrently_basic(
+        self, db: psycopg.Connection, make_table
+    ):
+        """CREATE INDEX CONCURRENTLY produces a usable, correct index."""
+        t = make_table()
+        for g in range(1, 6):
+            insert_versions(db, t, group_id=g, count=10)
+
+        db.execute(f"CREATE INDEX CONCURRENTLY {t}_cic_idx ON {t} (group_id)")
+        db.execute(f"ANALYZE {t}")
+
+        # Force index scan and verify correctness
+        db.execute("SET enable_seqscan = off")
+        try:
+            rows = db.execute(
+                f"SELECT version, content FROM {t} "
+                f"WHERE group_id = 3 ORDER BY version"
+            ).fetchall()
+            assert len(rows) == 10
+            for row in rows:
+                assert row["content"] == f"Version {row['version']} content"
+        finally:
+            db.execute("SET enable_seqscan = on")
+
+    def test_create_index_concurrently_on_delta_column(
+        self, db: psycopg.Connection, make_table
+    ):
+        """CREATE INDEX CONCURRENTLY on a delta-compressed column works."""
+        t = make_table()
+        for v in range(1, 21):
+            insert_rows(db, t, [(1, v, f"content-{v}")])
+
+        db.execute(f"CREATE INDEX CONCURRENTLY {t}_cic_content ON {t} (content)")
+        db.execute(f"ANALYZE {t}")
+
+        db.execute("SET enable_seqscan = off")
+        try:
+            row = db.execute(
+                f"SELECT version FROM {t} WHERE content = 'content-15'"
+            ).fetchone()
+            assert row is not None
+            assert row["version"] == 15
+        finally:
+            db.execute("SET enable_seqscan = on")
+
+    def test_create_index_concurrently_composite(
+        self, db: psycopg.Connection, make_table
+    ):
+        """CREATE INDEX CONCURRENTLY with composite key (group_id, version)."""
+        t = make_table()
+        for g in range(1, 4):
+            insert_versions(db, t, group_id=g, count=10)
+
+        db.execute(
+            f"CREATE INDEX CONCURRENTLY {t}_cic_comp ON {t} (group_id, version)"
+        )
+        db.execute(f"ANALYZE {t}")
+
+        db.execute("SET enable_seqscan = off")
+        try:
+            rows = db.execute(
+                f"SELECT version FROM {t} "
+                f"WHERE group_id = 2 AND version >= 5 ORDER BY version"
+            ).fetchall()
+            assert [r["version"] for r in rows] == [5, 6, 7, 8, 9, 10]
+        finally:
+            db.execute("SET enable_seqscan = on")
+
+    def test_create_index_concurrently_after_delete(
+        self, db: psycopg.Connection, make_table
+    ):
+        """CREATE INDEX CONCURRENTLY on table with deleted rows produces
+        an index that does NOT contain the deleted rows.
+        """
+        t = make_table()
+        for g in range(1, 4):
+            insert_versions(db, t, group_id=g, count=10)
+
+        # Delete group 2
+        db.execute(f"DELETE FROM {t} WHERE group_id = 2 AND version = 1")
+        db.execute(f"VACUUM {t}")
+
+        db.execute(
+            f"CREATE INDEX CONCURRENTLY {t}_cic_post_del ON {t} (group_id)"
+        )
+        db.execute(f"ANALYZE {t}")
+
+        db.execute("SET enable_seqscan = off")
+        try:
+            rows = db.execute(
+                f"SELECT * FROM {t} WHERE group_id = 2"
+            ).fetchall()
+            assert len(rows) == 0, (
+                f"Deleted group visible via concurrently-built index: {rows}"
+            )
+        finally:
+            db.execute("SET enable_seqscan = on")

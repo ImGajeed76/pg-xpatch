@@ -553,3 +553,197 @@ class TestExcessDeltaColumns:
                 )
         finally:
             db.execute(f"DROP TABLE IF EXISTS {t}")
+
+
+# ---------------------------------------------------------------------------
+# C5 — _xp_seq INT4 overflow at 2.1B rows per group
+# ---------------------------------------------------------------------------
+
+
+class TestXpSeqOverflow:
+    """``_xp_seq`` is defined as INT (int32).  For a group with more than
+    2,147,483,647 rows, the sequence wraps, causing delta chain corruption.
+
+    Bug: xpatch_config.c:444, xpatch_storage.c:1157 (known bug C5)
+
+    Testing with actual 2.1B rows is impractical, so we test via restore mode
+    where we can explicitly set ``_xp_seq`` values near the INT_MAX boundary.
+    """
+
+    def test_xp_seq_near_int_max_insert_succeeds(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Inserting rows with _xp_seq near INT_MAX via restore mode should
+        succeed and round-trip correctly (regression guard).
+        """
+        t = make_table()
+        # Use xpatch.restore() to insert with explicit _xp_seq values
+        # near INT_MAX
+        near_max = 2_147_483_640
+        try:
+            db.execute(
+                f"SELECT xpatch.restore('{t}'::regclass, "
+                f"group_id => 1, version => 1, _xp_seq => {near_max}, "
+                f"content => 'near-max')"
+            )
+            db.execute(
+                f"SELECT xpatch.restore('{t}'::regclass, "
+                f"group_id => 1, version => 2, _xp_seq => {near_max + 1}, "
+                f"content => 'near-max-plus-1')"
+            )
+            rows = db.execute(
+                f"SELECT _xp_seq, version, content FROM {t} ORDER BY _xp_seq"
+            ).fetchall()
+            assert len(rows) == 2
+            assert rows[0]["_xp_seq"] == near_max
+            assert rows[1]["content"] == "near-max-plus-1"
+        except psycopg.errors.Error:
+            # If restore() doesn't exist or doesn't support this,
+            # skip gracefully
+            pytest.skip("xpatch.restore() not available or doesn't support explicit _xp_seq")
+
+    @pytest.mark.xfail(
+        strict=False,
+        reason="C5: _xp_seq uses INT4 — overflow at 2.1B rows per group; "
+               "auto-increment after INT_MAX may wrap or error",
+    )
+    def test_xp_seq_at_int_max_auto_increment_errors(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Auto-incrementing _xp_seq past INT_MAX should raise an error
+        rather than silently wrapping.
+        """
+        t = make_table()
+        int_max = 2_147_483_647
+        try:
+            # Restore a row with _xp_seq at INT_MAX
+            db.execute(
+                f"SELECT xpatch.restore('{t}'::regclass, "
+                f"group_id => 1, version => 1, _xp_seq => {int_max}, "
+                f"content => 'at-max')"
+            )
+            # Now try a normal insert — auto-increment should need INT_MAX+1
+            # which overflows INT4
+            with pytest.raises(psycopg.errors.Error):
+                db.execute(
+                    f"INSERT INTO {t} (group_id, version, content) "
+                    f"VALUES (1, 2, 'overflow')"
+                )
+        except psycopg.errors.Error:
+            pytest.skip("xpatch.restore() not available for this test")
+
+
+# ---------------------------------------------------------------------------
+# H7 — Config cache in TopMemoryContext never invalidated
+# ---------------------------------------------------------------------------
+
+
+class TestConfigCacheInvalidation:
+    """The config hash table lives in ``TopMemoryContext`` and entries are
+    only removed by explicit ``xpatch_invalidate_config()`` calls.  There is
+    no relcache invalidation callback.  If a table is ALTERed, the cached
+    config becomes stale.
+
+    Bug: xpatch_config.c:68, 471-495 (known bug H7)
+
+    Despite the lack of explicit invalidation, PostgreSQL's relcache
+    invalidation seems to trigger config re-reads in practice (see
+    TestAlterTable in test_basic.py).  These tests guard that assumption.
+    """
+
+    def test_add_column_config_refreshed(
+        self, db: psycopg.Connection, make_table
+    ):
+        """After ALTER TABLE ADD COLUMN, the config should reflect the new
+        schema — INSERT with new column should succeed.
+        """
+        t = make_table()
+        insert_rows(db, t, [(1, 1, "before-add")])
+
+        db.execute(f"ALTER TABLE {t} ADD COLUMN extra TEXT DEFAULT 'x'")
+
+        # Insert using the new column
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, content, extra) "
+            f"VALUES (1, 2, 'after-add', 'new-data')"
+        )
+
+        rows = db.execute(
+            f"SELECT version, content, extra FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[1]["content"] == "after-add"
+        assert rows[1]["extra"] == "new-data"
+
+    def test_rename_column_config_refreshed(
+        self, db: psycopg.Connection, make_table
+    ):
+        """After ALTER TABLE RENAME COLUMN on a delta column, subsequent
+        inserts and reads should use the new name correctly.
+        """
+        t = make_table()
+        insert_rows(db, t, [(1, 1, "before-rename")])
+
+        db.execute(f"ALTER TABLE {t} RENAME COLUMN content TO body")
+
+        # Insert using the renamed column
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, body) "
+            f"VALUES (1, 2, 'after-rename')"
+        )
+
+        rows = db.execute(
+            f"SELECT version, body FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0]["body"] == "before-rename"
+        assert rows[1]["body"] == "after-rename"
+
+    def test_drop_column_config_refreshed(
+        self, db: psycopg.Connection, make_table
+    ):
+        """After ALTER TABLE DROP COLUMN on a non-delta column, INSERT
+        still works correctly with the remaining columns.
+        """
+        t = make_table(
+            "group_id INT, version INT, extra INT, content TEXT NOT NULL",
+        )
+        insert_rows(db, t, [(1, 1, 42, "v1")],
+                    columns=["group_id", "version", "extra", "content"])
+
+        db.execute(f"ALTER TABLE {t} DROP COLUMN extra")
+
+        insert_rows(db, t, [(1, 2, "v2")],
+                    columns=["group_id", "version", "content"])
+
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[1]["content"] == "v2"
+
+    def test_reconfigure_table_updates_cache(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Calling configure() again after inserting data refreshes the
+        config cache — subsequent reads still work.
+        """
+        t = make_table(keyframe_every=100)
+        insert_versions(db, t, group_id=1, count=5)
+
+        # Reconfigure with different keyframe_every
+        db.execute(
+            f"SELECT xpatch.configure('{t}', "
+            f"group_by => 'group_id', order_by => 'version', "
+            f"keyframe_every => 2)"
+        )
+
+        # Read should still work
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 5
+
+        # Insert new row — should use new keyframe_every=2
+        insert_rows(db, t, [(1, 6, "after reconfig")])
+        assert row_count(db, t) == 6

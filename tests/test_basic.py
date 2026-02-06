@@ -16,9 +16,14 @@ Covers:
 - DROP TABLE config cleanup
 - ALTER TABLE (ADD/DROP/RENAME COLUMN) regression tests
 - Custom schema support (non-public schemas)
+- Nested loop rescan nblocks (L5 — regression guard)
+- Concurrent cache stress (L6 — regression guard)
 """
 
 from __future__ import annotations
+
+import threading
+from typing import Any
 
 import psycopg
 import pytest
@@ -1051,3 +1056,207 @@ class TestCopyBinaryMode:
         for orig, copied in zip(rows_orig, rows_copy):
             assert orig["version"] == copied["version"]
             assert orig["content"] == copied["content"]
+
+
+# ---------------------------------------------------------------------------
+# L5 — xpatch_scan_rescan doesn't update nblocks
+# ---------------------------------------------------------------------------
+
+
+class TestRescanNblocks:
+    """``xpatch_scan_rescan`` doesn't update ``nblocks``.  When the xpatch
+    table is the inner side of a nested loop join, the rescan for each outer
+    row reuses the original nblocks — if the table grew between rescans,
+    new rows would be missed.
+
+    Bug: xpatch_tam.c (known bug L5)
+
+    Regression guard — tests that nested loop joins with xpatch as inner
+    table produce correct results.
+    """
+
+    def test_nested_loop_join_correct_results(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Nested loop join with xpatch as the inner table returns correct data."""
+        t = make_table()
+        for g in range(1, 4):
+            insert_versions(db, t, group_id=g, count=3)
+
+        # Create a regular heap table as the outer side
+        db.execute(
+            "CREATE TABLE lookup (id INT PRIMARY KEY, label TEXT)"
+        )
+        db.execute(
+            "INSERT INTO lookup VALUES (1, 'Alpha'), (2, 'Beta'), (3, 'Gamma')"
+        )
+        db.execute(f"ANALYZE {t}")
+        db.execute("ANALYZE lookup")
+
+        # Force nested loop join
+        db.execute("SET enable_hashjoin = off")
+        db.execute("SET enable_mergejoin = off")
+        db.execute("SET enable_nestloop = on")
+        try:
+            rows = db.execute(
+                f"SELECT l.label, x.version, x.content "
+                f"FROM lookup l JOIN {t} x ON l.id = x.group_id "
+                f"ORDER BY l.id, x.version"
+            ).fetchall()
+            assert len(rows) == 9
+            # Verify all groups
+            alpha_rows = [r for r in rows if r["label"] == "Alpha"]
+            assert len(alpha_rows) == 3
+            assert [r["version"] for r in alpha_rows] == [1, 2, 3]
+        finally:
+            db.execute("SET enable_hashjoin = on")
+            db.execute("SET enable_mergejoin = on")
+
+    def test_nested_loop_join_with_filter(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Nested loop join with WHERE filter on xpatch table."""
+        t = make_table()
+        for g in range(1, 6):
+            insert_versions(db, t, group_id=g, count=5)
+
+        db.execute(
+            "CREATE TABLE nl_filter (id INT PRIMARY KEY)"
+        )
+        db.execute(
+            "INSERT INTO nl_filter VALUES (1), (3), (5)"
+        )
+        db.execute(f"ANALYZE {t}")
+        db.execute("ANALYZE nl_filter")
+
+        db.execute("SET enable_hashjoin = off")
+        db.execute("SET enable_mergejoin = off")
+        try:
+            rows = db.execute(
+                f"SELECT f.id, x.version "
+                f"FROM nl_filter f JOIN {t} x ON f.id = x.group_id "
+                f"WHERE x.version <= 2 "
+                f"ORDER BY f.id, x.version"
+            ).fetchall()
+            # 3 groups x 2 versions each = 6 rows
+            assert len(rows) == 6
+            assert all(r["version"] <= 2 for r in rows)
+        finally:
+            db.execute("SET enable_hashjoin = on")
+            db.execute("SET enable_mergejoin = on")
+
+
+# ---------------------------------------------------------------------------
+# L6 — xpatch_cache_get lock upgrade not atomic
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentCacheStress:
+    """``xpatch_cache_get`` releases a shared lock and reacquires an exclusive
+    lock when a cache entry needs to be created.  Between release and
+    reacquire, another backend could evict the entry.
+
+    Bug: xpatch_config.c (known bug L6)
+
+    Stress test — 5 concurrent connections scanning the same table
+    simultaneously to provoke cache contention.
+    """
+
+    @pytest.mark.stress
+    def test_concurrent_scans_no_crash(
+        self, db: psycopg.Connection, db_factory, make_table
+    ):
+        """5 concurrent connections scanning the same xpatch table
+        simultaneously should not crash or produce errors.
+        """
+        t = make_table()
+        # Insert enough data to make scans non-trivial
+        for g in range(1, 6):
+            insert_versions(db, t, group_id=g, count=50)
+
+        n_workers = 5
+        conns = [db_factory() for _ in range(n_workers)]
+        results: dict[str, Any] = {}
+
+        def scan_worker(conn, name):
+            try:
+                for _ in range(10):
+                    rows = conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {t}"
+                    ).fetchone()
+                    assert rows["n"] == 250
+                results[name] = "ok"
+            except Exception as e:
+                results[name] = f"error: {e}"
+
+        threads = []
+        for i, conn in enumerate(conns):
+            t_thread = threading.Thread(
+                target=scan_worker, args=(conn, f"worker-{i}")
+            )
+            threads.append(t_thread)
+
+        for t_thread in threads:
+            t_thread.start()
+        for t_thread in threads:
+            t_thread.join(timeout=30)
+
+        for name, result in results.items():
+            assert result == "ok", f"{name}: {result}"
+
+    @pytest.mark.stress
+    def test_concurrent_mixed_operations_no_crash(
+        self, db: psycopg.Connection, db_factory, make_table
+    ):
+        """Concurrent INSERT + SELECT + ANALYZE on the same table should
+        not crash or produce incorrect results.
+        """
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=20)
+
+        conns = [db_factory() for _ in range(3)]
+        results: dict[str, Any] = {}
+
+        def do_inserts(conn, name):
+            try:
+                for v in range(21, 51):
+                    insert_rows(conn, t, [(1, v, f"concurrent-{v}")])
+                results[name] = "ok"
+            except Exception as e:
+                results[name] = f"error: {e}"
+
+        def do_selects(conn, name):
+            try:
+                for _ in range(20):
+                    rows = conn.execute(
+                        f"SELECT version FROM {t} ORDER BY version"
+                    ).fetchall()
+                    assert len(rows) >= 20  # at least the original rows
+                results[name] = "ok"
+            except Exception as e:
+                results[name] = f"error: {e}"
+
+        def do_analyzes(conn, name):
+            try:
+                for _ in range(5):
+                    conn.execute(f"ANALYZE {t}")
+                results[name] = "ok"
+            except Exception as e:
+                results[name] = f"error: {e}"
+
+        threads = [
+            threading.Thread(target=do_inserts, args=(conns[0], "inserts")),
+            threading.Thread(target=do_selects, args=(conns[1], "selects")),
+            threading.Thread(target=do_analyzes, args=(conns[2], "analyzes")),
+        ]
+        for t_thread in threads:
+            t_thread.start()
+        for t_thread in threads:
+            t_thread.join(timeout=30)
+
+        for name, result in results.items():
+            assert result == "ok", f"{name}: {result}"
+
+        # Final integrity check
+        cnt = row_count(db, t)
+        assert cnt == 50, f"Expected 50 rows, got {cnt}"

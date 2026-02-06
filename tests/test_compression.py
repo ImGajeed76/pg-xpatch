@@ -508,3 +508,94 @@ class TestCompressionEdgeCases:
             assert len(rows) == v
             for row in rows:
                 assert row["content"] == f"content-{row['version']}"
+
+
+# ---------------------------------------------------------------------------
+# H1 — Memory leak of `reconstructed` bytea in xpatch_physical_to_logical
+# ---------------------------------------------------------------------------
+
+
+class TestReconstructedMemoryLeak:
+    """``xpatch_physical_to_logical`` (xpatch_storage.c:1733-1740) leaks the
+    ``reconstructed`` bytea returned by ``xpatch_reconstruct_column_with_tuple``.
+    ``bytea_to_datum()`` does a palloc + copy, but the source ``reconstructed``
+    bytea is never freed.
+
+    Bug: xpatch_storage.c:1733-1740 (known bug H1)
+
+    We can't directly detect the leak from SQL, but we can guard against
+    OOM crashes by running many scans over large delta-compressed data.
+    """
+
+    def test_repeated_full_scan_no_crash(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Scanning all rows repeatedly should not crash or error.
+
+        If the memory leak is severe, repeated scans of large data will
+        eventually exhaust memory and crash the backend.
+        """
+        t = make_table()
+        # Insert 50 rows with ~10KB content each (500KB total data)
+        base = "X" * 10_000
+        for v in range(1, 51):
+            content = base[:v * 50] + "CHANGED" + base[v * 50 + 7:]
+            insert_rows(db, t, [(1, v, content)])
+
+        # Scan all rows 20 times — if there's a leak of ~10KB per row per scan,
+        # that's ~10MB of leaked memory.  Should not crash in 30s.
+        for scan in range(20):
+            rows = db.execute(
+                f"SELECT version, length(content) as len FROM {t} ORDER BY version"
+            ).fetchall()
+            assert len(rows) == 50
+            for row in rows:
+                assert row["len"] == 10_000
+
+    def test_multi_delta_column_repeated_scan(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Multiple delta columns scanned repeatedly — leak is per-column."""
+        t = make_table(
+            "gid INT, ver INT, body TEXT NOT NULL, notes TEXT NOT NULL",
+            group_by="gid",
+            order_by="ver",
+            delta_columns=["body", "notes"],
+        )
+        base_body = "B" * 5_000
+        base_notes = "N" * 5_000
+        for v in range(1, 31):
+            body = base_body[:v * 30] + "CHG" + base_body[v * 30 + 3:]
+            notes = base_notes[:v * 20] + "MOD" + base_notes[v * 20 + 3:]
+            insert_rows(db, t, [(1, v, body, notes)],
+                        columns=["gid", "ver", "body", "notes"])
+
+        for scan in range(15):
+            rows = db.execute(
+                f"SELECT ver, length(body) as blen, length(notes) as nlen "
+                f"FROM {t} ORDER BY ver"
+            ).fetchall()
+            assert len(rows) == 30
+            for row in rows:
+                assert row["blen"] == 5_000
+                assert row["nlen"] == 5_000
+
+    def test_large_data_sequential_scan_integrity(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Large data with many versions — content integrity across scans."""
+        t = make_table(keyframe_every=10)
+        base = "A" * 50_000  # 50KB per row
+        for v in range(1, 26):
+            content = base[:v * 100] + f"-v{v}-" + base[v * 100 + len(f"-v{v}-"):]
+            insert_rows(db, t, [(1, v, content)])
+
+        # Full scan
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 25
+        for row in rows:
+            v = row["version"]
+            assert f"-v{v}-" in row["content"]
+            assert len(row["content"]) == 50_000

@@ -18,6 +18,10 @@ Covers:
 - Concurrent DELETE serialization (H4 — fixed)
 - MVCC visibility via sequential scan (C4 — regression guard)
 - MVCC visibility via bitmap scan (H6 — fixed)
+- Speculative INSERT orphan (C1 — known bug, xfail)
+- Sequential scan nblocks not updated (H3 — regression guard)
+- DELETE two-pass race with VACUUM (H5 — regression guard)
+- SERIALIZABLE snapshot visibility (M5 — regression guard)
 """
 
 from __future__ import annotations
@@ -692,3 +696,292 @@ class TestMvccVisibilityBitmapScan:
         finally:
             db.execute("SET enable_seqscan = on")
             db.execute("SET enable_indexscan = on")
+
+
+# ---------------------------------------------------------------------------
+# C1 — Speculative INSERT orphan (INSERT ON CONFLICT)
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculativeInsertOrphan:
+    """``xpatch_tuple_insert_speculative`` delegates to the regular insert
+    path, so ``complete_speculative(false)`` cannot undo it — an orphaned
+    tuple permanently occupies a sequence slot.
+
+    Bug: xpatch_tam.c:982-1023 (known bug C1)
+    """
+
+    @pytest.mark.xfail(
+        strict=False,
+        reason="C1: speculative insert orphan — complete_speculative(false) "
+               "does not remove the row; may leave COUNT=2",
+    )
+    def test_concurrent_on_conflict_do_nothing_no_orphan(
+        self, db: psycopg.Connection, db2: psycopg.Connection, make_table
+    ):
+        """Two concurrent INSERT ON CONFLICT DO NOTHING for the same key
+        should result in exactly 1 row.  If the speculative insert is not
+        properly aborted, an orphan row leaks and COUNT becomes 2.
+        """
+        t = make_table()
+        db.execute(f"CREATE UNIQUE INDEX ON {t} (group_id, version)")
+
+        results: dict[str, Any] = {}
+
+        def do_insert(conn, name):
+            try:
+                conn.execute(
+                    f"INSERT INTO {t} (group_id, version, content) "
+                    f"VALUES (1, 1, 'from-{name}') "
+                    f"ON CONFLICT (group_id, version) DO NOTHING"
+                )
+                results[name] = "ok"
+            except Exception as e:
+                results[name] = f"error: {e}"
+
+        t1 = threading.Thread(target=do_insert, args=(db, "conn1"))
+        t2 = threading.Thread(target=do_insert, args=(db2, "conn2"))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert results.get("conn1") == "ok", f"conn1: {results.get('conn1')}"
+        assert results.get("conn2") == "ok", f"conn2: {results.get('conn2')}"
+
+        cnt = row_count(db, t)
+        assert cnt == 1, (
+            f"Expected exactly 1 row after concurrent ON CONFLICT DO NOTHING, "
+            f"got {cnt} — orphan row leaked (C1)"
+        )
+
+    def test_sequential_on_conflict_do_nothing_integrity(
+        self, db: psycopg.Connection, make_table
+    ):
+        """Sequential INSERT ON CONFLICT DO NOTHING — no orphan for the
+        non-concurrent case (regression guard).
+        """
+        t = make_table()
+        db.execute(f"CREATE UNIQUE INDEX ON {t} (group_id, version)")
+
+        insert_rows(db, t, [(1, 1, "original")])
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, content) "
+            f"VALUES (1, 1, 'duplicate') ON CONFLICT (group_id, version) DO NOTHING"
+        )
+        assert row_count(db, t) == 1
+
+
+# ---------------------------------------------------------------------------
+# H3 — Sequential scan nblocks not updated during scan
+# ---------------------------------------------------------------------------
+
+
+class TestScanNblocksNotUpdated:
+    """``xpatch_scan_getnextslot`` uses ``scan->nblocks`` set once at
+    ``scan_begin``.  If rows are inserted concurrently that extend the
+    relation, the scan misses the new blocks.
+
+    Bug: xpatch_tam.c:599-709 (known bug H3)
+
+    Regression guard — tests that a cursor-based scan at least returns
+    the originally-visible rows and doesn't crash.
+    """
+
+    def test_cursor_scan_during_concurrent_insert(
+        self, db: psycopg.Connection, db2: psycopg.Connection, make_table
+    ):
+        """A server-side cursor opened before new rows are inserted should
+        return at least the original rows without crashing.
+        """
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=10)
+
+        # Open a cursor on db — nblocks is frozen here
+        db.autocommit = False
+        try:
+            db.execute(f"DECLARE cur CURSOR FOR SELECT version FROM {t} ORDER BY version")
+
+            # Insert more rows from db2, extending the relation
+            for v in range(11, 31):
+                insert_rows(db2, t, [(1, v, f"Version {v} content")])
+
+            # Fetch all from cursor — should get at least the original 10
+            rows = db.execute("FETCH ALL FROM cur").fetchall()
+            db.execute("CLOSE cur")
+
+            assert len(rows) >= 10, (
+                f"Expected at least 10 rows from cursor, got {len(rows)}"
+            )
+            # Verify the first 10 are correct
+            versions = [r["version"] for r in rows[:10]]
+            assert versions == list(range(1, 11))
+        finally:
+            db.rollback()
+            db.autocommit = True
+
+
+# ---------------------------------------------------------------------------
+# H5 — DELETE two-pass race with concurrent VACUUM
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteVacuumRace:
+    """``xpatch_tuple_delete`` does two passes using a sequential counter
+    instead of ``_xp_seq``.  If VACUUM modifies page layout between passes,
+    the counter may mismatch, causing wrong tuples to be deleted.
+
+    Bug: xpatch_tam.c:1329-1453 (known bug H5)
+
+    Regression guard — hard to trigger deterministically but tests that
+    DELETE + concurrent VACUUM don't corrupt data.
+    """
+
+    def test_delete_with_concurrent_vacuum_no_corruption(
+        self, db: psycopg.Connection, db2: psycopg.Connection, make_table
+    ):
+        """DELETE and VACUUM running concurrently on the same group should
+        not corrupt data or crash.
+        """
+        t = make_table(keyframe_every=10)
+        # Insert enough data that VACUUM has work to do
+        insert_versions(db, t, group_id=1, count=20)
+        insert_versions(db, t, group_id=2, count=20)
+
+        # First, delete some rows to create dead tuples for VACUUM
+        db.execute(f"DELETE FROM {t} WHERE group_id = 2 AND version = 1")
+
+        results: dict[str, Any] = {}
+
+        def do_delete(conn, name):
+            try:
+                conn.execute(
+                    f"DELETE FROM {t} WHERE group_id = 1 AND version = 10"
+                )
+                results[name] = "ok"
+            except Exception as e:
+                results[name] = f"error: {e}"
+
+        def do_vacuum(conn, name):
+            try:
+                conn.execute(f"VACUUM {t}")
+                results[name] = "ok"
+            except Exception as e:
+                results[name] = f"error: {e}"
+
+        t1 = threading.Thread(target=do_delete, args=(db, "delete"))
+        t2 = threading.Thread(target=do_vacuum, args=(db2, "vacuum"))
+
+        t1.start()
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+
+        # Both should complete without error
+        assert results.get("delete") == "ok", f"delete: {results.get('delete')}"
+        assert results.get("vacuum") == "ok", f"vacuum: {results.get('vacuum')}"
+
+        # Verify remaining group 1 data is consistent
+        rows = db.execute(
+            f"SELECT version, content FROM {t} WHERE group_id = 1 ORDER BY version"
+        ).fetchall()
+        # Cascade from version 10: v10-v20 deleted, v1-v9 remain
+        assert len(rows) == 9
+        for row in rows:
+            assert row["content"] is not None
+            assert row["version"] <= 9
+
+
+# ---------------------------------------------------------------------------
+# M5 — SERIALIZABLE snapshot visibility always returns true for virtual tuples
+# ---------------------------------------------------------------------------
+
+
+class TestSerializableIsolation:
+    """``xpatch_tuple_satisfies_snapshot`` always returns true for virtual
+    tuples.  Despite this, PostgreSQL's predicate locking detects
+    SERIALIZABLE conflicts independently of the TAM's snapshot check.
+
+    Bug: xpatch_tam.c (known bug M5)
+
+    Regression guards — SERIALIZABLE isolation works today because PG's
+    predicate lock manager catches the conflict.
+    """
+
+    def test_serializable_write_write_conflict(
+        self, db: psycopg.Connection, db_factory, make_table
+    ):
+        """Two SERIALIZABLE transactions writing to the same table should
+        produce a serialization failure if they overlap.
+        """
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=5)
+
+        db2 = db_factory()
+        results: dict[str, Any] = {}
+
+        def txn_insert(conn, name, version):
+            try:
+                conn.autocommit = False
+                conn.execute(
+                    "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+                )
+                # Read the table to establish a read dependency
+                conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()
+                time.sleep(0.2)
+                # Insert new row
+                conn.execute(
+                    f"INSERT INTO {t} (group_id, version, content) "
+                    f"VALUES (1, {version}, 'ser-{name}')"
+                )
+                conn.commit()
+                results[name] = "ok"
+            except psycopg.errors.SerializationFailure:
+                conn.rollback()
+                results[name] = "serialization_failure"
+            except Exception as e:
+                conn.rollback()
+                results[name] = f"error: {e}"
+            finally:
+                conn.autocommit = True
+
+        t1 = threading.Thread(target=txn_insert, args=(db, "conn1", 100))
+        t2 = threading.Thread(target=txn_insert, args=(db2, "conn2", 200))
+        t1.start()
+        time.sleep(0.05)
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        # At least one should get serialization_failure
+        outcomes = [results.get("conn1"), results.get("conn2")]
+        assert "serialization_failure" in outcomes, (
+            f"Expected at least one SERIALIZABLE conflict, got: {outcomes}"
+        )
+
+    def test_read_committed_concurrent_inserts_both_succeed(
+        self, db: psycopg.Connection, db2: psycopg.Connection, make_table
+    ):
+        """Under READ COMMITTED (default), concurrent inserts to separate
+        groups both succeed — regression guard for M5.
+        """
+        t = make_table()
+        results: dict[str, Any] = {}
+
+        def do_insert(conn, name, gid):
+            try:
+                insert_rows(conn, t, [(gid, 1, f"from-{name}")])
+                results[name] = "ok"
+            except Exception as e:
+                results[name] = f"error: {e}"
+
+        t1 = threading.Thread(target=do_insert, args=(db, "conn1", 1))
+        t2 = threading.Thread(target=do_insert, args=(db2, "conn2", 2))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert results.get("conn1") == "ok"
+        assert results.get("conn2") == "ok"
+        assert row_count(db, t) == 2
