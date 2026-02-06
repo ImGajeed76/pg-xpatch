@@ -130,7 +130,7 @@ class TestIndexScanPlans:
             plan = db.execute(
                 f"EXPLAIN (COSTS OFF) SELECT * FROM {t} WHERE group_id = 3"
             ).fetchall()
-            plan_text = "\n".join(r[list(r.keys())[0]] for r in plan)
+            plan_text = "\n".join(r["QUERY PLAN"] for r in plan)
             assert "Index" in plan_text or "Bitmap" in plan_text, (
                 f"Expected index scan in plan:\n{plan_text}"
             )
@@ -200,8 +200,9 @@ class TestAnalyze:
             [t],
         ).fetchall()
         att_names = {r["attname"] for r in stats}
-        # At minimum group_id and version should have stats
-        assert "group_id" in att_names or "version" in att_names
+        # ANALYZE should produce stats for user columns
+        assert "group_id" in att_names, f"group_id not in pg_stats. Found: {att_names}"
+        assert "version" in att_names, f"version not in pg_stats. Found: {att_names}"
 
 
 class TestIndexSurvivalAfterDDL:
@@ -247,3 +248,164 @@ class TestIndexSurvivalAfterDDL:
             assert len(rows) == 10
         finally:
             db.execute("SET enable_seqscan = on")
+
+
+class TestIndexEdgeCases:
+    """Edge cases for index support on xpatch tables."""
+
+    def test_index_on_xp_seq_column(self, db: psycopg.Connection, make_table):
+        """Manual index on _xp_seq works for point queries."""
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=10)
+        # The auto-created composite index already covers _xp_seq,
+        # but test a direct single-column index too
+        db.execute(f"CREATE INDEX ON {t} (_xp_seq)")
+        db.execute(f"ANALYZE {t}")
+
+        db.execute("SET enable_seqscan = off")
+        try:
+            row = db.execute(
+                f"SELECT version FROM {t} WHERE _xp_seq = 5"
+            ).fetchone()
+            assert row is not None
+            assert row["version"] == 5
+        finally:
+            db.execute("SET enable_seqscan = on")
+
+    def test_index_drop_and_recreate(self, db: psycopg.Connection, make_table):
+        """DROP INDEX + CREATE INDEX — index rebuild works on delta data."""
+        t = make_table()
+        for v in range(1, 11):
+            insert_rows(db, t, [(1, v, f"content-{v}")])
+        db.execute(f"CREATE INDEX idx_rebuild_test ON {t} (content)")
+        db.execute(f"ANALYZE {t}")
+
+        # Verify index works
+        db.execute("SET enable_seqscan = off")
+        try:
+            row = db.execute(
+                f"SELECT version FROM {t} WHERE content = 'content-5'"
+            ).fetchone()
+            assert row is not None
+            assert row["version"] == 5
+        finally:
+            db.execute("SET enable_seqscan = on")
+
+        # Drop and recreate
+        db.execute("DROP INDEX idx_rebuild_test")
+        db.execute(f"CREATE INDEX idx_rebuild_test ON {t} (content)")
+        db.execute(f"ANALYZE {t}")
+
+        # Verify rebuilt index still works
+        db.execute("SET enable_seqscan = off")
+        try:
+            row = db.execute(
+                f"SELECT version FROM {t} WHERE content = 'content-7'"
+            ).fetchone()
+            assert row is not None
+            assert row["version"] == 7
+        finally:
+            db.execute("SET enable_seqscan = on")
+
+    def test_index_survives_vacuum(self, db: psycopg.Connection, make_table):
+        """Index remains usable after VACUUM on table with deleted rows."""
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=20)
+        db.execute(f"CREATE INDEX ON {t} (version)")
+
+        # Delete some rows
+        db.execute(f"DELETE FROM {t} WHERE group_id = 1 AND version = 15")
+        db.execute(f"VACUUM {t}")
+        db.execute(f"ANALYZE {t}")
+
+        db.execute("SET enable_seqscan = off")
+        try:
+            rows = db.execute(
+                f"SELECT version FROM {t} ORDER BY version"
+            ).fetchall()
+            # v15-v20 deleted by cascade, v1-v14 remain
+            assert len(rows) == 14
+            assert [r["version"] for r in rows] == list(range(1, 15))
+        finally:
+            db.execute("SET enable_seqscan = on")
+
+    def test_explain_analyze_with_index(self, db: psycopg.Connection, make_table):
+        """EXPLAIN (ANALYZE) with index scan completes without error."""
+        t = make_table()
+        for g in range(1, 6):
+            insert_versions(db, t, group_id=g, count=10)
+        db.execute(f"ANALYZE {t}")
+
+        db.execute("SET enable_seqscan = off")
+        try:
+            plan = db.execute(
+                f"EXPLAIN (ANALYZE, COSTS OFF) "
+                f"SELECT * FROM {t} WHERE group_id = 3"
+            ).fetchall()
+            plan_text = "\n".join(r["QUERY PLAN"] for r in plan)
+            # Should show actual rows
+            assert "actual" in plan_text.lower(), (
+                f"EXPLAIN ANALYZE should show actual rows:\n{plan_text}"
+            )
+        finally:
+            db.execute("SET enable_seqscan = on")
+
+    def test_index_with_many_rows(self, db: psycopg.Connection, make_table):
+        """Index correctness with enough data to span multiple heap blocks."""
+        t = make_table()
+        for g in range(1, 11):
+            insert_versions(db, t, group_id=g, count=100)
+        db.execute(f"ANALYZE {t}")
+
+        db.execute("SET enable_seqscan = off")
+        try:
+            rows = db.execute(
+                f"SELECT version FROM {t} WHERE group_id = 7 ORDER BY version"
+            ).fetchall()
+            assert len(rows) == 100
+            assert [r["version"] for r in rows] == list(range(1, 101))
+        finally:
+            db.execute("SET enable_seqscan = on")
+
+    def test_analyze_on_delta_columns(self, db: psycopg.Connection, make_table):
+        """ANALYZE produces meaningful stats for delta-compressed columns."""
+        t = make_table()
+        for g in range(1, 21):
+            for v in range(1, 6):
+                insert_rows(db, t, [(g, v, f"group{g}-version{v}")])
+        db.execute(f"ANALYZE {t}")
+
+        stats = db.execute(
+            "SELECT attname, n_distinct, null_frac "
+            "FROM pg_stats WHERE tablename = %s",
+            [t],
+        ).fetchall()
+        att_map = {r["attname"]: r for r in stats}
+        # content should have stats with meaningful n_distinct
+        assert "content" in att_map, (
+            f"content not in pg_stats. Found: {list(att_map.keys())}"
+        )
+        # n_distinct should be > 0 (there are 100 distinct content values)
+        assert att_map["content"]["n_distinct"] != 0
+
+    def test_bitmap_scan_explicit(self, db: psycopg.Connection, make_table):
+        """Bitmap scan returns correct data."""
+        t = make_table()
+        for g in range(1, 11):
+            insert_versions(db, t, group_id=g, count=10)
+        db.execute(f"ANALYZE {t}")
+
+        # Force bitmap scan by disabling both seqscan and indexscan
+        db.execute("SET enable_seqscan = off")
+        db.execute("SET enable_indexscan = off")
+        db.execute("SET enable_bitmapscan = on")
+        try:
+            rows = db.execute(
+                f"SELECT version, content FROM {t} WHERE group_id = 5 ORDER BY version"
+            ).fetchall()
+            assert len(rows) == 10
+            for row in rows:
+                assert row["content"] == f"Version {row['version']} content"
+        finally:
+            db.execute("SET enable_seqscan = on")
+            db.execute("SET enable_indexscan = on")

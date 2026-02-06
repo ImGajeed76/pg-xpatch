@@ -26,6 +26,11 @@ def test_pg_xpatch_version(db: psycopg.Connection, xpatch_expect_version: str | 
 
 def test_extension_loaded(db: psycopg.Connection):
     """pg_xpatch extension is installed and the access method is registered."""
+    ext = db.execute(
+        "SELECT 1 FROM pg_extension WHERE extname = 'pg_xpatch'"
+    ).fetchone()
+    assert ext is not None, "pg_xpatch extension not installed"
+
     row = db.execute(
         "SELECT 1 FROM pg_am WHERE amname = 'xpatch'"
     ).fetchone()
@@ -42,6 +47,43 @@ def test_xpatch_schema_exists(db: psycopg.Connection):
     """).fetchall()
     names = {r["routine_name"] for r in functions}
 
-    required = {"configure", "version", "stats", "describe", "inspect"}
+    required = {
+        "configure", "version", "stats", "describe", "inspect",
+        "get_config", "physical", "cache_stats", "warm_cache",
+    }
     missing = required - names
     assert not missing, f"Missing xpatch functions: {missing}"
+
+
+def test_event_triggers_registered(db: psycopg.Connection):
+    """Event triggers for auto-DDL are installed."""
+    triggers = db.execute(
+        "SELECT evtname FROM pg_event_trigger WHERE evtname LIKE 'xpatch_%'"
+    ).fetchall()
+    names = {r["evtname"] for r in triggers}
+    assert "xpatch_add_seq_column" in names, "Missing xpatch_add_seq_column event trigger"
+    assert "xpatch_cleanup_on_drop" in names, "Missing xpatch_cleanup_on_drop event trigger"
+
+
+def test_can_create_xpatch_table(db: psycopg.Connection):
+    """Minimal: CREATE TABLE USING xpatch succeeds and _xp_seq auto-added."""
+    db.execute(
+        "CREATE TABLE _smoke_probe (id INT, ver INT, body TEXT NOT NULL) USING xpatch"
+    )
+    row = db.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = '_smoke_probe' AND column_name = '_xp_seq'"
+    ).fetchone()
+    assert row is not None, "_xp_seq column was not auto-added"
+
+
+def test_can_insert_and_select(db: psycopg.Connection):
+    """Minimal round-trip: INSERT then SELECT through xpatch TAM."""
+    db.execute(
+        "CREATE TABLE _smoke_rt (gid INT, ver INT, body TEXT NOT NULL) USING xpatch"
+    )
+    db.execute("SELECT xpatch.configure('_smoke_rt', group_by => 'gid', order_by => 'ver')")
+    db.execute("INSERT INTO _smoke_rt (gid, ver, body) VALUES (1, 1, 'hello')")
+    row = db.execute("SELECT body FROM _smoke_rt WHERE gid = 1").fetchone()
+    assert row is not None, "No row returned after INSERT"
+    assert row["body"] == "hello", f"Expected 'hello', got '{row['body']}'"

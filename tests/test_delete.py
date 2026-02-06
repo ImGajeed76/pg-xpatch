@@ -9,11 +9,13 @@ Covers:
 - DELETE middle version: cascades to subsequent versions
 - DELETE first version: removes entire group
 - INSERT after DELETE: new versions work correctly
-- DELETE in table without group_by
 - Multi-group isolation
 - Row count correct after each delete
-- _xp_seq correct after delete + re-insert
 - DELETE with WHERE on delta column
+- DELETE without WHERE (all rows)
+- DELETE by group_id (whole group)
+- _xp_seq reset after full group delete + re-insert
+- Multiple sequential deletes
 """
 
 from __future__ import annotations
@@ -234,7 +236,12 @@ class TestDeleteEdgeCases:
         assert row_count(db, t) == 0
 
     def test_delete_by_content_filter(self, db: psycopg.Connection, xpatch_table):
-        """DELETE with WHERE on delta column (content)."""
+        """DELETE with WHERE on delta column (content).
+
+        Non-trivial: the scan must reconstruct delta-compressed content
+        before evaluating the WHERE predicate. The matched row's TID is
+        then passed to xpatch_tuple_delete for cascade.
+        """
         t = xpatch_table
         insert_rows(db, t, [
             (1, 1, "keep"),
@@ -250,3 +257,85 @@ class TestDeleteEdgeCases:
         assert len(remaining) == 1
         assert remaining[0]["version"] == 1
         assert remaining[0]["content"] == "keep"
+
+    def test_delete_all_rows_no_where(self, db: psycopg.Connection, xpatch_table):
+        """DELETE without WHERE removes all rows from the table."""
+        t = xpatch_table
+        for g in range(1, 4):
+            insert_versions(db, t, group_id=g, count=3)
+        assert row_count(db, t) == 9
+
+        db.execute(f"DELETE FROM {t}")
+        assert row_count(db, t) == 0
+
+    def test_delete_whole_group_by_group_id(self, db: psycopg.Connection, xpatch_table):
+        """DELETE WHERE group_id = X removes all versions in the group."""
+        t = xpatch_table
+        insert_versions(db, t, group_id=1, count=5)
+        insert_versions(db, t, group_id=2, count=3)
+
+        db.execute(f"DELETE FROM {t} WHERE group_id = 1")
+        assert row_count(db, t, "group_id = 1") == 0
+        assert row_count(db, t, "group_id = 2") == 3
+
+    def test_xp_seq_restarts_after_full_delete(self, db: psycopg.Connection, xpatch_table):
+        """_xp_seq restarts from 1 after full group deletion and re-insert."""
+        t = xpatch_table
+        insert_versions(db, t, group_id=1, count=3)
+        db.execute(f"DELETE FROM {t} WHERE group_id = 1 AND version = 1")
+        assert row_count(db, t) == 0
+
+        insert_rows(db, t, [(1, 1, "new-v1")])
+        row = db.execute(f"SELECT _xp_seq FROM {t} WHERE group_id = 1").fetchone()
+        assert row["_xp_seq"] == 1
+
+    def test_multiple_sequential_deletes(self, db: psycopg.Connection, xpatch_table):
+        """Multiple DELETEs in sequence across groups work correctly."""
+        t = xpatch_table
+        insert_versions(db, t, group_id=1, count=5)
+        insert_versions(db, t, group_id=2, count=5)
+
+        # Delete tail of group 1
+        db.execute(f"DELETE FROM {t} WHERE group_id = 1 AND version = 4")
+        assert row_count(db, t, "group_id = 1") == 3
+
+        # Delete tail of group 2
+        db.execute(f"DELETE FROM {t} WHERE group_id = 2 AND version = 3")
+        assert row_count(db, t, "group_id = 2") == 2
+
+        # Delete more from group 1
+        db.execute(f"DELETE FROM {t} WHERE group_id = 1 AND version = 2")
+        assert row_count(db, t, "group_id = 1") == 1
+        assert row_count(db, t, "group_id = 2") == 2
+
+    def test_delete_from_empty_table_no_where(self, db: psycopg.Connection, xpatch_table):
+        """DELETE without WHERE from an empty table is a no-op."""
+        t = xpatch_table
+        db.execute(f"DELETE FROM {t}")
+        assert row_count(db, t) == 0
+
+    def test_insert_after_partial_delete_chain_integrity(
+        self, db: psycopg.Connection, xpatch_table
+    ):
+        """After cascade delete, new inserts form a valid delta chain."""
+        t = xpatch_table
+        for v in range(1, 6):
+            insert_rows(db, t, [(1, v, f"original-{v}")])
+
+        # Cascade delete v3-v5
+        db.execute(f"DELETE FROM {t} WHERE group_id = 1 AND version = 3")
+        assert row_count(db, t) == 2
+
+        # Insert new versions — should form a valid chain with v1, v2
+        for v in range(3, 6):
+            insert_rows(db, t, [(1, v, f"new-{v}")])
+
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 5
+        assert rows[0]["content"] == "original-1"
+        assert rows[1]["content"] == "original-2"
+        assert rows[2]["content"] == "new-3"
+        assert rows[3]["content"] == "new-4"
+        assert rows[4]["content"] == "new-5"

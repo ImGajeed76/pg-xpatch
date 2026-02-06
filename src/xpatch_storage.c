@@ -1273,7 +1273,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
         *out_seq = new_seq;
     
     /* Determine if this is a keyframe */
-    is_keyframe = (new_seq == 1) || (new_seq % config->keyframe_every == 1);
+    is_keyframe = (new_seq == 1) || ((new_seq - 1) % config->keyframe_every == 0);
     
     elog(DEBUG1, "xpatch: inserting seq %d, is_keyframe=%d%s", new_seq, is_keyframe,
          restore_mode ? " (restore mode)" : "");

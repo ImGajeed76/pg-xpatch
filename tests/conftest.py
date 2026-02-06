@@ -480,6 +480,7 @@ def make_table(db: psycopg.Connection) -> Callable[..., str]:
         order_by: str = "version",
         delta_columns: list[str] | None = None,
         keyframe_every: int | None = None,
+        compress_depth: int | None = None,
         enable_zstd: bool | None = None,
     ) -> str:
         name = f"test_{uuid.uuid4().hex[:8]}"
@@ -504,6 +505,10 @@ def make_table(db: psycopg.Connection) -> Callable[..., str]:
         if keyframe_every is not None:
             config_parts.append(
                 sql.SQL("keyframe_every => {}").format(sql.Literal(keyframe_every))
+            )
+        if compress_depth is not None:
+            config_parts.append(
+                sql.SQL("compress_depth => {}").format(sql.Literal(compress_depth))
             )
         if enable_zstd is not None:
             config_parts.append(

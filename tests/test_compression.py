@@ -67,6 +67,7 @@ class TestDeltaCompression:
         assert stats["total_groups"] == 1
         assert stats["keyframe_count"] >= 1
         assert stats["delta_count"] >= 0
+        assert stats["keyframe_count"] + stats["delta_count"] == stats["total_rows"]
         assert stats["raw_size_bytes"] > 0
         assert stats["compressed_size_bytes"] > 0
         assert float(stats["compression_ratio"]) > 0
@@ -175,13 +176,10 @@ class TestKeyframes:
             f"SELECT * FROM xpatch.inspect('{t}'::regclass, 1) ORDER BY seq"
         ).fetchall()
         keyframe_seqs = [r["seq"] for r in rows if r["is_keyframe"]]
-        # Keyframes at position 1, 6, 11 (seq is 1-based in inspect)
-        assert 1 in keyframe_seqs
-        assert 6 in keyframe_seqs
-        assert 11 in keyframe_seqs
-        # Everything else is a delta
         delta_seqs = [r["seq"] for r in rows if not r["is_keyframe"]]
-        assert len(delta_seqs) > 0
+        # Keyframes at position 1, 6, 11 (seq is 1-based, formula: seq==1 or seq%5==1)
+        assert keyframe_seqs == [1, 6, 11]
+        assert sorted(delta_seqs) == [2, 3, 4, 5, 7, 8, 9, 10, 12]
 
     def test_keyframe_every_2(self, db: psycopg.Connection, make_table):
         """With keyframe_every=2, keyframes at seq 1, 3, 5 (seq % 2 == 1)."""
@@ -192,10 +190,10 @@ class TestKeyframes:
             f"SELECT * FROM xpatch.inspect('{t}'::regclass, 1) ORDER BY seq"
         ).fetchall()
         keyframe_seqs = [r["seq"] for r in rows if r["is_keyframe"]]
+        delta_seqs = [r["seq"] for r in rows if not r["is_keyframe"]]
         # Keyframes where seq == 1 or seq % 2 == 1
-        assert 1 in keyframe_seqs
-        assert 3 in keyframe_seqs
-        assert 5 in keyframe_seqs
+        assert keyframe_seqs == [1, 3, 5]
+        assert sorted(delta_seqs) == [2, 4, 6]
 
     def test_first_row_is_always_keyframe(self, db: psycopg.Connection, make_table):
         """The first row in every group is always a keyframe (seq=1)."""
@@ -229,19 +227,7 @@ class TestCompressDepth:
 
     def test_compress_depth_3(self, db: psycopg.Connection, make_table):
         """compress_depth=3 allows deltas against up to 3 previous versions."""
-        # We can't directly configure compress_depth via make_table,
-        # but we can test it via the configure function
-        t = make_table(
-            "group_id INT, version INT, content TEXT NOT NULL",
-            group_by="group_id",
-            order_by="version",
-        )
-        # Reconfigure with compress_depth=3
-        db.execute(
-            f"SELECT xpatch.configure('{t}', "
-            f"group_by => 'group_id', order_by => 'version', "
-            f"delta_columns => '{{content}}', compress_depth => 3)"
-        )
+        t = make_table(compress_depth=3)
         # Insert content where v4 is most similar to v1 (not v3)
         insert_rows(db, t, [
             (1, 1, "AAAA" * 1000),
@@ -257,6 +243,21 @@ class TestCompressDepth:
         assert rows[0]["content"] == "AAAA" * 1000
         assert rows[3]["content"] == "AAAA" * 1000
         assert rows[0]["content"] == rows[3]["content"]
+
+    def test_compress_depth_1_default(self, db: psycopg.Connection, make_table):
+        """Default compress_depth=1 only looks 1 row back."""
+        t = make_table()  # default compress_depth=1
+        insert_rows(db, t, [
+            (1, 1, "AAAA" * 1000),
+            (1, 2, "BBBB" * 1000),
+            (1, 3, "AAAA" * 1000),  # identical to v1 but depth=1 can only see v2
+        ])
+        # Data should still be correct regardless of depth
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert rows[0]["content"] == "AAAA" * 1000
+        assert rows[2]["content"] == "AAAA" * 1000
 
 
 class TestZstdToggle:
@@ -294,6 +295,18 @@ class TestZstdToggle:
         assert len(rows_on) == len(rows_off) == 10
         for a, b in zip(rows_on, rows_off):
             assert a["content"] == b["content"]
+
+    def test_zstd_reduces_storage(self, db: psycopg.Connection, make_table):
+        """zstd=true should produce smaller or equal storage than zstd=false."""
+        t_on = make_table(enable_zstd=True)
+        t_off = make_table(enable_zstd=False)
+        for v in range(1, 21):
+            content = f"Repeated pattern {'abcdef' * 500} version {v}"
+            insert_rows(db, t_on, [(1, v, content)])
+            insert_rows(db, t_off, [(1, v, content)])
+        s_on = db.execute(f"SELECT * FROM xpatch.stats('{t_on}'::regclass)").fetchone()
+        s_off = db.execute(f"SELECT * FROM xpatch.stats('{t_off}'::regclass)").fetchone()
+        assert s_on["compressed_size_bytes"] <= s_off["compressed_size_bytes"]
 
 
 class TestJsonbCompression:
@@ -418,3 +431,80 @@ class TestJsonbCompression:
                 p = json.loads(p)
             assert p["version"] == v
             assert p["items"] == list(range(v))
+
+
+class TestCompressionEdgeCases:
+    """Edge cases for compression and keyframe logic."""
+
+    def test_keyframe_every_1_all_keyframes(self, db: psycopg.Connection, make_table):
+        """keyframe_every=1 should make every row a keyframe."""
+        t = make_table(keyframe_every=1)
+        insert_versions(db, t, group_id=1, count=5)
+        rows = db.execute(
+            f"SELECT * FROM xpatch.inspect('{t}'::regclass, 1) ORDER BY seq"
+        ).fetchall()
+        keyframe_seqs = [r["seq"] for r in rows if r["is_keyframe"]]
+        assert keyframe_seqs == [1, 2, 3, 4, 5], (
+            f"Expected all rows to be keyframes, got keyframes at {keyframe_seqs}"
+        )
+
+    def test_empty_content_compresses(self, db: psycopg.Connection, make_table):
+        """Empty string delta column compresses and reconstructs."""
+        t = make_table()
+        insert_rows(db, t, [
+            (1, 1, ""),
+            (1, 2, ""),
+            (1, 3, "non-empty"),
+            (1, 4, ""),
+        ])
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert rows[0]["content"] == ""
+        assert rows[1]["content"] == ""
+        assert rows[2]["content"] == "non-empty"
+        assert rows[3]["content"] == ""
+
+    def test_keyframe_boundary_exact_multiples(self, db: psycopg.Connection, make_table):
+        """Verify exact multiples of keyframe_every are NOT keyframes (off-by-one)."""
+        t = make_table(keyframe_every=5)
+        insert_versions(db, t, group_id=1, count=11)
+        rows = db.execute(
+            f"SELECT * FROM xpatch.inspect('{t}'::regclass, 1) ORDER BY seq"
+        ).fetchall()
+        by_seq = {r["seq"]: r["is_keyframe"] for r in rows}
+        # seq % 5 == 0 should be deltas (not keyframes)
+        assert by_seq[5] is False, "seq=5 should be delta (5 % 5 == 0)"
+        assert by_seq[10] is False, "seq=10 should be delta (10 % 5 == 0)"
+        # seq % 5 == 1 should be keyframes
+        assert by_seq[1] is True, "seq=1 should be keyframe"
+        assert by_seq[6] is True, "seq=6 should be keyframe (6 % 5 == 1)"
+        assert by_seq[11] is True, "seq=11 should be keyframe (11 % 5 == 1)"
+
+    def test_distinct_on_latest_version_per_group(self, db: psycopg.Connection, xpatch_table):
+        """DISTINCT ON pattern to get latest version per group with compression."""
+        t = xpatch_table
+        for g in range(1, 4):
+            for v in range(1, 6):
+                insert_rows(db, t, [(g, v, f"g{g}-v{v}")])
+        rows = db.execute(
+            f"SELECT DISTINCT ON (group_id) group_id, version, content "
+            f"FROM {t} ORDER BY group_id, version DESC"
+        ).fetchall()
+        assert len(rows) == 3
+        assert rows[0]["version"] == 5 and rows[0]["content"] == "g1-v5"
+        assert rows[1]["version"] == 5 and rows[1]["content"] == "g2-v5"
+        assert rows[2]["version"] == 5 and rows[2]["content"] == "g3-v5"
+
+    def test_interleaved_insert_read_integrity(self, db: psycopg.Connection, xpatch_table):
+        """Interleaved insert + read doesn't corrupt the version chain."""
+        t = xpatch_table
+        for v in range(1, 6):
+            insert_rows(db, t, [(1, v, f"content-{v}")])
+            # Read back after each insert
+            rows = db.execute(
+                f"SELECT version, content FROM {t} ORDER BY version"
+            ).fetchall()
+            assert len(rows) == v
+            for row in rows:
+                assert row["content"] == f"content-{row['version']}"

@@ -30,11 +30,12 @@ class TestGroupColumnTypes:
     """Different data types for the group_by column."""
 
     def test_int_group(self, db: psycopg.Connection, make_table):
-        """INT group column (default)."""
+        """INT group column with multi-version groups."""
         t = make_table()
-        insert_rows(db, t, [(1, 1, "a"), (2, 1, "b")])
-        assert row_count(db, t) == 2
-        assert row_count(db, t, "group_id = 1") == 1
+        insert_rows(db, t, [(1, 1, "a"), (1, 2, "a2"), (2, 1, "b")])
+        assert row_count(db, t) == 3
+        assert row_count(db, t, "group_id = 1") == 2
+        assert row_count(db, t, "group_id = 2") == 1
 
     def test_bigint_group(self, db: psycopg.Connection, make_table):
         """BIGINT group column with large values."""
@@ -82,7 +83,7 @@ class TestGroupColumnTypes:
         assert row_count(db, t) == 2
 
     def test_uuid_group(self, db: psycopg.Connection, make_table):
-        """UUID group column."""
+        """UUID group column with delta chain across multiple versions."""
         t = make_table(
             "id UUID, ver INT, content TEXT NOT NULL",
             group_by="id",
@@ -90,15 +91,24 @@ class TestGroupColumnTypes:
         )
         u1 = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
         u2 = "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22"
-        db.execute(
-            f"INSERT INTO {t} (id, ver, content) VALUES (%s::uuid, 1, 'first')",
+        for v in range(1, 4):
+            db.execute(
+                f"INSERT INTO {t} (id, ver, content) VALUES (%s::uuid, %s, %s)",
+                [u1, v, f"u1-v{v}"],
+            )
+            db.execute(
+                f"INSERT INTO {t} (id, ver, content) VALUES (%s::uuid, %s, %s)",
+                [u2, v, f"u2-v{v}"],
+            )
+        assert row_count(db, t) == 6
+        # Verify delta chain reconstruction per UUID group
+        rows = db.execute(
+            f"SELECT ver, content FROM {t} WHERE id = %s::uuid ORDER BY ver",
             [u1],
-        )
-        db.execute(
-            f"INSERT INTO {t} (id, ver, content) VALUES (%s::uuid, 1, 'second')",
-            [u2],
-        )
-        assert row_count(db, t) == 2
+        ).fetchall()
+        assert len(rows) == 3
+        for row in rows:
+            assert row["content"] == f"u1-v{row['ver']}"
 
 
 # ---------------------------------------------------------------------------
@@ -436,3 +446,154 @@ class TestSpecialCharacters:
         insert_rows(db, t, [(1, 1, content)])
         row = db.execute(f"SELECT content FROM {t}").fetchone()
         assert row["content"] == content
+
+
+# ---------------------------------------------------------------------------
+# Boundary values and edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestBoundaryValues:
+    """Type boundary values and edge cases."""
+
+    def test_bigint_group_max_value(self, db: psycopg.Connection, make_table):
+        """BIGINT group at exact INT8_MAX boundary."""
+        t = make_table(
+            "gid BIGINT, ver INT, content TEXT NOT NULL",
+            group_by="gid",
+            order_by="ver",
+        )
+        max_bigint = 9_223_372_036_854_775_807  # INT8_MAX
+        insert_rows(db, t, [
+            (max_bigint, 1, "max bigint group"),
+            (max_bigint, 2, "max bigint v2"),
+        ], columns=["gid", "ver", "content"])
+        rows = db.execute(f"SELECT gid, content FROM {t} ORDER BY ver").fetchall()
+        assert len(rows) == 2
+        assert rows[0]["gid"] == max_bigint
+        assert rows[1]["content"] == "max bigint v2"
+
+    def test_int_order_negative_values(self, db: psycopg.Connection, make_table):
+        """Negative order_by values work correctly."""
+        t = make_table()
+        insert_rows(db, t, [
+            (1, -10, "neg ten"),
+            (1, -1, "neg one"),
+            (1, 0, "zero"),
+            (1, 1, "one"),
+        ])
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 4
+        assert [r["version"] for r in rows] == [-10, -1, 0, 1]
+        assert rows[0]["content"] == "neg ten"
+
+    def test_smallint_order_boundary(self, db: psycopg.Connection, make_table):
+        """SMALLINT order near boundary values."""
+        t = make_table(
+            "gid INT, ver SMALLINT, content TEXT NOT NULL",
+            group_by="gid",
+            order_by="ver",
+        )
+        insert_rows(db, t, [
+            (1, 32766, "near max"),
+            (1, 32767, "at max"),  # INT2_MAX
+        ], columns=["gid", "ver", "content"])
+        rows = db.execute(f"SELECT ver, content FROM {t} ORDER BY ver").fetchall()
+        assert rows[0]["ver"] == 32766
+        assert rows[1]["ver"] == 32767
+
+    def test_timestamp_order_subsecond(self, db: psycopg.Connection, make_table):
+        """Timestamps differing only by microseconds are distinguished."""
+        t = make_table(
+            "gid INT, ts TIMESTAMP, content TEXT NOT NULL",
+            group_by="gid",
+            order_by="ts",
+        )
+        db.execute(
+            f"INSERT INTO {t} (gid, ts, content) VALUES "
+            f"(1, '2025-01-01 00:00:00.000001', 'micro1'), "
+            f"(1, '2025-01-01 00:00:00.000002', 'micro2'), "
+            f"(1, '2025-01-01 00:00:00.000003', 'micro3')"
+        )
+        rows = db.execute(f"SELECT content FROM {t} ORDER BY ts").fetchall()
+        assert [r["content"] for r in rows] == ["micro1", "micro2", "micro3"]
+
+    def test_text_group_unicode_collation(self, db: psycopg.Connection, make_table):
+        """TEXT group with unicode — accented chars form separate groups."""
+        t = make_table(
+            "category TEXT, ver INT, content TEXT NOT NULL",
+            group_by="category",
+            order_by="ver",
+        )
+        insert_rows(db, t, [
+            ("cafe", 1, "plain"),
+            ("caf\u00e9", 1, "accented"),
+        ], columns=["category", "ver", "content"])
+        assert row_count(db, t) == 2
+        assert row_count(db, t, "category = 'cafe'") == 1
+        assert row_count(db, t, "category = E'caf\\u00e9'") == 1
+
+    def test_empty_bytea_delta(self, db: psycopg.Connection, make_table):
+        """Empty BYTEA value in delta column."""
+        t = make_table(
+            "gid INT, ver INT, data BYTEA NOT NULL",
+            group_by="gid",
+            order_by="ver",
+            delta_columns=["data"],
+        )
+        db.execute(
+            f"INSERT INTO {t} (gid, ver, data) VALUES (1, 1, %s)",
+            [b""],
+        )
+        db.execute(
+            f"INSERT INTO {t} (gid, ver, data) VALUES (1, 2, %s)",
+            [b"now has data"],
+        )
+        rows = db.execute(f"SELECT ver, data FROM {t} ORDER BY ver").fetchall()
+        assert bytes(rows[0]["data"]) == b""
+        assert bytes(rows[1]["data"]) == b"now has data"
+
+    def test_bytea_delta_chain(self, db: psycopg.Connection, make_table):
+        """BYTEA delta compression works across multiple versions."""
+        t = make_table(
+            "gid INT, ver INT, data BYTEA NOT NULL",
+            group_by="gid",
+            order_by="ver",
+            delta_columns=["data"],
+        )
+        base = bytes(range(256)) * 10  # 2560 bytes
+        for v in range(1, 6):
+            modified = bytearray(base)
+            modified[v * 100] = 0xFF  # small change per version
+            db.execute(
+                f"INSERT INTO {t} (gid, ver, data) VALUES (1, %s, %s)",
+                [v, bytes(modified)],
+            )
+        rows = db.execute(f"SELECT ver, data FROM {t} ORDER BY ver").fetchall()
+        assert len(rows) == 5
+        for row in rows:
+            v = row["ver"]
+            expected = bytearray(base)
+            expected[v * 100] = 0xFF
+            assert bytes(row["data"]) == bytes(expected)
+
+    def test_null_in_non_delta_across_versions(self, db: psycopg.Connection, make_table):
+        """NULL in non-delta column survives reconstruction across versions."""
+        t = make_table(
+            "gid INT, ver INT, content TEXT NOT NULL, score INT",
+            group_by="gid",
+            order_by="ver",
+        )
+        insert_rows(db, t, [
+            (1, 1, "v1", None),
+            (1, 2, "v2", 42),
+            (1, 3, "v3", None),
+        ], columns=["gid", "ver", "content", "score"])
+        rows = db.execute(
+            f"SELECT ver, score FROM {t} ORDER BY ver"
+        ).fetchall()
+        assert rows[0]["score"] is None
+        assert rows[1]["score"] == 42
+        assert rows[2]["score"] is None

@@ -200,7 +200,10 @@ class TestDescribe:
         ).fetchall()
         assert len(rows) > 0
         props = {r["property"]: r["value"] for r in rows}
-        assert "table_name" in props or "Table" in props or len(props) > 3
+        # The SQL function returns rows with property names like "table", "group_by", etc.
+        assert "table" in props or "table_name" in props, (
+            f"Expected 'table' property in describe output. Found: {list(props.keys())}"
+        )
 
     def test_describe_shows_group_by(self, db: psycopg.Connection, make_table):
         """describe() shows the group_by column."""
@@ -264,9 +267,13 @@ class TestPhysical:
         rows = db.execute(
             f"SELECT * FROM xpatch.physical('{t}'::regclass, 1) ORDER BY seq"
         ).fetchall()
-        # physical() returns raw delta storage — at least the deltas (may exclude
-        # the first keyframe depending on from_seq default behavior)
-        assert len(rows) >= 4
+        # physical() returns raw delta storage — skips the first keyframe (seq=1),
+        # returns only delta rows. With 5 versions: seq 2,3,4,5 = 4 delta rows.
+        assert len(rows) == 4, (
+            f"Expected 4 delta rows (physical() skips keyframe), got {len(rows)}"
+        )
+        # Verify all returned rows are deltas
+        assert all(not r["is_keyframe"] for r in rows)
 
     def test_physical_has_expected_columns(self, db: psycopg.Connection, make_table):
         """physical() returns expected column set."""
@@ -555,3 +562,89 @@ class TestInvalidateConfig:
         # Read should still work (config auto re-read)
         rows = db.execute(f"SELECT * FROM {t}").fetchall()
         assert len(rows) == 3
+
+
+# ---------------------------------------------------------------------------
+# Edge cases and error paths
+# ---------------------------------------------------------------------------
+
+
+class TestUtilityEdgeCases:
+    """Edge cases and error paths for utility functions."""
+
+    def test_inspect_nonexistent_group(self, db: psycopg.Connection, make_table):
+        """inspect() with nonexistent group returns 0 rows, no error."""
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=3)
+        rows = db.execute(
+            f"SELECT * FROM xpatch.inspect('{t}'::regclass, 999)"
+        ).fetchall()
+        assert len(rows) == 0
+
+    def test_stats_exist_empty_table(self, db: psycopg.Connection, make_table):
+        """stats_exist() on a freshly created table with no inserts returns false."""
+        t = make_table()
+        exists = db.execute(
+            f"SELECT xpatch.stats_exist('{t}'::regclass) AS e"
+        ).fetchone()
+        assert exists["e"] is False
+
+    def test_refresh_stats_empty_table(self, db: psycopg.Connection, make_table):
+        """refresh_stats() on an empty table returns zero counts."""
+        t = make_table()
+        result = db.execute(
+            f"SELECT * FROM xpatch.refresh_stats('{t}'::regclass)"
+        ).fetchone()
+        assert result["groups_scanned"] == 0
+        assert result["rows_scanned"] == 0
+
+    def test_dump_configs_with_multiple_tables(self, db: psycopg.Connection, make_table):
+        """dump_configs() includes all configured tables."""
+        t1 = make_table()
+        t2 = make_table(
+            "doc_id INT, ver INT, body TEXT NOT NULL",
+            group_by="doc_id",
+            order_by="ver",
+        )
+        rows = db.execute("SELECT * FROM xpatch.dump_configs()").fetchall()
+        texts = [row[list(row.keys())[0]] for row in rows]
+        has_t1 = any(t1 in text for text in texts)
+        has_t2 = any(t2 in text for text in texts)
+        assert has_t1, f"Table {t1} not found in dump output"
+        assert has_t2, f"Table {t2} not found in dump output"
+
+    def test_physical_from_seq_filter(self, db: psycopg.Connection, make_table):
+        """physical() with from_seq parameter filters correctly."""
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=10)
+        rows = db.execute(
+            f"SELECT * FROM xpatch.physical('{t}'::regclass, 1, 5) ORDER BY seq"
+        ).fetchall()
+        # Should only return rows with seq >= 5
+        if len(rows) > 0:
+            seqs = [r["seq"] for r in rows]
+            assert all(s >= 5 for s in seqs), f"Expected seq >= 5, got {seqs}"
+
+    def test_describe_non_xpatch_table(self, db: psycopg.Connection):
+        """describe() on a regular heap table raises an error."""
+        db.execute("CREATE TABLE heap_test (id INT)")
+        with pytest.raises(psycopg.errors.Error):
+            db.execute("SELECT * FROM xpatch.describe('heap_test'::regclass)")
+
+    def test_warm_cache_zero_max_rows(self, db: psycopg.Connection, make_table):
+        """warm_cache() with max_rows=0 scans 0 rows."""
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=10)
+        result = db.execute(
+            f"SELECT * FROM xpatch.warm_cache('{t}'::regclass, max_rows => 0)"
+        ).fetchone()
+        assert result["rows_scanned"] == 0
+
+    def test_fix_restored_configs_runs(self, db: psycopg.Connection, make_table):
+        """fix_restored_configs() runs without error on configured tables."""
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=3)
+        result = db.execute(
+            "SELECT * FROM xpatch.fix_restored_configs()"
+        ).fetchone()
+        assert result is not None

@@ -109,12 +109,21 @@ class TestConfiguration:
         assert cfg["enable_zstd"] is True
 
     def test_auto_detect_order_by(self, db: psycopg.Connection):
-        """Auto-detects order_by — verified by successful INSERT/SELECT."""
+        """Auto-detects order_by — verified by describe() and INSERT/SELECT."""
         t = "test_auto_ob"
         db.execute(f"CREATE TABLE {t} (gid INT, name TEXT NOT NULL, seq INT) USING xpatch")
         # configure without explicit order_by — C code auto-detects 'seq'
         db.execute(f"SELECT xpatch.configure('{t}', group_by => 'gid')")
-        # If auto-detection works, INSERT + SELECT should succeed
+        # Verify auto-detection picked the right column
+        desc = db.execute(
+            f"SELECT * FROM xpatch.describe('{t}'::regclass)"
+        ).fetchall()
+        ob_row = [r for r in desc if r["property"] == "order_by"]
+        assert len(ob_row) == 1
+        assert ob_row[0]["value"] == "seq", (
+            f"Expected auto-detected order_by='seq', got '{ob_row[0]['value']}'"
+        )
+        # And INSERT + SELECT should succeed
         db.execute(f"INSERT INTO {t} (gid, name, seq) VALUES (1, 'hello', 1)")
         db.execute(f"INSERT INTO {t} (gid, name, seq) VALUES (1, 'world', 2)")
         rows = db.execute(f"SELECT name FROM {t} ORDER BY seq").fetchall()
@@ -129,15 +138,15 @@ class TestConfiguration:
             f"USING xpatch"
         )
         db.execute(f"SELECT xpatch.configure('{t}', group_by => 'gid', order_by => 'ver')")
-        # Verify auto-detection via describe (shows column roles)
+        # Verify auto-detection via describe — check delta_columns property specifically
         desc = db.execute(
             f"SELECT * FROM xpatch.describe('{t}'::regclass)"
         ).fetchall()
-        desc_text = " ".join(f"{r['property']}={r['value']}" for r in desc)
-        # All three columns should appear as delta columns
-        assert "body" in desc_text
-        assert "data" in desc_text
-        assert "doc" in desc_text
+        delta_rows = [r for r in desc if r["property"] == "delta_columns"]
+        assert len(delta_rows) == 1, f"Expected 1 delta_columns row, got {len(delta_rows)}"
+        delta_value = delta_rows[0]["value"]
+        for col in ("body", "data", "doc"):
+            assert col in delta_value, f"{col} not in delta_columns: {delta_value}"
 
     def test_configure_creates_composite_index(self, db: psycopg.Connection, make_table):
         """configure() creates (group_by, _xp_seq) composite index."""
@@ -240,7 +249,7 @@ class TestInsert:
     def test_null_group_raises_error(self, db: psycopg.Connection, xpatch_table):
         """NULL value in group_by column raises an error."""
         t = xpatch_table
-        with pytest.raises(psycopg.errors.Error, match="(?i)null"):
+        with pytest.raises(psycopg.errors.Error, match="(?i)null.*group"):
             db.execute(
                 f"INSERT INTO {t} (group_id, version, content) VALUES (NULL, 1, 'x')"
             )
@@ -468,7 +477,7 @@ class TestUpdate:
         """UPDATE on xpatch table raises a clear error."""
         t = xpatch_table
         insert_rows(db, t, [(1, 1, "original")])
-        with pytest.raises(psycopg.errors.Error, match="(?i)update.*not supported"):
+        with pytest.raises(psycopg.errors.FeatureNotSupported, match="(?i)update.*not supported"):
             db.execute(f"UPDATE {t} SET content = 'modified' WHERE group_id = 1")
 
 
@@ -504,7 +513,123 @@ class TestVersionSemantics:
         assert rows[1]["version"] == 2
 
     def test_null_version_allowed(self, db: psycopg.Connection, xpatch_table):
-        """NULL in the version (order_by) column is allowed."""
+        """NULL in the version (order_by) column is allowed and content reconstructs."""
         t = xpatch_table
         insert_rows(db, t, [(1, None, "no version")])
         assert row_count(db, t) == 1
+        row = db.execute(f"SELECT content FROM {t}").fetchone()
+        assert row["content"] == "no version"
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    """Edge cases for basic operations."""
+
+    def test_insert_empty_content(self, db: psycopg.Connection, xpatch_table):
+        """Empty string in delta column round-trips correctly."""
+        t = xpatch_table
+        insert_rows(db, t, [(1, 1, "")])
+        row = db.execute(f"SELECT content FROM {t}").fetchone()
+        assert row["content"] == ""
+
+    def test_insert_large_content_toast(self, db: psycopg.Connection, xpatch_table):
+        """Content exceeding TOAST threshold (~2KB) round-trips correctly."""
+        t = xpatch_table
+        large = "X" * 10_000  # Well above TOAST threshold
+        insert_rows(db, t, [(1, 1, large)])
+        row = db.execute(f"SELECT content FROM {t}").fetchone()
+        assert row["content"] == large
+
+    def test_insert_large_content_multiple_versions(self, db: psycopg.Connection, xpatch_table):
+        """Multiple TOAST-sized versions in same group reconstruct correctly."""
+        t = xpatch_table
+        for v in range(1, 4):
+            insert_rows(db, t, [(1, v, f"{'A' * 5000}-v{v}")])
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        for i, row in enumerate(rows):
+            assert row["content"] == f"{'A' * 5000}-v{i + 1}"
+
+    def test_select_star_includes_xp_seq(self, db: psycopg.Connection, xpatch_table):
+        """SELECT * includes the _xp_seq column."""
+        t = xpatch_table
+        insert_rows(db, t, [(1, 1, "test")])
+        row = db.execute(f"SELECT * FROM {t}").fetchone()
+        assert "_xp_seq" in row.keys()
+        assert row["_xp_seq"] is not None
+
+    def test_select_where_on_xp_seq(self, db: psycopg.Connection, xpatch_table):
+        """Filtering on _xp_seq returns the correct row."""
+        t = xpatch_table
+        insert_versions(db, t, group_id=1, count=5)
+        row = db.execute(
+            f"SELECT version FROM {t} WHERE _xp_seq = 3"
+        ).fetchone()
+        assert row is not None
+        assert row["version"] == 3
+
+    def test_keyframe_boundary_reconstruction(self, db: psycopg.Connection, make_table):
+        """Data at and around keyframe boundaries reconstructs correctly."""
+        t = make_table(keyframe_every=5)
+        # With keyframe_every=5: seq 1 and 6 are keyframes
+        for v in range(1, 12):
+            insert_rows(db, t, [(1, v, f"content-{v}")])
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 11
+        for i, row in enumerate(rows):
+            assert row["content"] == f"content-{i + 1}", (
+                f"Mismatch at version {i + 1}: expected 'content-{i + 1}', got '{row['content']}'"
+            )
+
+    def test_multi_row_batch_insert(self, db: psycopg.Connection, xpatch_table):
+        """Multi-row INSERT VALUES (...), (...) works correctly."""
+        t = xpatch_table
+        db.execute(
+            f"INSERT INTO {t} (group_id, version, content) VALUES "
+            f"(1, 1, 'a'), (1, 2, 'b'), (1, 3, 'c')"
+        )
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert len(rows) == 3
+        assert [r["content"] for r in rows] == ["a", "b", "c"]
+
+    def test_configure_idempotent(self, db: psycopg.Connection, make_table):
+        """Calling configure() twice on the same table does not corrupt data."""
+        t = make_table()
+        insert_versions(db, t, group_id=1, count=3)
+        # Reconfigure with same parameters
+        db.execute(
+            f"SELECT xpatch.configure('{t}', "
+            f"group_by => 'group_id', order_by => 'version')"
+        )
+        # Data should still be readable
+        assert row_count(db, t) == 3
+        rows = db.execute(
+            f"SELECT version, content FROM {t} ORDER BY version"
+        ).fetchall()
+        assert [r["version"] for r in rows] == [1, 2, 3]
+
+    def test_many_versions_in_group(self, db: psycopg.Connection, xpatch_table):
+        """250 rows spanning multiple keyframe intervals reconstruct correctly."""
+        t = xpatch_table
+        # Default keyframe_every=100, so keyframes at seq 1, 101, 201
+        for v in range(1, 251):
+            insert_rows(db, t, [(1, v, f"v{v}")])
+        assert row_count(db, t) == 250
+        # Spot-check around keyframe boundaries
+        for check_v in [1, 2, 99, 100, 101, 102, 199, 200, 201, 250]:
+            row = db.execute(
+                f"SELECT content FROM {t} WHERE version = {check_v}"
+            ).fetchone()
+            assert row is not None, f"Missing version {check_v}"
+            assert row["content"] == f"v{check_v}", (
+                f"Version {check_v}: expected 'v{check_v}', got '{row['content']}'"
+            )
