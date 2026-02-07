@@ -336,59 +336,62 @@ xpatch automatically creates indexes for efficient lookups:
 
 ## Testing
 
-### Basic Test Suite
+pg-xpatch has a comprehensive pytest-based test suite with **425+ tests** across 15 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
+
+### Requirements
+
+- Python 3.10+
+- [psycopg](https://www.psycopg.org/) 3 (`pip install psycopg[binary]`)
+- pytest (`pip install pytest pytest-timeout`)
+- The `pg-xpatch-dev` Docker container running (or a PostgreSQL instance with pg_xpatch installed)
+
+### Running Tests
 
 ```bash
-# Run all tests (21 test files)
-# First create the test database and extension
-createdb xpatch_test
-psql -d xpatch_test -c "CREATE EXTENSION pg_xpatch;"
+# All tests (excludes crash and stress tests by default)
+python -m pytest tests/ -v --tb=short -m "not crash_test and not stress"
 
-# Then run all test files
-for f in test/sql/*.sql; do
-    psql -d xpatch_test -f "$f"
-done
+# All tests including crash recovery and stress tests
+python -m pytest tests/ -v --tb=short
 
-# Or use the test runner
-./test/run_tests.sh run
+# Run a specific test file
+python -m pytest tests/test_basic.py -v
+
+# Run a specific test class or test
+python -m pytest tests/test_transactions.py::TestMvccVisibilitySeqScan -v
+
+# Parallel execution (requires pytest-xdist)
+python -m pytest tests/ -n auto -m "not crash_test and not stress"
 ```
 
-The basic test suite covers:
-- Basic INSERT/SELECT operations
-- Delta compression and reconstruction
-- Keyframe behavior
-- Index support
-- Parallel scans
-- DELETE with cascade
-- VACUUM
-- Error handling
-- Edge cases (empty tables, NULL values, unusual types, large data)
+### Test Coverage
 
-### Comprehensive Stress Testing
+| Test File | Tests | What It Covers |
+|-----------|-------|----------------|
+| `test_smoke.py` | 6 | Extension loaded, version, schema, event triggers |
+| `test_basic.py` | 62 | CREATE TABLE, INSERT/SELECT, COPY FROM/TO, ALTER TABLE, DROP cleanup, custom schemas, nested loop rescan |
+| `test_compression.py` | 34 | Delta compression ratios, keyframe intervals, compress_depth, enable_zstd, JSONB operators, encode_threads GUC |
+| `test_delete.py` | 23 | Cascade delete semantics, multi-group isolation, re-insert after delete, edge cases |
+| `test_errors.py` | 36 | Blocked operations (UPDATE, CLUSTER), configure() validation (E13/E17), NULL group, ON CONFLICT, TABLESAMPLE, BIGINT _xp_seq |
+| `test_indexes.py` | 25 | Auto-created indexes, manual indexes, index/bitmap scan plans, ANALYZE, REINDEX CONCURRENTLY, CREATE INDEX CONCURRENTLY |
+| `test_multi_delta.py` | 18 | Multiple delta columns, mixed types (TEXT+BYTEA, TEXT+JSONB), 4+ columns, per-column inspection |
+| `test_no_group.py` | 16 | Tables without group_by, single-group stats, delete, inspect, physical |
+| `test_parallel.py` | 12 | Parallel sequential scan correctness, aggregation, filters, empty tables |
+| `test_restore_mode.py` | 22 | Explicit _xp_seq (restore mode), dump_configs, fix_restored_configs, pg_dump/pg_restore round-trip |
+| `test_stats_cache.py` | 20 | group_stats incremental updates, refresh_stats, truncate, cross-validation invariants |
+| `test_transactions.py` | 35 | Commit/rollback, savepoints, MVCC visibility (seq/index/bitmap scan), concurrent insert/delete, SERIALIZABLE isolation |
+| `test_types.py` | 39 | All group types (INT/BIGINT/TEXT/VARCHAR/UUID), order types (INT/BIGINT/SMALLINT/TIMESTAMP), delta types (TEXT/BYTEA/JSON/JSONB), special characters, boundary values |
+| `test_utility_functions.py` | 52 | All SQL-callable functions: version, stats, inspect, describe, physical, cache_stats, warm_cache, refresh_stats, dump_configs, invalidate_config |
+| `test_vacuum.py` | 25 | VACUUM, VACUUM FULL (error), ANALYZE, TRUNCATE + rollback, crash recovery after VACUUM |
 
-In addition to the basic test suite, pg-xpatch has been validated with **240 comprehensive tests** covering production scenarios. These tests are not yet included in the repository but document the testing that was performed.
+### Key Test Scenarios
 
-#### Test Categories
-
-| Category | Tests | Description |
-|----------|-------|-------------|
-| **Data Types** | 41 | TEXT, BYTEA, JSON, JSONB, Unicode, binary data, empty strings, very large content (100MB+) |
-| **Transactions** | 12 | Commit, rollback, savepoints, nested transactions, isolation levels (READ COMMITTED, REPEATABLE READ, SERIALIZABLE) |
-| **SQL Compatibility** | 25 | JOINs, CTEs, window functions, aggregates, subqueries, UNION/INTERSECT, EXPLAIN, prepared statements |
-| **Concurrency** | 10 | Parallel inserts (different/same groups), concurrent read/write, connection storms, long vs short transactions |
-| **Crash Recovery** | 4 | Kill -9 survival, data integrity after crash, repeated crash cycles |
-| **Adversarial Inputs** | 54 | SQL injection (8 patterns), integer overflow/underflow, invalid UTF-8, malformed data, resource exhaustion |
-| **Edge Cases** | 57 | Views, triggers, foreign keys, cursors, indexes, RETURNING clause, COPY operations, locking |
-| **Backup/Restore** | 18 | pg_dump/pg_restore cycle, data integrity verification, extension upgrade simulation |
-
-#### Key Results
-
-- **Concurrency**: ~68 inserts/sec with parallel workers, race conditions handled correctly
-- **Crash Recovery**: Zero data loss after 3 consecutive kill -9 crashes, all delta chains intact
-- **SQL Injection**: All 8 injection patterns safely stored as literal text (no execution)
-- **Large Transactions**: 10,000 inserts in a single transaction commits successfully
-- **Stability**: 60-second mixed workload (insert/read/delete) with zero errors
-- **Backup/Restore**: Full pg_dump/pg_restore cycle preserves data integrity, OIDs auto-fixed on first access
+- **MVCC visibility** across all scan types (sequential, index, bitmap)
+- **Concurrent operations**: parallel inserts, concurrent deletes with serialization, SERIALIZABLE isolation conflicts
+- **Crash recovery**: SIGKILL PostgreSQL, verify data integrity after recovery
+- **pg_dump/pg_restore**: full round-trip preserving data, _xp_seq values, and configuration
+- **All supported data types**: 5 group types, 5 order types, 5 delta types, special characters, boundary values
+- **Configuration validation**: all xpatch.configure() parameters, error paths, auto-detection
 
 ## Limitations and Known Issues
 
@@ -414,7 +417,7 @@ These issues are documented for transparency. For typical workloads (versioned d
 
 ### PostgreSQL Version
 
-Thoroughly tested on PostgreSQL 16 with 240+ test cases. Other versions may work but are not officially supported.
+Thoroughly tested on PostgreSQL 16 with 425+ test cases. Other versions may work but are not officially supported.
 
 ## License
 
@@ -466,13 +469,13 @@ See `LICENSE-AGPL.txt` for the full text, or `LICENSE-COMMERCIAL.txt` for commer
 Contributions are welcome! Please open an issue or pull request on GitHub.
 
 Before submitting:
-1. Run the test suite (`test/sql/*.sql`)
-2. Add tests for new functionality
+1. Run the test suite: `python -m pytest tests/ -v --tb=short`
+2. Add tests for new functionality in the `tests/` directory
 3. Keep commits focused and well-documented
 
 ## Links
 
 - **xpatch library**: https://github.com/ImGajeed76/xpatch
 - **Issue tracker**: https://github.com/ImGajeed76/pg-xpatch/issues
-- **Tests**: `test/sql/*.sql`
+- **Tests**: `tests/` (pytest)
 - **Portfolio**: [Check it out on my website](https://oseifert.ch/projects/pg-xpatch-1137)
