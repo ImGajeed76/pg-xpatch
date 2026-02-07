@@ -69,7 +69,7 @@ extern int xpatch_insert_cache_slots;
  */
 typedef struct InsertCacheBase
 {
-    int32           seq;            /* Sequence number of this base */
+    int64           seq;            /* Sequence number of this base */
     int             tag;            /* Delta tag (new_seq - base_seq) */
     const uint8    *data;           /* Pointer to raw content (palloc'd copy) */
     Size            size;           /* Content size */
@@ -151,8 +151,8 @@ int xpatch_insert_cache_get_slot(Oid relid, Datum group_value, Oid typid,
  */
 void xpatch_insert_cache_get_bases(int slot_idx, Oid relid,
                                    XPatchGroupHash expected_hash,
-                                   int32 new_seq, int col_idx,
-                                   InsertCacheBases *bases);
+                                    int64 new_seq, int col_idx,
+                                    InsertCacheBases *bases);
 
 /*
  * Push new row content into the FIFO ring buffer for one column.
@@ -171,8 +171,8 @@ void xpatch_insert_cache_get_bases(int slot_idx, Oid relid,
  */
 void xpatch_insert_cache_push(int slot_idx, Oid relid,
                               XPatchGroupHash expected_hash,
-                              int32 seq, int col_idx,
-                              const uint8 *data, Size size);
+                               int64 seq, int col_idx,
+                               const uint8 *data, Size size);
 
 /*
  * Mark a FIFO entry as complete (all columns written).
@@ -188,7 +188,7 @@ void xpatch_insert_cache_push(int slot_idx, Oid relid,
  */
 void xpatch_insert_cache_commit_entry(int slot_idx, Oid relid,
                                       XPatchGroupHash expected_hash,
-                                      int32 seq);
+                                       int64 seq);
 
 /*
  * Populate a FIFO slot with reconstructed content (cold start).
@@ -204,7 +204,7 @@ void xpatch_insert_cache_commit_entry(int slot_idx, Oid relid,
  */
 void xpatch_insert_cache_populate(int slot_idx, Relation rel,
                                   struct XPatchConfig *config,
-                                  Datum group_value, int32 current_max_seq);
+                                   Datum group_value, int64 current_max_seq);
 
 /*
  * Invalidate all FIFO slots for a relation.

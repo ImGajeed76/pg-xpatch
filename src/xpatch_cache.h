@@ -56,7 +56,7 @@ void xpatch_cache_init(void);
  *
  * Returns a palloc'd copy of the cached content, or NULL if not found.
  */
-bytea *xpatch_cache_get(Oid relid, Datum group_value, Oid typid, int32 seq,
+bytea *xpatch_cache_get(Oid relid, Datum group_value, Oid typid, int64 seq,
                         AttrNumber attnum);
 
 /*
@@ -70,7 +70,7 @@ bytea *xpatch_cache_get(Oid relid, Datum group_value, Oid typid, int32 seq,
  *   attnum      - Attribute number of delta column
  *   content     - Content to cache (will be copied)
  */
-void xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int32 seq,
+void xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int64 seq,
                       AttrNumber attnum, bytea *content);
 
 /*

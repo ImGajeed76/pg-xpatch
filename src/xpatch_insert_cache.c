@@ -31,7 +31,7 @@
  * - No artificial cap on compress_depth — ring buffer grows to match
  *
  * Ring buffer DSA layout (single contiguous allocation):
- *   int32           entry_seqs[depth]
+ *   int64           entry_seqs[depth]
  *   bool            entry_valid[depth]         (padded to MAXALIGN)
  *   dsa_pointer     entry_ptrs[depth * ncols]
  *   Size            entry_sizes[depth * ncols]
@@ -110,29 +110,29 @@ static inline Size
 ring_alloc_size(int depth, int num_delta_cols)
 {
     Size size = 0;
-    size += MAXALIGN(sizeof(int32) * depth);                /* seqs (aligned) */
+    size += MAXALIGN(sizeof(int64) * depth);                /* seqs (aligned) */
     size += MAXALIGN(sizeof(bool) * depth);                 /* valid (aligned) */
     size += MAXALIGN(sizeof(dsa_pointer) * depth * num_delta_cols);  /* ptrs (aligned) */
     size += sizeof(Size) * depth * num_delta_cols;          /* sizes */
     return MAXALIGN(size);
 }
 
-static inline int32 *
+static inline int64 *
 ring_seqs(void *ring_base)
 {
-    return (int32 *) ring_base;
+    return (int64 *) ring_base;
 }
 
 static inline bool *
 ring_valid(void *ring_base, int depth)
 {
-    return (bool *) ((char *) ring_base + MAXALIGN(sizeof(int32) * depth));
+    return (bool *) ((char *) ring_base + MAXALIGN(sizeof(int64) * depth));
 }
 
 static inline dsa_pointer *
 ring_ptrs(void *ring_base, int depth)
 {
-    Size offset = MAXALIGN(sizeof(int32) * depth);
+    Size offset = MAXALIGN(sizeof(int64) * depth);
     offset += MAXALIGN(sizeof(bool) * depth);
     return (dsa_pointer *) ((char *) ring_base + offset);
 }
@@ -140,7 +140,7 @@ ring_ptrs(void *ring_base, int depth)
 static inline Size *
 ring_sizes(void *ring_base, int depth, int num_delta_cols)
 {
-    Size offset = MAXALIGN(sizeof(int32) * depth);
+    Size offset = MAXALIGN(sizeof(int64) * depth);
     offset += MAXALIGN(sizeof(bool) * depth);
     offset += MAXALIGN(sizeof(dsa_pointer) * depth * num_delta_cols);
     return (Size *) ((char *) ring_base + offset);
@@ -339,7 +339,7 @@ alloc_ring(int depth, int num_delta_cols)
     Size alloc_size;
     dsa_pointer ptr;
     void *ring_base;
-    int32 *seqs;
+    int64 *seqs;
     bool *valid;
     dsa_pointer *ptrs;
     Size *sizes;
@@ -565,12 +565,12 @@ record_eviction_miss(void)
 void
 xpatch_insert_cache_get_bases(int slot_idx, Oid relid,
                               XPatchGroupHash expected_hash,
-                              int32 new_seq, int col_idx,
+                              int64 new_seq, int col_idx,
                               InsertCacheBases *bases)
 {
     InsertCacheSlot *slot;
     void *ring_base;
-    int32 *seqs;
+    int64 *seqs;
     bool *valid;
     dsa_pointer *ptrs;
     Size *sizes;
@@ -665,7 +665,7 @@ xpatch_insert_cache_get_bases(int slot_idx, Oid relid,
             sj = si;
             while (sj > 0 && bases->bases[sj].tag < bases->bases[sj - 1].tag)
             {
-                int32 tmp_seq = bases->bases[sj].seq;
+                int64 tmp_seq = bases->bases[sj].seq;
                 int tmp_tag = bases->bases[sj].tag;
                 const uint8 *tmp_data = bases->bases[sj].data;
                 Size tmp_size = bases->bases[sj].size;
@@ -692,14 +692,14 @@ xpatch_insert_cache_get_bases(int slot_idx, Oid relid,
 void
 xpatch_insert_cache_push(int slot_idx, Oid relid,
                          XPatchGroupHash expected_hash,
-                         int32 seq, int col_idx,
+                         int64 seq, int col_idx,
                          const uint8 *data, Size size)
 {
     InsertCacheSlot *slot;
     void *ring_base;
     dsa_pointer *ptrs;
     Size *sizes;
-    int32 *seqs;
+    int64 *seqs;
     int write_pos;
     int ptr_offset;
     dsa_pointer new_ptr;
@@ -774,12 +774,12 @@ xpatch_insert_cache_push(int slot_idx, Oid relid,
 void
 xpatch_insert_cache_commit_entry(int slot_idx, Oid relid,
                                  XPatchGroupHash expected_hash,
-                                 int32 seq)
+                                 int64 seq)
 {
     InsertCacheSlot *slot;
     void *ring_base;
     bool *valid;
-    int32 *seqs;
+    int64 *seqs;
     int write_pos;
 
     if (!insert_cache_initialized || slot_idx < 0 ||
@@ -832,7 +832,7 @@ xpatch_insert_cache_commit_entry(int slot_idx, Oid relid,
 void
 xpatch_insert_cache_populate(int slot_idx, Relation rel,
                              struct XPatchConfig *config,
-                             Datum group_value, int32 current_max_seq)
+                             Datum group_value, int64 current_max_seq)
 {
     InsertCacheSlot *slot;
     Oid relid;
@@ -840,7 +840,7 @@ xpatch_insert_cache_populate(int slot_idx, Relation rel,
     int depth;
     int num_to_populate;
     int i, j;
-    int32 seq;
+    int64 seq;
 
     if (!insert_cache_initialized || slot_idx < 0 ||
         slot_idx >= insert_cache->num_slots)

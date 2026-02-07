@@ -335,7 +335,7 @@ xpatch_inspect(PG_FUNCTION_ARGS)
                             memset(nulls, 0, sizeof(nulls));
 
                             values[0] = Int64GetDatum(version);
-                            values[1] = Int32GetDatum(ctx->current_seq);
+                            values[1] = Int64GetDatum(ctx->current_seq);
                             values[2] = BoolGetDatum(is_keyframe);
                             values[3] = Int32GetDatum((int32) tag);
                             values[4] = Int32GetDatum(data_len);
@@ -482,7 +482,7 @@ typedef struct XPatchPhysicalContext
     bool            group_eq_valid;    /* True if group_eq_finfo is initialized */
     Datum           filter_group;      /* Group value to filter by */
     bool            filter_group_null; /* True if filtering all groups */
-    int32           from_seq;          /* Filter: return rows with seq > from_seq */
+    int64           from_seq;          /* Filter: return rows with seq > from_seq */
     bool            from_seq_null;     /* True if no seq filtering */
     BlockNumber     current_block;
     OffsetNumber    current_offset;
@@ -647,7 +647,7 @@ xpatch_physical(PG_FUNCTION_ARGS)
         else
         {
             ctx->from_seq_null = false;
-            ctx->from_seq = PG_GETARG_INT32(2);
+            ctx->from_seq = PG_GETARG_INT64(2);
         }
 
         ctx->current_block = 0;
@@ -715,7 +715,7 @@ xpatch_physical(PG_FUNCTION_ARGS)
                 Datum       version_datum;
                 Oid         version_type;
                 int64       version;
-                int32       output_seq;
+                int64       output_seq;
 
                 /* Convert group value to text for output */
                 if (ctx->config->group_by_attnum != InvalidAttrNumber)
@@ -794,7 +794,7 @@ xpatch_physical(PG_FUNCTION_ARGS)
                         }
 
                         values[1] = Int64GetDatum(version);
-                        values[2] = Int32GetDatum(output_seq);
+                        values[2] = Int64GetDatum(output_seq);
                         values[3] = BoolGetDatum(is_keyframe);
                         values[4] = Int32GetDatum((int32) tag);
                         values[5] = CStringGetTextDatum(ctx->config->delta_columns[ctx->current_delta_col]);

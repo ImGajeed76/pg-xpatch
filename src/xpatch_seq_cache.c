@@ -66,7 +66,7 @@ typedef struct GroupSeqEntry
     XPatchGroupHash group_hash;     /* 128-bit hash of group value */
     
     /* Value */
-    int32       max_seq;
+    int64       max_seq;
     
     /* LRU list links */
     int32       lru_prev;       /* Previous entry in LRU (-1 = head) */
@@ -139,7 +139,7 @@ typedef struct TidSeqEntry
     ItemPointerData tid;
     
     /* Value */
-    int32           seq;
+    int64           seq;
     
     /* LRU list links */
     int32           lru_prev;       /* Previous entry in LRU (-1 = head) */
@@ -181,7 +181,7 @@ typedef struct SeqTidEntry
     /* Key - using 128-bit BLAKE3 hash for collision resistance */
     Oid             relid;
     XPatchGroupHash group_hash;     /* 128-bit hash of group value */
-    int32           seq;            /* Sequence number */
+    int64           seq;            /* Sequence number */
     
     /* Value */
     ItemPointerData tid;            /* Physical location of the tuple */
@@ -218,7 +218,7 @@ typedef struct SeqTidCache
 
 /* Hash function for seq-to-TID cache key */
 static uint32
-hash_seq_tid_key(Oid relid, XPatchGroupHash group_hash, int32 seq)
+hash_seq_tid_key(Oid relid, XPatchGroupHash group_hash, int64 seq)
 {
     uint32 h = FNV_OFFSET_BASIS_32;
     unsigned char *p;
@@ -239,7 +239,7 @@ hash_seq_tid_key(Oid relid, XPatchGroupHash group_hash, int32 seq)
     
     /* Mix in the sequence number */
     p = (unsigned char *) &seq;
-    for (i = 0; i < (int) sizeof(int32); i++)
+    for (i = 0; i < (int) sizeof(int64); i++)
         h = (h ^ p[i]) * FNV_PRIME_32;
     
     return h;
@@ -1005,11 +1005,11 @@ group_cache_find_slot_for_key(Oid relid, XPatchGroupHash group_hash)
     return -1;  /* Cache full */
 }
 
-int32
+int64
 xpatch_seq_cache_get_max_seq(Oid relid, Datum group_value, Oid typid, bool *found)
 {
     int32 idx;
-    int32 result = 0;
+    int64 result = 0;
     GroupSeqEntry *entries;
     XPatchGroupHash group_hash;
     
@@ -1047,7 +1047,7 @@ xpatch_seq_cache_get_max_seq(Oid relid, Datum group_value, Oid typid, bool *foun
 }
 
 void
-xpatch_seq_cache_set_max_seq(Oid relid, Datum group_value, Oid typid, int32 max_seq)
+xpatch_seq_cache_set_max_seq(Oid relid, Datum group_value, Oid typid, int64 max_seq)
 {
     int32 idx;
     int32 slot;
@@ -1122,12 +1122,12 @@ xpatch_seq_cache_set_max_seq(Oid relid, Datum group_value, Oid typid, int32 max_
     LWLockRelease(group_cache->lock);
 }
 
-int32
+int64
 xpatch_seq_cache_next_seq(Oid relid, Datum group_value, Oid typid)
 {
     int32 idx;
     int32 slot;
-    int32 new_seq;
+    int64 new_seq;
     GroupSeqEntry *entries;
     XPatchGroupHash group_hash;
     
@@ -1173,7 +1173,7 @@ xpatch_seq_cache_next_seq(Oid relid, Datum group_value, Oid typid)
 }
 
 bool
-xpatch_seq_cache_rollback_seq(Oid relid, Datum group_value, Oid typid, int32 expected_seq)
+xpatch_seq_cache_rollback_seq(Oid relid, Datum group_value, Oid typid, int64 expected_seq)
 {
     int32 idx;
     int32 slot;
@@ -1205,11 +1205,11 @@ xpatch_seq_cache_rollback_seq(Oid relid, Datum group_value, Oid typid, int32 exp
         {
             entries[idx].max_seq--;
             success = true;
-            elog(DEBUG1, "xpatch: rolled back seq %d for group", expected_seq);
+            elog(DEBUG1, "xpatch: rolled back seq " INT64_FORMAT " for group", expected_seq);
         }
         else
         {
-            elog(DEBUG1, "xpatch: seq rollback skipped - current %d != expected %d",
+            elog(DEBUG1, "xpatch: seq rollback skipped - current " INT64_FORMAT " != expected " INT64_FORMAT,
                  entries[idx].max_seq, expected_seq);
         }
     }
@@ -1318,11 +1318,11 @@ tid_cache_find_slot_for_key(Oid relid, ItemPointer tid)
     return -1;  /* Cache full */
 }
 
-int32
+int64
 xpatch_seq_cache_get_tid_seq(Oid relid, ItemPointer tid, bool *found)
 {
     int32 idx;
-    int32 result = 0;
+    int64 result = 0;
     TidSeqEntry *entries;
     
     *found = false;
@@ -1356,7 +1356,7 @@ xpatch_seq_cache_get_tid_seq(Oid relid, ItemPointer tid, bool *found)
 }
 
 void
-xpatch_seq_cache_set_tid_seq(Oid relid, ItemPointer tid, int32 seq)
+xpatch_seq_cache_set_tid_seq(Oid relid, ItemPointer tid, int64 seq)
 {
     int32 idx;
     int32 slot;
@@ -1429,7 +1429,7 @@ xpatch_seq_cache_set_tid_seq(Oid relid, ItemPointer tid, int32 seq)
 
 void
 xpatch_seq_cache_populate_group_tids(Oid relid, Datum group_value,
-                                     ItemPointer *tids, int32 *seqs,
+                                     ItemPointer *tids, int64 *seqs,
                                      int count)
 {
     int i;
@@ -1498,7 +1498,7 @@ xpatch_seq_cache_populate_group_tids(Oid relid, Datum group_value,
 
 /* Find entry index using hash lookup with linear probing, returns -1 if not found */
 static int32
-seq_tid_cache_find(Oid relid, XPatchGroupHash group_hash, int32 seq, int32 *out_slot)
+seq_tid_cache_find(Oid relid, XPatchGroupHash group_hash, int64 seq, int32 *out_slot)
 {
     uint32 h;
     int32 slot;
@@ -1546,7 +1546,7 @@ seq_tid_cache_find(Oid relid, XPatchGroupHash group_hash, int32 seq, int32 *out_
 
 /* Find free slot for insertion */
 static int32
-seq_tid_cache_find_slot_for_key(Oid relid, XPatchGroupHash group_hash, int32 seq)
+seq_tid_cache_find_slot_for_key(Oid relid, XPatchGroupHash group_hash, int64 seq)
 {
     uint32 h;
     int32 slot;
@@ -1597,7 +1597,7 @@ seq_tid_cache_find_slot_for_key(Oid relid, XPatchGroupHash group_hash, int32 seq
 
 bool
 xpatch_seq_cache_get_seq_tid(Oid relid, Datum group_value, Oid typid,
-                              int32 seq, ItemPointer tid)
+                              int64 seq, ItemPointer tid)
 {
     int32 idx;
     SeqTidEntry *entries;
@@ -1636,7 +1636,7 @@ xpatch_seq_cache_get_seq_tid(Oid relid, Datum group_value, Oid typid,
 
 void
 xpatch_seq_cache_set_seq_tid(Oid relid, Datum group_value, Oid typid,
-                              int32 seq, ItemPointer tid)
+                              int64 seq, ItemPointer tid)
 {
     int32 idx;
     int32 slot;

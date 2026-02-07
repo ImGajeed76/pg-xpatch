@@ -54,18 +54,15 @@ SHLIB_LINK_INTERNAL = $(BLAKE3_ASM_OBJS)
 # Extension data files
 DATA = sql/pg_xpatch--0.1.0.sql sql/pg_xpatch--0.1.1.sql sql/pg_xpatch--0.2.0.sql \
        sql/pg_xpatch--0.2.1.sql sql/pg_xpatch--0.3.0.sql sql/pg_xpatch--0.3.1.sql \
-       sql/pg_xpatch--0.4.0.sql sql/pg_xpatch--0.1.0--0.1.1.sql \
+       sql/pg_xpatch--0.4.0.sql sql/pg_xpatch--0.5.0.sql \
+       sql/pg_xpatch--0.1.0--0.1.1.sql \
        sql/pg_xpatch--0.1.1--0.2.0.sql sql/pg_xpatch--0.2.0--0.2.1.sql \
        sql/pg_xpatch--0.2.1--0.3.0.sql sql/pg_xpatch--0.3.0--0.3.1.sql \
-       sql/pg_xpatch--0.3.1--0.4.0.sql
+       sql/pg_xpatch--0.3.1--0.4.0.sql sql/pg_xpatch--0.4.0--0.5.0.sql
 EXTRA_CLEAN = lib/libxpatch_c.a lib/xpatch.h lib/blake3/*.o
 
-# Regression tests
-REGRESS = 00_setup 01_basic 02_compression 03_reconstruction 04_keyframes \
-          05_cache 06_errors 07_indexes 08_parallel 09_multi_delta 10_no_group \
-          11_delete 12_vacuum 13_crash_recovery 14_describe 15_warm_cache \
-          16_auto_index 17_edge_cases 18_restore_mode 19_stats_cache 20_comprehensive
-REGRESS_OPTS = --inputdir=test --outputdir=test
+# Tests: see tests/ directory (pytest)
+# Run: python -m pytest tests/ -v --tb=short
 
 # Link against static xpatch library
 # Note: Order matters! -lxpatch_c must come before system libs

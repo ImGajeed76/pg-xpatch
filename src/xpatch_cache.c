@@ -67,7 +67,7 @@ typedef struct XPatchCacheKey
 {
     Oid             relid;
     XPatchGroupHash group_hash;     /* 128-bit BLAKE3 hash of group value */
-    int32           seq;
+    int64           seq;
     AttrNumber      attnum;
     int16           padding;        /* Alignment padding */
 } XPatchCacheKey;
@@ -341,7 +341,9 @@ hash_cache_key(const XPatchCacheKey *key)
     h *= 16777619u;
     h ^= (uint32) (key->group_hash.h2 >> 32);
     h *= 16777619u;
-    h ^= (uint32) key->seq;
+    h ^= (uint32) (key->seq & 0xFFFFFFFF);
+    h *= 16777619u;
+    h ^= (uint32) (key->seq >> 32);
     h *= 16777619u;
     h ^= (uint32) key->attnum;
     h *= 16777619u;
@@ -579,7 +581,7 @@ xpatch_cache_init(void)
  * Look up content in the cache
  */
 bytea *
-xpatch_cache_get(Oid relid, Datum group_value, Oid typid, int32 seq, AttrNumber attnum)
+xpatch_cache_get(Oid relid, Datum group_value, Oid typid, int64 seq, AttrNumber attnum)
 {
     XPatchCacheKey key;
     int32 entry_idx;
@@ -616,8 +618,12 @@ xpatch_cache_get(Oid relid, Datum group_value, Oid typid, int32 seq, AttrNumber 
         LWLockRelease(shared_cache->lock);
         LWLockAcquire(shared_cache->lock, LW_EXCLUSIVE);
         
-        /* Re-check entry is still valid after lock upgrade */
-        if (entry->in_use)
+        /* Re-check entry is still valid after lock upgrade.
+         * Between releasing shared and acquiring exclusive lock, another
+         * backend could have evicted this entry and reused the slot.
+         * Verify both in_use AND that the key still matches (L6 fix). */
+        if (entry->in_use &&
+            memcmp(&entry->key, &key, sizeof(XPatchCacheKey)) == 0)
         {
             lru_remove(entry, entry_idx);
             lru_push_front(entry, entry_idx);
@@ -637,7 +643,7 @@ xpatch_cache_get(Oid relid, Datum group_value, Oid typid, int32 seq, AttrNumber 
  * Store content in the cache
  */
 void
-xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int32 seq,
+xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int64 seq,
                  AttrNumber attnum, bytea *content)
 {
     XPatchCacheKey key;

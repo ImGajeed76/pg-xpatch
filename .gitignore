@@ -42,3 +42,11 @@ test/regression.out
 
 # Debian packages
 *.deb
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Test progress notes (local only, never commit)
+tests/PROGRESS.md

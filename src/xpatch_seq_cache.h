@@ -70,7 +70,7 @@ void xpatch_seq_cache_init(void);
  *   typid       - Type OID of the group column (for proper hashing)
  *   found       - Output: true if found in cache, false if cache miss
  */
-int32 xpatch_seq_cache_get_max_seq(Oid relid, Datum group_value, Oid typid, bool *found);
+int64 xpatch_seq_cache_get_max_seq(Oid relid, Datum group_value, Oid typid, bool *found);
 
 /*
  * Set the maximum sequence number for a group.
@@ -82,7 +82,7 @@ int32 xpatch_seq_cache_get_max_seq(Oid relid, Datum group_value, Oid typid, bool
  *   typid       - Type OID of the group column (for proper hashing)
  *   max_seq     - The maximum sequence number
  */
-void xpatch_seq_cache_set_max_seq(Oid relid, Datum group_value, Oid typid, int32 max_seq);
+void xpatch_seq_cache_set_max_seq(Oid relid, Datum group_value, Oid typid, int64 max_seq);
 
 /*
  * Increment and return the next sequence number for a group.
@@ -94,7 +94,7 @@ void xpatch_seq_cache_set_max_seq(Oid relid, Datum group_value, Oid typid, int32
  *   group_value - Group column value (use 0 if no group_by)
  *   typid       - Type OID of the group column (for proper hashing)
  */
-int32 xpatch_seq_cache_next_seq(Oid relid, Datum group_value, Oid typid);
+int64 xpatch_seq_cache_next_seq(Oid relid, Datum group_value, Oid typid);
 
 /*
  * Rollback a sequence number allocation after a failed insert.
@@ -110,7 +110,7 @@ int32 xpatch_seq_cache_next_seq(Oid relid, Datum group_value, Oid typid);
  *
  * Returns true if rollback succeeded, false if seq changed (concurrent insert).
  */
-bool xpatch_seq_cache_rollback_seq(Oid relid, Datum group_value, Oid typid, int32 expected_seq);
+bool xpatch_seq_cache_rollback_seq(Oid relid, Datum group_value, Oid typid, int64 expected_seq);
 
 /* ================================================================
  * TID Seq Cache - for READ optimization
@@ -125,13 +125,13 @@ bool xpatch_seq_cache_rollback_seq(Oid relid, Datum group_value, Oid typid, int3
  *   tid   - Tuple ItemPointer
  *   found - Output: true if found in cache, false if cache miss
  */
-int32 xpatch_seq_cache_get_tid_seq(Oid relid, ItemPointer tid, bool *found);
+int64 xpatch_seq_cache_get_tid_seq(Oid relid, ItemPointer tid, bool *found);
 
 /*
  * Set the sequence number for a tuple.
  * Called after determining seq from a scan.
  */
-void xpatch_seq_cache_set_tid_seq(Oid relid, ItemPointer tid, int32 seq);
+void xpatch_seq_cache_set_tid_seq(Oid relid, ItemPointer tid, int64 seq);
 
 /*
  * Batch populate TID seq cache for an entire group.
@@ -139,7 +139,7 @@ void xpatch_seq_cache_set_tid_seq(Oid relid, ItemPointer tid, int32 seq);
  * This populates entries for all TIDs in the group in one pass.
  */
 void xpatch_seq_cache_populate_group_tids(Oid relid, Datum group_value,
-                                          ItemPointer *tids, int32 *seqs,
+                                           ItemPointer *tids, int64 *seqs,
                                           int count);
 
 /* ================================================================
@@ -158,14 +158,14 @@ void xpatch_seq_cache_populate_group_tids(Oid relid, Datum group_value,
  *   tid         - Output: TID if found
  */
 bool xpatch_seq_cache_get_seq_tid(Oid relid, Datum group_value, Oid typid,
-                                  int32 seq, ItemPointer tid);
+                                   int64 seq, ItemPointer tid);
 
 /*
  * Set the TID for a (group, seq) key.
  * Called after finding a tuple to cache its location for future lookups.
  */
 void xpatch_seq_cache_set_seq_tid(Oid relid, Datum group_value, Oid typid,
-                                  int32 seq, ItemPointer tid);
+                                   int64 seq, ItemPointer tid);
 
 /* ================================================================
  * Cache Invalidation

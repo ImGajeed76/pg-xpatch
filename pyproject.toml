@@ -1,0 +1,69 @@
+[project]
+name = "pg-xpatch-tests"
+version = "0.1.0"
+description = "Test suite for pg-xpatch PostgreSQL extension"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "pg-xpatch contributors" }
+]
+
+dependencies = [
+    "pytest>=9.0",
+    "pytest-xdist>=3.8",
+    "pytest-timeout>=2.4",
+    "psycopg[binary]>=3.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.19",
+    "ruff>=0.15",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "stress: marks stress/load tests",
+    "benchmark: marks benchmark tests",
+    "crash_test: marks crash recovery tests (run sequentially, may kill PG)",
+]
+strict_markers = true
+addopts = "-v"
+timeout = 120
+timeout_method = "thread"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::ResourceWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
