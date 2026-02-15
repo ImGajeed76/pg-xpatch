@@ -385,8 +385,8 @@ Datum
 xpatch_cache_stats_fn(PG_FUNCTION_ARGS)
 {
     TupleDesc tupdesc;
-    Datum values[6];
-    bool nulls[6];
+    Datum values[7];
+    bool nulls[7];
     HeapTuple result_tuple;
     XPatchCacheStats stats;
 
@@ -409,6 +409,7 @@ xpatch_cache_stats_fn(PG_FUNCTION_ARGS)
     values[3] = Int64GetDatum(stats.hit_count);
     values[4] = Int64GetDatum(stats.miss_count);
     values[5] = Int64GetDatum(stats.eviction_count);
+    values[6] = Int64GetDatum(stats.skip_count);
 
     result_tuple = heap_form_tuple(tupdesc, values, nulls);
 

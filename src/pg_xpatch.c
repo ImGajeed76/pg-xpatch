@@ -51,6 +51,7 @@ PG_MODULE_MAGIC;
 
 /* GUC variables */
 int xpatch_cache_size_mb = XPATCH_DEFAULT_CACHE_SIZE_MB;
+int xpatch_cache_max_entry_kb = XPATCH_DEFAULT_MAX_ENTRY_KB;
 
 /* GUC variables for seq caches (defined in xpatch_seq_cache.c) */
 extern int xpatch_group_cache_size_mb;
@@ -98,6 +99,19 @@ _PG_init(void)
             NULL,                           /* check_hook */
             NULL,                           /* assign_hook */
             NULL                            /* show_hook */
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.cache_max_entry_kb",
+            "Maximum size of a single cache entry in kilobytes",
+            "Entries larger than this are not cached. Increase for workloads with large files.",
+            &xpatch_cache_max_entry_kb,
+            XPATCH_DEFAULT_MAX_ENTRY_KB,    /* default 256 KB */
+            16,                              /* min 16 KB */
+            4096,                            /* max 4 MB */
+            PGC_SUSET,                       /* superuser can change at runtime */
+            GUC_UNIT_KB,
+            NULL, NULL, NULL
         );
 
         DefineCustomIntVariable(
@@ -157,9 +171,10 @@ _PG_init(void)
         xpatch_seq_cache_request_shmem();
         xpatch_insert_cache_request_shmem();
 
-        elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries (xpatch library %s, cache %d MB, group_cache %d MB, tid_cache %d MB, insert_cache_slots %d, encode_threads %d)",
+        elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries (xpatch library %s, cache %d MB, max_entry %d KB, group_cache %d MB, tid_cache %d MB, insert_cache_slots %d, encode_threads %d)",
              PG_XPATCH_VERSION, xpatch_lib_version(), xpatch_cache_size_mb,
-             xpatch_group_cache_size_mb, xpatch_tid_cache_size_mb,
+             xpatch_cache_max_entry_kb, xpatch_group_cache_size_mb,
+             xpatch_tid_cache_size_mb,
              xpatch_insert_cache_slots, xpatch_encode_threads);
     }
     else

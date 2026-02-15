@@ -330,7 +330,7 @@ class TestCacheStats:
         """cache_stats() has all expected columns."""
         row = db.execute("SELECT * FROM xpatch.cache_stats()").fetchone()
         expected = {"cache_size_bytes", "cache_max_bytes", "entries_count",
-                    "hit_count", "miss_count", "eviction_count"}
+                    "hit_count", "miss_count", "eviction_count", "skip_count"}
         assert expected.issubset(set(row.keys()))
 
     def test_cache_stats_max_bytes_positive(self, db: psycopg.Connection):

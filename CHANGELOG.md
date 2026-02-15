@@ -2,6 +2,18 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
+## [0.5.1] - 2026-02-15
+
+### Fixed
+
+- **Cache silently rejected entries >64KB**: The shared LRU cache had a hardcoded 64KB per-entry size limit that silently discarded any reconstructed content exceeding that threshold. This caused repeated delta chain walks for large files (e.g., a 127KB file required ~4.7s per lookup with zero cache benefit). Default limit raised to 256KB.
+
+### Added
+
+- **New GUC `pg_xpatch.cache_max_entry_kb`**: Configurable maximum cache entry size (default 256 KB, min 16 KB, max 4 MB). Tunable at runtime by superusers (`PGC_SUSET`) without requiring a server restart.
+
+- **Cache skip observability**: `xpatch_cache_stats()` and `xpatch.cache_stats()` now return a `skip_count` column showing how many entries were rejected by the size limit. A `WARNING` is logged on the first skip per backend to aid diagnosis.
+
 ## [0.4.0] - 2026-01-31
 
 ### Added

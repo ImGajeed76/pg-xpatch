@@ -56,8 +56,9 @@
  */
 #define XPATCH_SHMEM_MAX_ENTRIES    65536
 
-/* Maximum content size for a single entry (64KB) */
-#define XPATCH_MAX_ENTRY_SIZE       (64 * 1024)
+/* Default maximum content size for a single entry (256KB).
+ * Configurable via pg_xpatch.cache_max_entry_kb GUC. */
+#define XPATCH_DEFAULT_MAX_ENTRY_KB 256
 
 /* Content slot size (fixed to simplify memory management) */
 #define XPATCH_SLOT_SIZE            4096
@@ -105,6 +106,7 @@ typedef struct XPatchSharedCache
     pg_atomic_uint64 hit_count;
     pg_atomic_uint64 miss_count;
     pg_atomic_uint64 eviction_count;
+    pg_atomic_uint64 skip_count;        /* entries rejected by size limit */
     
     /* Hash table entries follow (fixed array) */
     XPatchCacheEntry entries[FLEXIBLE_ARRAY_MEMBER];
@@ -515,6 +517,7 @@ xpatch_shmem_startup(void)
         pg_atomic_init_u64(&shared_cache->hit_count, 0);
         pg_atomic_init_u64(&shared_cache->miss_count, 0);
         pg_atomic_init_u64(&shared_cache->eviction_count, 0);
+        pg_atomic_init_u64(&shared_cache->skip_count, 0);
         
         /* Initialize entry array */
         for (i = 0; i < XPATCH_SHMEM_MAX_ENTRIES; i++)
@@ -658,9 +661,27 @@ xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int64 seq,
     
     content_size = VARSIZE(content);
     
-    /* Don't cache very large entries */
-    if (content_size > XPATCH_MAX_ENTRY_SIZE)
+    /* Don't cache entries that exceed the configurable size limit */
+    if (content_size > (Size) xpatch_cache_max_entry_kb * 1024)
+    {
+        static bool warned = false;
+
+        pg_atomic_fetch_add_u64(&shared_cache->skip_count, 1);
+
+        if (!warned)
+        {
+            elog(WARNING, "pg_xpatch: cache entry of %zu bytes exceeds limit of %d KB; "
+                 "consider increasing pg_xpatch.cache_max_entry_kb",
+                 content_size, xpatch_cache_max_entry_kb);
+            warned = true;
+        }
+        else
+        {
+            elog(DEBUG1, "pg_xpatch: cache skip %zu bytes (limit %d KB)",
+                 content_size, xpatch_cache_max_entry_kb);
+        }
         return;
+    }
     
     /* Calculate slots needed */
     num_slots_needed = (content_size + sizeof(content_slots[0].data) - 1) / 
@@ -796,6 +817,7 @@ xpatch_cache_get_stats(XPatchCacheStats *stats)
     stats->hit_count = pg_atomic_read_u64(&shared_cache->hit_count);
     stats->miss_count = pg_atomic_read_u64(&shared_cache->miss_count);
     stats->eviction_count = pg_atomic_read_u64(&shared_cache->eviction_count);
+    stats->skip_count = pg_atomic_read_u64(&shared_cache->skip_count);
     
     /* Estimate current size from entries */
     {

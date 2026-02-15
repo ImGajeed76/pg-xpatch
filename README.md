@@ -75,6 +75,7 @@ SELECT * FROM xpatch.inspect('documents', 1);  -- group_value = 1
 SELECT * FROM xpatch.physical('documents');
 
 -- Get cache statistics (requires shared_preload_libraries)
+-- Returns: capacity, used, hits, misses, evictions, resets, skip_count
 SELECT * FROM xpatch.cache_stats();
 
 -- Get insert cache statistics
@@ -170,7 +171,12 @@ pg_xpatch.group_cache_size_mb = 64  # Group sequence cache (default: 8)
 pg_xpatch.tid_cache_size_mb = 64    # TID cache (default: 8)
 pg_xpatch.insert_cache_slots = 64   # Concurrent insert slots (default: 16)
 pg_xpatch.encode_threads = 4        # Parallel encoding threads (default: 0)
+pg_xpatch.cache_max_entry_kb = 256  # Max entry size for content cache (default: 256, range: 16-4096)
 ```
+
+Entries larger than `cache_max_entry_kb` are silently skipped by the cache. A `WARNING` is logged on the first skip per backend session (subsequent skips log at `DEBUG1`). Use `xpatch.cache_stats()` to monitor the `skip_count` counter.
+
+This GUC uses `PGC_SUSET` context, so superusers can change it at runtime with `SET` or `ALTER SYSTEM` without a restart.
 
 Cache warming example:
 ```sql
@@ -336,7 +342,7 @@ xpatch automatically creates indexes for efficient lookups:
 
 ## Testing
 
-pg-xpatch has a comprehensive pytest-based test suite with **425+ tests** across 15 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
+pg-xpatch has a comprehensive pytest-based test suite with **450+ tests** across 16 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
 
 ### Requirements
 
@@ -382,6 +388,7 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 | `test_transactions.py` | 35 | Commit/rollback, savepoints, MVCC visibility (seq/index/bitmap scan), concurrent insert/delete, SERIALIZABLE isolation |
 | `test_types.py` | 39 | All group types (INT/BIGINT/TEXT/VARCHAR/UUID), order types (INT/BIGINT/SMALLINT/TIMESTAMP), delta types (TEXT/BYTEA/JSON/JSONB), special characters, boundary values |
 | `test_utility_functions.py` | 52 | All SQL-callable functions: version, stats, inspect, describe, physical, cache_stats, warm_cache, refresh_stats, dump_configs, invalidate_config |
+| `test_cache_max_entry.py` | 25 | Cache max entry GUC, skip_count stats, oversized entry rejection, mixed sizes, large delta chains |
 | `test_vacuum.py` | 25 | VACUUM, VACUUM FULL (error), ANALYZE, TRUNCATE + rollback, crash recovery after VACUUM |
 
 ### Key Test Scenarios
@@ -417,7 +424,7 @@ These issues are documented for transparency. For typical workloads (versioned d
 
 ### PostgreSQL Version
 
-Thoroughly tested on PostgreSQL 16 with 425+ test cases. Other versions may work but are not officially supported.
+Thoroughly tested on PostgreSQL 16 with 450+ test cases. Other versions may work but are not officially supported.
 
 ## License
 

@@ -90,6 +90,7 @@ typedef struct XPatchCacheStats
     int64       hit_count;          /* Cache hits */
     int64       miss_count;         /* Cache misses */
     int64       eviction_count;     /* Evictions */
+    int64       skip_count;         /* Entries rejected by size limit */
 } XPatchCacheStats;
 
 void xpatch_cache_get_stats(XPatchCacheStats *stats);
