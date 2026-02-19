@@ -45,7 +45,7 @@ SELECT * FROM xpatch.stats('documents');
 - **DELETE** - Cascade delete removes a version and all subsequent versions in the chain
 - **VACUUM** - Dead tuple cleanup works
 - **WAL logging** - Crash recovery supported
-- **Shared memory cache** - LRU cache for reconstructed content across all backends
+- **Shared memory cache** - Lock-striped LRU cache for reconstructed content across all backends
 - **Stats cache** - Statistics updated incrementally on INSERT/DELETE for instant `xpatch.stats()` calls
 
 ### What Doesn't Work (By Design)
@@ -75,7 +75,7 @@ SELECT * FROM xpatch.inspect('documents', 1);  -- group_value = 1
 SELECT * FROM xpatch.physical('documents');
 
 -- Get cache statistics (requires shared_preload_libraries)
--- Returns: capacity, used, hits, misses, evictions, resets, skip_count
+-- Returns: size_bytes, max_bytes, entries_count, hit_count, miss_count, eviction_count, skip_count
 SELECT * FROM xpatch.cache_stats();
 
 -- Get insert cache statistics
@@ -165,18 +165,29 @@ The shared memory cache is **essential** for good read performance. Add to `post
 ```
 shared_preload_libraries = 'pg_xpatch'
 
-# Cache sizes (adjust based on your workload)
-pg_xpatch.cache_size_mb = 512       # Content cache (default: 64, max: 1024)
-pg_xpatch.group_cache_size_mb = 64  # Group sequence cache (default: 8)
-pg_xpatch.tid_cache_size_mb = 64    # TID cache (default: 8)
-pg_xpatch.insert_cache_slots = 64   # Concurrent insert slots (default: 16)
-pg_xpatch.encode_threads = 4        # Parallel encoding threads (default: 0)
-pg_xpatch.cache_max_entry_kb = 256  # Max entry size for content cache (default: 256, range: 16-4096)
+# Content cache (LRU, shared memory with lock striping)
+pg_xpatch.cache_size_mb = 512           # Total cache size (default: 256)
+pg_xpatch.cache_max_entries = 65536     # Max cache entries (default: 65536)
+pg_xpatch.cache_slot_size_kb = 4        # Content slot size (default: 4, range: 1-64)
+pg_xpatch.cache_partitions = 32         # Lock stripes for concurrency (default: 32, range: 1-256)
+pg_xpatch.cache_max_entry_kb = 256      # Max single entry size (default: 256, runtime-tunable)
+
+# Sequence caches
+pg_xpatch.group_cache_size_mb = 64      # Group max-seq cache (default: 16)
+pg_xpatch.tid_cache_size_mb = 64        # TID-to-seq cache (default: 16)
+pg_xpatch.seq_tid_cache_size_mb = 64    # Seq-to-TID cache (default: 16)
+
+# Insert performance
+pg_xpatch.insert_cache_slots = 64       # Concurrent insert slots (default: 16)
+pg_xpatch.max_delta_columns = 32        # Max delta columns per table (default: 32)
+pg_xpatch.encode_threads = 4            # Parallel encoding threads (default: 0)
 ```
+
+**Lock striping** (v0.6.0): The content cache is partitioned into `cache_partitions` independent stripes, each with its own lock. This eliminates contention between concurrent backends. With the default of 32 stripes, up to 32 backends can access the cache simultaneously without blocking each other.
 
 Entries larger than `cache_max_entry_kb` are silently skipped by the cache. A `WARNING` is logged on the first skip per backend session (subsequent skips log at `DEBUG1`). Use `xpatch.cache_stats()` to monitor the `skip_count` counter.
 
-This GUC uses `PGC_SUSET` context, so superusers can change it at runtime with `SET` or `ALTER SYSTEM` without a restart.
+`cache_max_entry_kb` uses `PGC_SUSET` context (superusers can change at runtime). `encode_threads` uses `PGC_USERSET` (any user can change per-session). All other GUCs are `PGC_POSTMASTER` (require a restart).
 
 Cache warming example:
 ```sql
@@ -342,7 +353,7 @@ xpatch automatically creates indexes for efficient lookups:
 
 ## Testing
 
-pg-xpatch has a comprehensive pytest-based test suite with **450+ tests** across 16 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
+pg-xpatch has a comprehensive pytest-based test suite with **496 tests** across 18 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
 
 ### Requirements
 
@@ -378,6 +389,7 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 | `test_basic.py` | 62 | CREATE TABLE, INSERT/SELECT, COPY FROM/TO, ALTER TABLE, DROP cleanup, custom schemas, nested loop rescan |
 | `test_compression.py` | 34 | Delta compression ratios, keyframe intervals, compress_depth, enable_zstd, JSONB operators, encode_threads GUC |
 | `test_delete.py` | 23 | Cascade delete semantics, multi-group isolation, re-insert after delete, edge cases |
+| `test_empty_content.py` | 9 | Empty content delta correctness: non-empty→empty→empty via COPY and INSERT, tag verification, alternating patterns, keyframe boundaries, multi-group isolation |
 | `test_errors.py` | 36 | Blocked operations (UPDATE, CLUSTER), configure() validation (E13/E17), NULL group, ON CONFLICT, TABLESAMPLE, BIGINT _xp_seq |
 | `test_indexes.py` | 25 | Auto-created indexes, manual indexes, index/bitmap scan plans, ANALYZE, REINDEX CONCURRENTLY, CREATE INDEX CONCURRENTLY |
 | `test_multi_delta.py` | 18 | Multiple delta columns, mixed types (TEXT+BYTEA, TEXT+JSONB), 4+ columns, per-column inspection |
@@ -389,6 +401,7 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 | `test_types.py` | 39 | All group types (INT/BIGINT/TEXT/VARCHAR/UUID), order types (INT/BIGINT/SMALLINT/TIMESTAMP), delta types (TEXT/BYTEA/JSON/JSONB), special characters, boundary values |
 | `test_utility_functions.py` | 52 | All SQL-callable functions: version, stats, inspect, describe, physical, cache_stats, warm_cache, refresh_stats, dump_configs, invalidate_config |
 | `test_cache_max_entry.py` | 25 | Cache max entry GUC, skip_count stats, oversized entry rejection, mixed sizes, large delta chains |
+| `test_guc_settings.py` | 27 | All 11 GUC defaults/metadata, PGC context enforcement, lock striping correctness (multi-group, stats aggregation, cross-stripe invalidation) |
 | `test_vacuum.py` | 25 | VACUUM, VACUUM FULL (error), ANALYZE, TRUNCATE + rollback, crash recovery after VACUUM |
 
 ### Key Test Scenarios
@@ -424,7 +437,7 @@ These issues are documented for transparency. For typical workloads (versioned d
 
 ### PostgreSQL Version
 
-Thoroughly tested on PostgreSQL 16 with 450+ test cases. Other versions may work but are not officially supported.
+Thoroughly tested on PostgreSQL 16 with 496 test cases. Other versions may work but are not officially supported.
 
 ## License
 

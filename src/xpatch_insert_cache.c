@@ -635,17 +635,41 @@ xpatch_insert_cache_get_bases(int slot_idx, Oid relid,
         content_ptr = ptrs[ptr_offset];
         content_size = sizes[ptr_offset];
 
-        if (!DsaPointerIsValid(content_ptr) || content_size == 0)
-            continue;
+        /*
+         * Accept both non-empty content (valid DSA pointer, size > 0) and
+         * empty content (InvalidDsaPointer, size == 0).  Empty entries are
+         * valid delta bases — skipping them caused the "stale base" bug
+         * where a subsequent insert would delta against the wrong predecessor.
+         *
+         * Reject inconsistent states (valid pointer with size=0, or invalid
+         * pointer with size!=0) as corrupt entries.
+         */
+        if (!DsaPointerIsValid(content_ptr) && content_size != 0)
+            continue;   /* corrupt: no pointer but nonzero size */
+        if (DsaPointerIsValid(content_ptr) && content_size == 0)
+            continue;   /* corrupt: pointer but zero size */
 
         /* Copy content to caller's palloc'd memory */
         {
-            void *dsa_mem = dsa_get_address(insert_cache_dsa, content_ptr);
-
             bases->bases[bases_found].seq = seqs[ring_idx];
             bases->bases[bases_found].tag = tag;
-            bases->bases[bases_found].data = palloc(content_size);
-            memcpy((void *) bases->bases[bases_found].data, dsa_mem, content_size);
+
+            if (content_size > 0)
+            {
+                void *dsa_mem = dsa_get_address(insert_cache_dsa, content_ptr);
+                bases->bases[bases_found].data = palloc(content_size);
+                memcpy((void *) bases->bases[bases_found].data, dsa_mem, content_size);
+            }
+            else
+            {
+                /*
+                 * Empty base: use a 1-byte palloc so the caller always gets
+                 * a non-NULL pointer.  This avoids passing NULL to the Rust
+                 * FFI xpatch_encode() which expects a valid pointer even
+                 * when base_len is 0.
+                 */
+                bases->bases[bases_found].data = palloc(1);
+            }
             bases->bases[bases_found].size = content_size;
             bases_found++;
 
@@ -716,9 +740,6 @@ xpatch_insert_cache_push(int slot_idx, Oid relid,
         !DsaPointerIsValid(slot->ring_ptr))
         return;
 
-    if (size == 0 || data == NULL)
-        return;
-
     LWLockAcquire(&insert_cache_locks[slot_idx].lock, LW_EXCLUSIVE);
 
     /*
@@ -748,6 +769,22 @@ xpatch_insert_cache_push(int slot_idx, Oid relid,
         dsa_free(insert_cache_dsa, ptrs[ptr_offset]);
         ptrs[ptr_offset] = InvalidDsaPointer;
         sizes[ptr_offset] = 0;
+    }
+
+    /*
+     * Handle empty content (size=0 or data=NULL): record the entry in the
+     * ring as InvalidDsaPointer with size=0 so that get_bases() sees it as
+     * a valid empty base.  Previously this was an early return which caused
+     * the FIFO to lose track of empty rows — subsequent inserts would then
+     * compute deltas against a stale non-empty predecessor.
+     */
+    if (size == 0 || data == NULL)
+    {
+        ptrs[ptr_offset] = InvalidDsaPointer;
+        sizes[ptr_offset] = 0;
+        seqs[write_pos] = seq;
+        LWLockRelease(&insert_cache_locks[slot_idx].lock);
+        return;
     }
 
     /* Allocate DSA memory and copy content (NO_OOM to avoid throwing with lock held) */

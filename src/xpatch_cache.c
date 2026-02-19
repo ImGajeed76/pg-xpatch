@@ -21,22 +21,30 @@
  */
 
 /*
- * xpatch_cache.c - Shared LRU cache implementation
+ * xpatch_cache.c - Shared LRU cache with lock striping
  *
  * Implements a shared memory LRU cache for decoded content.
  * The cache is shared across all PostgreSQL backends for better hit rates.
  *
- * Architecture:
- * - Fixed-size shared memory region allocated at startup
- * - Hash table for O(1) key lookup
- * - Doubly-linked LRU list for eviction
- * - LWLock for concurrent access
- * - Content stored in dynamically-sized slots within shmem
+ * Lock Striping (v0.6.0):
+ * The cache is partitioned into N = xpatch_cache_partitions independent
+ * stripes. Each stripe has its own LWLock, LRU list, entry hash table,
+ * and content slot free list. Key hash determines stripe assignment:
+ *   stripe_idx = hash(key) % num_stripes
  *
- * Memory Layout:
- * [XPatchSharedCache header]
- * [Hash table entries - fixed count]
- * [Content buffer pool - remaining space]
+ * This allows N concurrent backends to access the cache without contention,
+ * as long as they access different stripes.
+ *
+ * Memory Layout (per stripe):
+ *   [XPatchCacheStripe header]
+ *   ...all stripe headers contiguous...
+ *   [Entry arrays - one per stripe, contiguous]
+ *   [Content slot buffer - one pool per stripe, contiguous]
+ *
+ * Global layout in shared memory:
+ *   [XPatchSharedCache header with stripe array]
+ *   [All entry arrays]
+ *   [All content slot buffers]
  */
 
 #include "xpatch_cache.h"
@@ -89,266 +97,95 @@ typedef struct XPatchCacheEntry
  * These statics are computed once in shmem_startup and remain fixed
  * for the lifetime of the postmaster (PGC_POSTMASTER GUC).
  */
-static char *content_slots_base = NULL;  /* Base of content slot buffer */
 static int   slot_total_size;            /* xpatch_cache_slot_size_kb * 1024 */
 static int   slot_data_size;             /* slot_total_size - sizeof(int32) */
 
-/* Inline helpers for slot access via pointer arithmetic */
-static inline int32 *
-slot_next_ptr(int32 idx)
+/*
+ * Per-stripe cache partition.
+ *
+ * Each stripe independently manages its own entries, LRU list, slot pool,
+ * and statistics. This eliminates contention between backends accessing
+ * different stripes.
+ */
+typedef struct XPatchCacheStripe
 {
-    return (int32 *)(content_slots_base + (Size)idx * slot_total_size);
-}
+    LWLock             *lock;
+    int32               lru_head;           /* Most recently used entry index (stripe-local) */
+    int32               lru_tail;           /* Least recently used entry index (stripe-local) */
+    int32               num_entries;        /* Current entry count in this stripe */
+    int32               max_entries;        /* Max entries for this stripe */
+    int32               free_slot_head;     /* Free slot list head (stripe-local index) */
+    int32               num_slots;          /* Total content slots in this stripe */
+    pg_atomic_uint64    hit_count;
+    pg_atomic_uint64    miss_count;
+    pg_atomic_uint64    eviction_count;
+    pg_atomic_uint64    skip_count;         /* entries rejected by size limit */
+} XPatchCacheStripe;
 
-static inline char *
-slot_data_ptr(int32 idx)
-{
-    return content_slots_base + (Size)idx * slot_total_size + sizeof(int32);
-}
-
-/* Shared cache header in shmem */
+/*
+ * Shared cache header in shmem.
+ *
+ * The stripe array is embedded at the end via FLEXIBLE_ARRAY_MEMBER.
+ * Entry arrays and slot buffers follow after the header in shmem,
+ * computed via offsets.
+ */
 typedef struct XPatchSharedCache
 {
-    LWLock         *lock;               /* Protects all cache operations */
-    int32           lru_head;           /* Most recently used entry index */
-    int32           lru_tail;           /* Least recently used entry index */
-    int32           num_entries;        /* Current entry count */
-    int32           max_entries;        /* Maximum entries */
-    int32           num_slots;          /* Total content slots */
-    int32           free_slot_head;     /* Free slot list head */
-    pg_atomic_uint64 hit_count;
-    pg_atomic_uint64 miss_count;
-    pg_atomic_uint64 eviction_count;
-    pg_atomic_uint64 skip_count;        /* entries rejected by size limit */
-    
-    /* Hash table entries follow (fixed array) */
-    XPatchCacheEntry entries[FLEXIBLE_ARRAY_MEMBER];
+    int32               num_stripes;
+    int32               total_entries;      /* Sum of all stripe max_entries */
+    int32               total_slots;        /* Sum of all stripe num_slots */
+    XPatchCacheStripe   stripes[FLEXIBLE_ARRAY_MEMBER];
 } XPatchSharedCache;
 
 /* Pointers to shared memory structures */
 static XPatchSharedCache *shared_cache = NULL;
+
+/*
+ * Per-stripe base pointers into shmem (computed once per backend).
+ * stripe_entries_base[i] points to the start of stripe i's entry array.
+ * stripe_slots_base[i] points to the start of stripe i's slot buffer.
+ */
+static XPatchCacheEntry **stripe_entries_base = NULL;
+static char            **stripe_slots_base = NULL;
+
 static bool shmem_initialized = false;
 
 /* Hooks for shared memory */
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
-/*
- * Backend exit callback - clears per-backend pointers to shared memory.
- * This is a defensive measure; PostgreSQL handles shared memory detachment
- * automatically, but clearing these helps catch bugs where code tries to
- * access the cache after the backend has started shutting down.
- */
-static void
-xpatch_cache_shmem_exit(int code, Datum arg)
+/* --- Slot access helpers (per-stripe) --- */
+
+static inline int32 *
+slot_next_ptr(char *slots_base, int32 idx)
 {
-    /* Clear per-backend pointers to shared memory */
-    shared_cache = NULL;
-    content_slots_base = NULL;
-    shmem_initialized = false;
+    return (int32 *)(slots_base + (Size)idx * slot_total_size);
 }
 
-/*
- * Calculate required shared memory size
- */
-static Size
-xpatch_cache_shmem_size(void)
+static inline char *
+slot_data_ptr(char *slots_base, int32 idx)
 {
-    Size size = 0;
-    Size slot_bytes;
-    int num_slots;
-    
-    /* Header + entry array */
-    size = offsetof(XPatchSharedCache, entries);
-    size = add_size(size, mul_size(sizeof(XPatchCacheEntry), xpatch_cache_max_entries));
-    
-    /* Content slots - use remaining space up to cache_size_mb */
-    slot_bytes = (Size)xpatch_cache_slot_size_kb * 1024;
-    num_slots = ((Size)xpatch_cache_size_mb * 1024 * 1024 - size) / slot_bytes;
-    if (num_slots < 1000)
-        num_slots = 1000;  /* Minimum slots */
-    
-    size = add_size(size, mul_size(slot_bytes, num_slots));
-    
-    return size;
+    return slots_base + (Size)idx * slot_total_size + sizeof(int32);
 }
 
-/*
- * Shared memory request hook
- */
-static void
-xpatch_shmem_request(void)
-{
-    if (prev_shmem_request_hook)
-        prev_shmem_request_hook();
-    
-    RequestAddinShmemSpace(xpatch_cache_shmem_size());
-    RequestNamedLWLockTranche("pg_xpatch", 1);
-}
+/* --- Hash function --- */
 
 /*
- * Initialize content slot free list
- */
-static void
-init_free_slots(int num_slots)
-{
-    int i;
-    
-    for (i = 0; i < num_slots - 1; i++)
-    {
-        *slot_next_ptr(i) = i + 1;
-    }
-    *slot_next_ptr(num_slots - 1) = -1;
-    
-    shared_cache->free_slot_head = 0;
-    shared_cache->num_slots = num_slots;
-}
-
-/*
- * Allocate slots for content
- * Returns first slot index, or -1 if not enough space
- */
-static int32
-alloc_slots(int num_needed)
-{
-    int32 first_slot = -1;
-    int32 prev_slot = -1;
-    int i;
-    
-    for (i = 0; i < num_needed; i++)
-    {
-        int32 slot = shared_cache->free_slot_head;
-        if (slot < 0)
-        {
-            /* Not enough slots - free what we allocated */
-            while (first_slot >= 0)
-            {
-                int32 next = *slot_next_ptr(first_slot);
-                *slot_next_ptr(first_slot) = shared_cache->free_slot_head;
-                shared_cache->free_slot_head = first_slot;
-                first_slot = next;
-            }
-            return -1;
-        }
-        
-        shared_cache->free_slot_head = *slot_next_ptr(slot);
-        *slot_next_ptr(slot) = -1;
-        
-        if (first_slot < 0)
-            first_slot = slot;
-        else
-            *slot_next_ptr(prev_slot) = slot;
-        
-        prev_slot = slot;
-    }
-    
-    return first_slot;
-}
-
-/*
- * Free slots back to free list
- */
-static void
-free_slots(int32 first_slot)
-{
-    while (first_slot >= 0)
-    {
-        int32 next = *slot_next_ptr(first_slot);
-        *slot_next_ptr(first_slot) = shared_cache->free_slot_head;
-        shared_cache->free_slot_head = first_slot;
-        first_slot = next;
-    }
-}
-
-/*
- * Remove entry from LRU list
- */
-static void
-lru_remove(XPatchCacheEntry *entry, int entry_idx)
-{
-    if (entry->lru_prev >= 0)
-        shared_cache->entries[entry->lru_prev].lru_next = entry->lru_next;
-    else
-        shared_cache->lru_head = entry->lru_next;
-    
-    if (entry->lru_next >= 0)
-        shared_cache->entries[entry->lru_next].lru_prev = entry->lru_prev;
-    else
-        shared_cache->lru_tail = entry->lru_prev;
-    
-    entry->lru_prev = -1;
-    entry->lru_next = -1;
-}
-
-/*
- * Add entry to front of LRU list (most recently used)
- */
-static void
-lru_push_front(XPatchCacheEntry *entry, int entry_idx)
-{
-    entry->lru_prev = -1;
-    entry->lru_next = shared_cache->lru_head;
-    
-    if (shared_cache->lru_head >= 0)
-        shared_cache->entries[shared_cache->lru_head].lru_prev = entry_idx;
-    else
-        shared_cache->lru_tail = entry_idx;
-    
-    shared_cache->lru_head = entry_idx;
-}
-
-/*
- * Evict least recently used entry
- * Sets a tombstone marker so linear probing continues past this slot.
- */
-static void
-evict_lru_entry(void)
-{
-    int32 victim_idx = shared_cache->lru_tail;
-    XPatchCacheEntry *victim;
-    
-    if (victim_idx < 0)
-        return;
-    
-    victim = &shared_cache->entries[victim_idx];
-    
-    /* Remove from LRU list */
-    lru_remove(victim, victim_idx);
-    
-    /* Free content slots */
-    if (victim->slot_index >= 0)
-        free_slots(victim->slot_index);
-    
-    /* 
-     * Mark entry as tombstone (not in_use but also not empty).
-     * This is crucial for linear probing - we must continue probing
-     * past deleted entries to find entries that were inserted after
-     * this one and probed past it during insertion.
-     */
-    victim->in_use = false;
-    victim->tombstone = true;  /* Keep probing past this slot */
-    victim->slot_index = -1;
-    victim->content_size = 0;
-    victim->num_slots = 0;
-    
-    shared_cache->num_entries--;
-    pg_atomic_fetch_add_u64(&shared_cache->eviction_count, 1);
-}
-
-/*
- * Hash function for cache key - fast O(1) lookup
- * Uses FNV-1a to combine the 128-bit group hash with other key fields.
+ * Compute a 32-bit hash of the cache key using FNV-1a.
+ *
+ * The group_hash field already contains 128 bits of BLAKE3 output,
+ * so FNV-1a on the composite key gives excellent distribution.
+ *
+ * Returns the raw 32-bit hash (caller applies modulo).
  */
 static inline uint32
-hash_cache_key(const XPatchCacheKey *key)
+hash_cache_key_raw(const XPatchCacheKey *key)
 {
     uint32 h;
-    
-    /* FNV-1a style hash combining all key fields */
+
     h = 2166136261u;
     h ^= (uint32) key->relid;
     h *= 16777619u;
-    /* Incorporate 128-bit group hash */
     h ^= (uint32) (key->group_hash.h1 & 0xFFFFFFFF);
     h *= 16777619u;
     h ^= (uint32) (key->group_hash.h1 >> 32);
@@ -363,38 +200,227 @@ hash_cache_key(const XPatchCacheKey *key)
     h *= 16777619u;
     h ^= (uint32) key->attnum;
     h *= 16777619u;
-    
-    return h % xpatch_cache_max_entries;
+
+    return h;
 }
 
 /*
- * Find entry by key using hash table with linear probing - O(1) average
- * Properly handles tombstones to maintain correct probing behavior.
+ * Determine which stripe a key belongs to.
+ */
+static inline int
+key_to_stripe(const XPatchCacheKey *key)
+{
+    return (int)(hash_cache_key_raw(key) % (uint32)shared_cache->num_stripes);
+}
+
+/*
+ * Hash a key to a probe start index within a stripe's entry array.
+ */
+static inline uint32
+hash_cache_key_for_stripe(const XPatchCacheKey *key, int32 max_entries)
+{
+    return hash_cache_key_raw(key) % (uint32)max_entries;
+}
+
+/*
+ * Backend exit callback - clears per-backend pointers to shared memory.
+ */
+static void
+xpatch_cache_shmem_exit(int code, Datum arg)
+{
+    shared_cache = NULL;
+    if (stripe_entries_base)
+    {
+        pfree(stripe_entries_base);
+        stripe_entries_base = NULL;
+    }
+    if (stripe_slots_base)
+    {
+        pfree(stripe_slots_base);
+        stripe_slots_base = NULL;
+    }
+    shmem_initialized = false;
+}
+
+/* --- Per-stripe internal operations --- */
+
+/*
+ * Initialize content slot free list for a stripe.
+ */
+static void
+init_free_slots(XPatchCacheStripe *stripe, char *slots_base, int num_slots)
+{
+    int i;
+
+    for (i = 0; i < num_slots - 1; i++)
+    {
+        *slot_next_ptr(slots_base, i) = i + 1;
+    }
+    *slot_next_ptr(slots_base, num_slots - 1) = -1;
+
+    stripe->free_slot_head = 0;
+    stripe->num_slots = num_slots;
+}
+
+/*
+ * Allocate slots from a stripe's free list.
+ * Returns first slot index (stripe-local), or -1 if not enough space.
  */
 static int32
-find_entry(const XPatchCacheKey *key)
+alloc_slots(XPatchCacheStripe *stripe, char *slots_base, int num_needed)
 {
-    uint32 hash = hash_cache_key(key);
-    int probes = 0;
-    
-    while (probes < xpatch_cache_max_entries)
+    int32 first_slot = -1;
+    int32 prev_slot = -1;
+    int i;
+
+    for (i = 0; i < num_needed; i++)
     {
-        int32 idx = (hash + probes) % xpatch_cache_max_entries;
-        XPatchCacheEntry *entry = &shared_cache->entries[idx];
-        
+        int32 slot = stripe->free_slot_head;
+        if (slot < 0)
+        {
+            /* Not enough slots - free what we allocated */
+            while (first_slot >= 0)
+            {
+                int32 next = *slot_next_ptr(slots_base, first_slot);
+                *slot_next_ptr(slots_base, first_slot) = stripe->free_slot_head;
+                stripe->free_slot_head = first_slot;
+                first_slot = next;
+            }
+            return -1;
+        }
+
+        stripe->free_slot_head = *slot_next_ptr(slots_base, slot);
+        *slot_next_ptr(slots_base, slot) = -1;
+
+        if (first_slot < 0)
+            first_slot = slot;
+        else
+            *slot_next_ptr(slots_base, prev_slot) = slot;
+
+        prev_slot = slot;
+    }
+
+    return first_slot;
+}
+
+/*
+ * Free slots back to a stripe's free list.
+ */
+static void
+free_slots(XPatchCacheStripe *stripe, char *slots_base, int32 first_slot)
+{
+    while (first_slot >= 0)
+    {
+        int32 next = *slot_next_ptr(slots_base, first_slot);
+        *slot_next_ptr(slots_base, first_slot) = stripe->free_slot_head;
+        stripe->free_slot_head = first_slot;
+        first_slot = next;
+    }
+}
+
+/*
+ * Remove entry from a stripe's LRU list.
+ */
+static void
+lru_remove(XPatchCacheStripe *stripe, XPatchCacheEntry *entries,
+           XPatchCacheEntry *entry, int entry_idx)
+{
+    if (entry->lru_prev >= 0)
+        entries[entry->lru_prev].lru_next = entry->lru_next;
+    else
+        stripe->lru_head = entry->lru_next;
+
+    if (entry->lru_next >= 0)
+        entries[entry->lru_next].lru_prev = entry->lru_prev;
+    else
+        stripe->lru_tail = entry->lru_prev;
+
+    entry->lru_prev = -1;
+    entry->lru_next = -1;
+}
+
+/*
+ * Add entry to front of a stripe's LRU list (most recently used).
+ */
+static void
+lru_push_front(XPatchCacheStripe *stripe, XPatchCacheEntry *entries,
+               XPatchCacheEntry *entry, int entry_idx)
+{
+    entry->lru_prev = -1;
+    entry->lru_next = stripe->lru_head;
+
+    if (stripe->lru_head >= 0)
+        entries[stripe->lru_head].lru_prev = entry_idx;
+    else
+        stripe->lru_tail = entry_idx;
+
+    stripe->lru_head = entry_idx;
+}
+
+/*
+ * Evict least recently used entry from a stripe.
+ */
+static void
+evict_lru_entry(XPatchCacheStripe *stripe, XPatchCacheEntry *entries,
+                char *slots_base)
+{
+    int32 victim_idx = stripe->lru_tail;
+    XPatchCacheEntry *victim;
+
+    if (victim_idx < 0)
+        return;
+
+    victim = &entries[victim_idx];
+
+    /* Remove from LRU list */
+    lru_remove(stripe, entries, victim, victim_idx);
+
+    /* Free content slots */
+    if (victim->slot_index >= 0)
+        free_slots(stripe, slots_base, victim->slot_index);
+
+    /*
+     * Mark entry as tombstone (not in_use but also not empty).
+     * Crucial for linear probing correctness.
+     */
+    victim->in_use = false;
+    victim->tombstone = true;
+    victim->slot_index = -1;
+    victim->content_size = 0;
+    victim->num_slots = 0;
+
+    stripe->num_entries--;
+    pg_atomic_fetch_add_u64(&stripe->eviction_count, 1);
+}
+
+/*
+ * Find entry by key in a stripe using linear probing.
+ */
+static int32
+find_entry(XPatchCacheEntry *entries, int32 max_entries,
+           const XPatchCacheKey *key)
+{
+    uint32 hash = hash_cache_key_for_stripe(key, max_entries);
+    int probes = 0;
+
+    while (probes < max_entries)
+    {
+        int32 idx = (hash + probes) % max_entries;
+        XPatchCacheEntry *entry = &entries[idx];
+
         if (!entry->in_use && !entry->tombstone)
         {
             /* Empty slot (never used) - key not found */
             return -1;
         }
-        
+
         /* Skip tombstones but continue probing */
         if (entry->tombstone)
         {
             probes++;
             continue;
         }
-        
+
         /* Check if this is the entry we're looking for */
         if (entry->key.relid == key->relid &&
             xpatch_group_hash_equals(entry->key.group_hash, key->group_hash) &&
@@ -403,192 +429,328 @@ find_entry(const XPatchCacheKey *key)
         {
             return idx;
         }
-        
+
         probes++;
     }
-    
+
     return -1;
 }
 
 /*
- * Find free entry slot using hash-based placement
- * Uses the same hash as find_entry for consistency.
- * Can reuse tombstone slots to reclaim space.
+ * Find free entry slot in a stripe using hash-based placement.
+ * Can reuse tombstone slots.
  */
 static int32
-find_free_entry_for_key(const XPatchCacheKey *key)
+find_free_entry_for_key(XPatchCacheEntry *entries, int32 max_entries,
+                        const XPatchCacheKey *key)
 {
-    uint32 hash = hash_cache_key(key);
+    uint32 hash = hash_cache_key_for_stripe(key, max_entries);
     int probes = 0;
     int32 first_tombstone = -1;
-    
-    while (probes < xpatch_cache_max_entries)
+
+    while (probes < max_entries)
     {
-        int32 idx = (hash + probes) % xpatch_cache_max_entries;
-        XPatchCacheEntry *entry = &shared_cache->entries[idx];
-        
+        int32 idx = (hash + probes) % max_entries;
+        XPatchCacheEntry *entry = &entries[idx];
+
         /* Empty slot (never used) - can use it */
         if (!entry->in_use && !entry->tombstone)
             return idx;
-        
-        /* 
-         * Tombstone slot - remember the first one we see.
-         * We prefer the first tombstone to maintain good probe locality.
-         */
+
+        /* Tombstone slot - remember the first one */
         if (entry->tombstone && first_tombstone < 0)
             first_tombstone = idx;
-        
+
         probes++;
     }
-    
+
     /* If we found a tombstone, we can reuse it */
     return first_tombstone;
 }
 
 /*
- * Copy content to slots
+ * Copy content to slots within a stripe's slot buffer.
  */
 static void
-copy_to_slots(int32 first_slot, const bytea *content)
+copy_to_slots(char *slots_base, int32 first_slot, const bytea *content)
 {
     Size content_len = VARSIZE(content);
     const char *src = (const char *) content;
     Size remaining = content_len;
     int32 slot = first_slot;
-    
+
     while (remaining > 0 && slot >= 0)
     {
         Size to_copy = Min(remaining, (Size)slot_data_size);
-        memcpy(slot_data_ptr(slot), src, to_copy);
+        memcpy(slot_data_ptr(slots_base, slot), src, to_copy);
         src += to_copy;
         remaining -= to_copy;
-        slot = *slot_next_ptr(slot);
+        slot = *slot_next_ptr(slots_base, slot);
     }
 }
 
 /*
- * Copy content from slots to palloc'd bytea
+ * Copy content from slots to palloc'd bytea.
  */
 static bytea *
-copy_from_slots(int32 first_slot, Size content_size)
+copy_from_slots(char *slots_base, int32 first_slot, Size content_size)
 {
     bytea *result;
     char *dst;
     Size remaining = content_size;
     int32 slot = first_slot;
-    
+
     result = (bytea *) palloc(content_size);
     dst = (char *) result;
-    
+
     while (remaining > 0 && slot >= 0)
     {
         Size to_copy = Min(remaining, (Size)slot_data_size);
-        memcpy(dst, slot_data_ptr(slot), to_copy);
+        memcpy(dst, slot_data_ptr(slots_base, slot), to_copy);
         dst += to_copy;
         remaining -= to_copy;
-        slot = *slot_next_ptr(slot);
+        slot = *slot_next_ptr(slots_base, slot);
     }
-    
+
     return result;
 }
 
+/* --- Shared memory size calculation --- */
+
 /*
- * Shared memory startup hook
+ * Calculate required shared memory size.
+ *
+ * Layout:
+ *   [XPatchSharedCache header + stripe array]
+ *   [Entry arrays: num_stripes * entries_per_stripe * sizeof(XPatchCacheEntry)]
+ *   [Slot buffers: remaining space up to cache_size_mb]
+ */
+static Size
+xpatch_cache_shmem_size(void)
+{
+    Size size = 0;
+    Size header_size;
+    Size entries_size;
+    Size slot_bytes;
+    int num_stripes = xpatch_cache_partitions;
+    int entries_per_stripe;
+    int total_slots;
+
+    /* Header + stripe array */
+    header_size = offsetof(XPatchSharedCache, stripes);
+    header_size = add_size(header_size, mul_size(sizeof(XPatchCacheStripe), num_stripes));
+    header_size = MAXALIGN(header_size);
+
+    /* Entry arrays for all stripes */
+    entries_per_stripe = xpatch_cache_max_entries / num_stripes;
+    if (entries_per_stripe < 64)
+        entries_per_stripe = 64;  /* Minimum entries per stripe */
+    entries_size = mul_size(sizeof(XPatchCacheEntry),
+                            mul_size(entries_per_stripe, num_stripes));
+    entries_size = MAXALIGN(entries_size);
+
+    size = add_size(header_size, entries_size);
+
+    /* Content slots - use remaining space up to cache_size_mb */
+    slot_bytes = (Size)xpatch_cache_slot_size_kb * 1024;
+    total_slots = ((Size)xpatch_cache_size_mb * 1024 * 1024 - size) / slot_bytes;
+    if (total_slots < num_stripes)
+        total_slots = num_stripes;  /* At least 1 slot per stripe */
+
+    size = add_size(size, mul_size(slot_bytes, total_slots));
+
+    return size;
+}
+
+/*
+ * Shared memory request hook.
+ */
+static void
+xpatch_shmem_request(void)
+{
+    if (prev_shmem_request_hook)
+        prev_shmem_request_hook();
+
+    RequestAddinShmemSpace(xpatch_cache_shmem_size());
+    RequestNamedLWLockTranche("pg_xpatch", xpatch_cache_partitions);
+}
+
+/*
+ * Shared memory startup hook.
  */
 static void
 xpatch_shmem_startup(void)
 {
     bool found;
     Size cache_size;
-    Size slots_offset;
-    int num_slots;
-    
+    Size header_size;
+    Size entries_size;
+    Size slot_bytes;
+    int num_stripes = xpatch_cache_partitions;
+    int entries_per_stripe;
+    int total_slots;
+    int slots_per_stripe;
+    int extra_slots;
+    char *entries_start;
+    char *slots_start;
+    int s;
+
     if (prev_shmem_startup_hook)
         prev_shmem_startup_hook();
-    
+
     LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
-    
+
     cache_size = xpatch_cache_shmem_size();
-    
+
     shared_cache = ShmemInitStruct("pg_xpatch cache",
                                     cache_size,
                                     &found);
-    
+
     /* Compute slot layout statics (same for postmaster and children) */
     slot_total_size = xpatch_cache_slot_size_kb * 1024;
     slot_data_size = slot_total_size - (int)sizeof(int32);
-    
+
+    /* Compute layout parameters (needed by both init and attach paths) */
+    header_size = offsetof(XPatchSharedCache, stripes);
+    header_size = add_size(header_size, mul_size(sizeof(XPatchCacheStripe), num_stripes));
+    header_size = MAXALIGN(header_size);
+
+    entries_per_stripe = xpatch_cache_max_entries / num_stripes;
+    if (entries_per_stripe < 64)
+        entries_per_stripe = 64;
+    entries_size = mul_size(sizeof(XPatchCacheEntry),
+                            mul_size(entries_per_stripe, num_stripes));
+    entries_size = MAXALIGN(entries_size);
+
+    slot_bytes = (Size)xpatch_cache_slot_size_kb * 1024;
+    total_slots = (cache_size - header_size - entries_size) / slot_bytes;
+    if (total_slots < num_stripes)
+        total_slots = num_stripes;
+
+    slots_per_stripe = total_slots / num_stripes;
+    extra_slots = total_slots % num_stripes;
+
+    /* Compute base pointers into shmem */
+    entries_start = (char *) shared_cache + header_size;
+    slots_start = entries_start + entries_size;
+
     if (!found)
     {
-        int i;
-        
-        /* Initialize cache header */
+        LWLockPadded *locks;
+
+        /* Zero out entire region */
         memset(shared_cache, 0, cache_size);
-        
-        shared_cache->lock = &(GetNamedLWLockTranche("pg_xpatch"))->lock;
-        shared_cache->lru_head = -1;
-        shared_cache->lru_tail = -1;
-        shared_cache->num_entries = 0;
-        shared_cache->max_entries = xpatch_cache_max_entries;
-        pg_atomic_init_u64(&shared_cache->hit_count, 0);
-        pg_atomic_init_u64(&shared_cache->miss_count, 0);
-        pg_atomic_init_u64(&shared_cache->eviction_count, 0);
-        pg_atomic_init_u64(&shared_cache->skip_count, 0);
-        
-        /* Initialize entry array */
-        for (i = 0; i < xpatch_cache_max_entries; i++)
+
+        shared_cache->num_stripes = num_stripes;
+        shared_cache->total_entries = entries_per_stripe * num_stripes;
+        shared_cache->total_slots = total_slots;
+
+        locks = GetNamedLWLockTranche("pg_xpatch");
+
+        /* Initialize each stripe */
+        for (s = 0; s < num_stripes; s++)
         {
-            shared_cache->entries[i].in_use = false;
-            shared_cache->entries[i].tombstone = false;
-            shared_cache->entries[i].slot_index = -1;
-            shared_cache->entries[i].lru_prev = -1;
-            shared_cache->entries[i].lru_next = -1;
+            XPatchCacheStripe *stripe = &shared_cache->stripes[s];
+            XPatchCacheEntry *entries;
+            char *sslots;
+            int this_stripe_slots;
+            int this_stripe_entries = entries_per_stripe;
+            int i;
+
+            stripe->lock = &locks[s].lock;
+            stripe->lru_head = -1;
+            stripe->lru_tail = -1;
+            stripe->num_entries = 0;
+            stripe->max_entries = this_stripe_entries;
+            pg_atomic_init_u64(&stripe->hit_count, 0);
+            pg_atomic_init_u64(&stripe->miss_count, 0);
+            pg_atomic_init_u64(&stripe->eviction_count, 0);
+            pg_atomic_init_u64(&stripe->skip_count, 0);
+
+            /* Entry array for this stripe */
+            entries = (XPatchCacheEntry *)(entries_start +
+                        (Size)s * entries_per_stripe * sizeof(XPatchCacheEntry));
+            for (i = 0; i < this_stripe_entries; i++)
+            {
+                entries[i].in_use = false;
+                entries[i].tombstone = false;
+                entries[i].slot_index = -1;
+                entries[i].lru_prev = -1;
+                entries[i].lru_next = -1;
+            }
+
+            /* Slot buffer for this stripe */
+            /* Distribute extra slots to first stripes (1 extra each) */
+            this_stripe_slots = slots_per_stripe + (s < extra_slots ? 1 : 0);
+
+            /* Compute slot offset: sum of slots for all previous stripes */
+            {
+                int slot_offset = 0;
+                int j;
+                for (j = 0; j < s; j++)
+                    slot_offset += slots_per_stripe + (j < extra_slots ? 1 : 0);
+
+                sslots = slots_start + (Size)slot_offset * slot_bytes;
+            }
+
+            stripe->num_slots = this_stripe_slots;
+            if (this_stripe_slots > 0)
+                init_free_slots(stripe, sslots, this_stripe_slots);
+            else
+                stripe->free_slot_head = -1;
         }
-        
-        /* Calculate content slots location */
-        slots_offset = offsetof(XPatchSharedCache, entries);
-        slots_offset += sizeof(XPatchCacheEntry) * xpatch_cache_max_entries;
-        
-        content_slots_base = (char *) shared_cache + slots_offset;
-        
-        num_slots = (cache_size - slots_offset) / slot_total_size;
-        init_free_slots(num_slots);
-        
-        elog(LOG, "pg_xpatch: shared cache initialized (%d entries, %d content slots, %zu MB)",
-             xpatch_cache_max_entries, num_slots, cache_size / (1024 * 1024));
+
+        elog(LOG, "pg_xpatch: shared cache initialized (%d stripes, %d entries/stripe, "
+             "%d total slots, %zu MB)",
+             num_stripes, entries_per_stripe, total_slots,
+             cache_size / (1024 * 1024));
     }
-    else
+
+    /* Build per-backend pointer arrays (both init and attach paths) */
     {
-        /* Attach to existing cache - just set content_slots_base pointer */
-        slots_offset = offsetof(XPatchSharedCache, entries);
-        slots_offset += sizeof(XPatchCacheEntry) * xpatch_cache_max_entries;
-        content_slots_base = (char *) shared_cache + slots_offset;
+        MemoryContext old_ctx = MemoryContextSwitchTo(TopMemoryContext);
+        stripe_entries_base = palloc(sizeof(XPatchCacheEntry *) * num_stripes);
+        stripe_slots_base = palloc(sizeof(char *) * num_stripes);
+        MemoryContextSwitchTo(old_ctx);
+
+        for (s = 0; s < num_stripes; s++)
+        {
+            int slot_offset = 0;
+            int j;
+
+            stripe_entries_base[s] = (XPatchCacheEntry *)(entries_start +
+                        (Size)s * entries_per_stripe * sizeof(XPatchCacheEntry));
+
+            for (j = 0; j < s; j++)
+                slot_offset += slots_per_stripe + (j < extra_slots ? 1 : 0);
+            stripe_slots_base[s] = slots_start + (Size)slot_offset * slot_bytes;
+        }
     }
-    
+
     LWLockRelease(AddinShmemInitLock);
-    
+
     shmem_initialized = true;
-    
+
     /* Register exit callback to clear per-backend pointers */
     on_shmem_exit(xpatch_cache_shmem_exit, (Datum) 0);
 }
 
 /*
- * Request shared memory space
- * Must be called from _PG_init()
+ * Request shared memory space.
+ * Must be called from _PG_init().
  */
 void
 xpatch_cache_request_shmem(void)
 {
     prev_shmem_request_hook = shmem_request_hook;
     shmem_request_hook = xpatch_shmem_request;
-    
+
     prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook = xpatch_shmem_startup;
 }
 
 /*
- * Initialize the cache (called from _PG_init, but actual init is in startup hook)
+ * Initialize the cache (called from _PG_init, actual init in startup hook).
  */
 void
 xpatch_cache_init(void)
@@ -596,93 +758,113 @@ xpatch_cache_init(void)
     /* Actual initialization happens in shmem_startup_hook */
 }
 
+/* --- Public API --- */
+
 /*
- * Look up content in the cache
+ * Look up content in the cache.
  */
 bytea *
 xpatch_cache_get(Oid relid, Datum group_value, Oid typid, int64 seq, AttrNumber attnum)
 {
     XPatchCacheKey key;
+    int stripe_idx;
+    XPatchCacheStripe *stripe;
+    XPatchCacheEntry *entries;
+    char *slots_base;
     int32 entry_idx;
     XPatchCacheEntry *entry;
     bytea *result = NULL;
-    
+
     if (!shmem_initialized || shared_cache == NULL)
         return NULL;
-    
+
     /* Build key with 128-bit BLAKE3 hash of group value */
     memset(&key, 0, sizeof(key));
     key.relid = relid;
     key.group_hash = xpatch_compute_group_hash(group_value, typid, false);
     key.seq = seq;
     key.attnum = attnum;
-    
-    LWLockAcquire(shared_cache->lock, LW_SHARED);
-    
-    entry_idx = find_entry(&key);
-    
+
+    /* Determine stripe */
+    stripe_idx = key_to_stripe(&key);
+    stripe = &shared_cache->stripes[stripe_idx];
+    entries = stripe_entries_base[stripe_idx];
+    slots_base = stripe_slots_base[stripe_idx];
+
+    LWLockAcquire(stripe->lock, LW_SHARED);
+
+    entry_idx = find_entry(entries, stripe->max_entries, &key);
+
     if (entry_idx >= 0)
     {
-        entry = &shared_cache->entries[entry_idx];
-        
+        entry = &entries[entry_idx];
+
         /* Copy content to caller's memory */
         if (entry->slot_index >= 0 && entry->content_size > 0)
         {
-            result = copy_from_slots(entry->slot_index, entry->content_size);
+            result = copy_from_slots(slots_base, entry->slot_index,
+                                     entry->content_size);
         }
-        
-        pg_atomic_fetch_add_u64(&shared_cache->hit_count, 1);
-        
+
+        pg_atomic_fetch_add_u64(&stripe->hit_count, 1);
+
         /* Move to front of LRU - need exclusive lock */
-        LWLockRelease(shared_cache->lock);
-        LWLockAcquire(shared_cache->lock, LW_EXCLUSIVE);
-        
-        /* Re-check entry is still valid after lock upgrade.
+        LWLockRelease(stripe->lock);
+        LWLockAcquire(stripe->lock, LW_EXCLUSIVE);
+
+        /*
+         * Re-check entry is still valid after lock upgrade.
          * Between releasing shared and acquiring exclusive lock, another
          * backend could have evicted this entry and reused the slot.
-         * Verify both in_use AND that the key still matches (L6 fix). */
+         */
         if (entry->in_use &&
             memcmp(&entry->key, &key, sizeof(XPatchCacheKey)) == 0)
         {
-            lru_remove(entry, entry_idx);
-            lru_push_front(entry, entry_idx);
+            lru_remove(stripe, entries, entry, entry_idx);
+            lru_push_front(stripe, entries, entry, entry_idx);
         }
     }
     else
     {
-        pg_atomic_fetch_add_u64(&shared_cache->miss_count, 1);
+        pg_atomic_fetch_add_u64(&stripe->miss_count, 1);
     }
-    
-    LWLockRelease(shared_cache->lock);
-    
+
+    LWLockRelease(stripe->lock);
+
     return result;
 }
 
 /*
- * Store content in the cache
+ * Store content in the cache.
  */
 void
 xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int64 seq,
                  AttrNumber attnum, bytea *content)
 {
     XPatchCacheKey key;
+    int stripe_idx;
+    XPatchCacheStripe *stripe;
+    XPatchCacheEntry *entries;
+    char *slots_base;
     int32 entry_idx;
     XPatchCacheEntry *entry;
     Size content_size;
     int num_slots_needed;
     int32 first_slot;
-    
+
     if (!shmem_initialized || shared_cache == NULL || content == NULL)
         return;
-    
+
     content_size = VARSIZE(content);
-    
+
     /* Don't cache entries that exceed the configurable size limit */
     if (content_size > (Size) xpatch_cache_max_entry_kb * 1024)
     {
         static bool warned = false;
 
-        pg_atomic_fetch_add_u64(&shared_cache->skip_count, 1);
+        /* Use stripe 0 for skip_count when we haven't computed key yet */
+        if (shared_cache->num_stripes > 0)
+            pg_atomic_fetch_add_u64(&shared_cache->stripes[0].skip_count, 1);
 
         if (!warned)
         {
@@ -698,153 +880,175 @@ xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int64 seq,
         }
         return;
     }
-    
+
     /* Calculate slots needed */
     num_slots_needed = (content_size + slot_data_size - 1) / slot_data_size;
-    
+
     /* Build key with 128-bit BLAKE3 hash of group value */
     memset(&key, 0, sizeof(key));
     key.relid = relid;
     key.group_hash = xpatch_compute_group_hash(group_value, typid, false);
     key.seq = seq;
     key.attnum = attnum;
-    
-    LWLockAcquire(shared_cache->lock, LW_EXCLUSIVE);
-    
+
+    /* Determine stripe */
+    stripe_idx = key_to_stripe(&key);
+    stripe = &shared_cache->stripes[stripe_idx];
+    entries = stripe_entries_base[stripe_idx];
+    slots_base = stripe_slots_base[stripe_idx];
+
+    LWLockAcquire(stripe->lock, LW_EXCLUSIVE);
+
     /* Check if already cached */
-    entry_idx = find_entry(&key);
+    entry_idx = find_entry(entries, stripe->max_entries, &key);
     if (entry_idx >= 0)
     {
         /* Already cached - just move to front of LRU */
-        entry = &shared_cache->entries[entry_idx];
-        lru_remove(entry, entry_idx);
-        lru_push_front(entry, entry_idx);
-        LWLockRelease(shared_cache->lock);
+        entry = &entries[entry_idx];
+        lru_remove(stripe, entries, entry, entry_idx);
+        lru_push_front(stripe, entries, entry, entry_idx);
+        LWLockRelease(stripe->lock);
         return;
     }
-    
+
     /* Allocate content slots */
-    first_slot = alloc_slots(num_slots_needed);
-    
+    first_slot = alloc_slots(stripe, slots_base, num_slots_needed);
+
     /* If not enough slots, evict until we have space */
-    while (first_slot < 0 && shared_cache->num_entries > 0)
+    while (first_slot < 0 && stripe->num_entries > 0)
     {
-        evict_lru_entry();
-        first_slot = alloc_slots(num_slots_needed);
+        evict_lru_entry(stripe, entries, slots_base);
+        first_slot = alloc_slots(stripe, slots_base, num_slots_needed);
     }
-    
+
     if (first_slot < 0)
     {
         /* Still no space - give up */
-        LWLockRelease(shared_cache->lock);
+        LWLockRelease(stripe->lock);
         return;
     }
-    
+
     /* Find free entry at appropriate hash position */
-    entry_idx = find_free_entry_for_key(&key);
-    
+    entry_idx = find_free_entry_for_key(entries, stripe->max_entries, &key);
+
     /* If no free entry, evict until we have space */
-    while (entry_idx < 0 && shared_cache->num_entries > 0)
+    while (entry_idx < 0 && stripe->num_entries > 0)
     {
-        evict_lru_entry();
-        entry_idx = find_free_entry_for_key(&key);
+        evict_lru_entry(stripe, entries, slots_base);
+        entry_idx = find_free_entry_for_key(entries, stripe->max_entries, &key);
     }
-    
+
     if (entry_idx < 0)
     {
         /* No entry available - free slots and give up */
-        free_slots(first_slot);
-        LWLockRelease(shared_cache->lock);
+        free_slots(stripe, slots_base, first_slot);
+        LWLockRelease(stripe->lock);
         return;
     }
-    
+
     /* Initialize entry */
-    entry = &shared_cache->entries[entry_idx];
+    entry = &entries[entry_idx];
     memcpy(&entry->key, &key, sizeof(key));
     entry->slot_index = first_slot;
     entry->content_size = content_size;
     entry->num_slots = num_slots_needed;
     entry->in_use = true;
-    entry->tombstone = false;  /* Clear tombstone when reusing slot */
-    
+    entry->tombstone = false;
+
     /* Copy content to slots */
-    copy_to_slots(first_slot, content);
-    
+    copy_to_slots(slots_base, first_slot, content);
+
     /* Add to LRU */
-    lru_push_front(entry, entry_idx);
-    shared_cache->num_entries++;
-    
-    LWLockRelease(shared_cache->lock);
+    lru_push_front(stripe, entries, entry, entry_idx);
+    stripe->num_entries++;
+
+    LWLockRelease(stripe->lock);
 }
 
 /*
- * Invalidate all cache entries for a relation
+ * Invalidate all cache entries for a relation.
+ * Iterates all stripes sequentially.
  */
 void
 xpatch_cache_invalidate_rel(Oid relid)
 {
-    int i;
-    
+    int s;
+
     if (!shmem_initialized || shared_cache == NULL)
         return;
-    
-    LWLockAcquire(shared_cache->lock, LW_EXCLUSIVE);
-    
-    for (i = 0; i < xpatch_cache_max_entries; i++)
+
+    for (s = 0; s < shared_cache->num_stripes; s++)
     {
-        XPatchCacheEntry *entry = &shared_cache->entries[i];
-        
-        if (entry->in_use && entry->key.relid == relid)
+        XPatchCacheStripe *stripe = &shared_cache->stripes[s];
+        XPatchCacheEntry *entries = stripe_entries_base[s];
+        char *slots_base = stripe_slots_base[s];
+        int i;
+
+        LWLockAcquire(stripe->lock, LW_EXCLUSIVE);
+
+        for (i = 0; i < stripe->max_entries; i++)
         {
-            lru_remove(entry, i);
-            
-            if (entry->slot_index >= 0)
-                free_slots(entry->slot_index);
-            
-            entry->in_use = false;
-            entry->slot_index = -1;
-            entry->content_size = 0;
-            entry->num_slots = 0;
-            
-            shared_cache->num_entries--;
+            XPatchCacheEntry *entry = &entries[i];
+
+            if (entry->in_use && entry->key.relid == relid)
+            {
+                lru_remove(stripe, entries, entry, i);
+
+                if (entry->slot_index >= 0)
+                    free_slots(stripe, slots_base, entry->slot_index);
+
+                entry->in_use = false;
+                entry->slot_index = -1;
+                entry->content_size = 0;
+                entry->num_slots = 0;
+
+                stripe->num_entries--;
+            }
         }
+
+        LWLockRelease(stripe->lock);
     }
-    
-    LWLockRelease(shared_cache->lock);
 }
 
 /*
- * Get cache statistics
+ * Get cache statistics.
+ * Aggregates across all stripes.
  */
 void
 xpatch_cache_get_stats(XPatchCacheStats *stats)
 {
+    int s;
+
     if (!shmem_initialized || shared_cache == NULL)
     {
         memset(stats, 0, sizeof(*stats));
         return;
     }
-    
-    LWLockAcquire(shared_cache->lock, LW_SHARED);
-    
-    stats->entries_count = shared_cache->num_entries;
-    stats->max_bytes = xpatch_cache_size_mb * 1024 * 1024;
-    stats->hit_count = pg_atomic_read_u64(&shared_cache->hit_count);
-    stats->miss_count = pg_atomic_read_u64(&shared_cache->miss_count);
-    stats->eviction_count = pg_atomic_read_u64(&shared_cache->eviction_count);
-    stats->skip_count = pg_atomic_read_u64(&shared_cache->skip_count);
-    
-    /* Estimate current size from entries */
+
+    memset(stats, 0, sizeof(*stats));
+    stats->max_bytes = (int64)xpatch_cache_size_mb * 1024 * 1024;
+
+    for (s = 0; s < shared_cache->num_stripes; s++)
     {
+        XPatchCacheStripe *stripe = &shared_cache->stripes[s];
+        XPatchCacheEntry *entries = stripe_entries_base[s];
         int i;
-        Size total = 0;
-        for (i = 0; i < xpatch_cache_max_entries; i++)
+
+        LWLockAcquire(stripe->lock, LW_SHARED);
+
+        stats->entries_count += stripe->num_entries;
+        stats->hit_count += pg_atomic_read_u64(&stripe->hit_count);
+        stats->miss_count += pg_atomic_read_u64(&stripe->miss_count);
+        stats->eviction_count += pg_atomic_read_u64(&stripe->eviction_count);
+        stats->skip_count += pg_atomic_read_u64(&stripe->skip_count);
+
+        /* Estimate current size from entries */
+        for (i = 0; i < stripe->max_entries; i++)
         {
-            if (shared_cache->entries[i].in_use)
-                total += shared_cache->entries[i].content_size;
+            if (entries[i].in_use)
+                stats->size_bytes += entries[i].content_size;
         }
-        stats->size_bytes = total;
+
+        LWLockRelease(stripe->lock);
     }
-    
-    LWLockRelease(shared_cache->lock);
 }

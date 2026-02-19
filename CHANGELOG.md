@@ -2,6 +2,42 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
+## [0.6.0] - 2026-02-19
+
+### Added
+
+- **Lock striping for shared cache**: The content cache is now partitioned into N independent stripes (default 32), each with its own LWLock, LRU list, entry hash table, and slot free list. This eliminates contention between concurrent backends accessing different stripes. Controlled via `pg_xpatch.cache_partitions` GUC (1-256, default 32).
+
+- **5 new GUCs for full configurability**:
+  - `pg_xpatch.cache_max_entries` — Maximum cache entries (default 65536, min 1000, max INT_MAX). Replaces hardcoded `XPATCH_SHMEM_MAX_ENTRIES`.
+  - `pg_xpatch.cache_slot_size_kb` — Content slot size (default 4 KB, 1-64 KB). Replaces hardcoded `XPATCH_SLOT_SIZE` and the `XPatchContentSlot` struct.
+  - `pg_xpatch.cache_partitions` — Number of lock stripes (default 32, 1-256).
+  - `pg_xpatch.seq_tid_cache_size_mb` — Seq-to-TID cache size (default 16 MB). Previously existed as an internal variable but was never exposed as a GUC.
+  - `pg_xpatch.max_delta_columns` — Maximum delta columns per table (default 32, min 1, max INT_MAX). Replaces hardcoded `XPATCH_MAX_DELTA_COLUMNS`.
+
+### Changed
+
+- **GUC defaults and maximums raised** for large-scale workloads (target: Linux kernel history, 24M+ entries, 80K+ groups):
+  - `cache_size_mb`: default 64 → **256**, max 1024 → **INT_MAX**
+  - `cache_max_entry_kb`: max 4096 → **INT_MAX**
+  - `group_cache_size_mb`: default 8 → **16**, max 256 → **INT_MAX**
+  - `tid_cache_size_mb`: default 8 → **16**, max 256 → **INT_MAX**
+  - `insert_cache_slots`: max 256 → **INT_MAX**
+
+- **All hardcoded constants removed**: `XPATCH_SHMEM_MAX_ENTRIES`, `XPATCH_SLOT_SIZE`, and `XPATCH_MAX_DELTA_COLUMNS` have been replaced with GUC-backed variables. The `XPatchContentSlot` struct was removed in favor of pointer-arithmetic helpers computed once at startup.
+
+- **Cache stats now aggregate across stripes**: `xpatch.cache_stats()` and `xpatch_cache_stats()` iterate all stripes and sum hits, misses, evictions, skip_count, entries_count, and size_bytes.
+
+### Fixed
+
+- **Insert cache drops empty content, causing stale delta bases**: The FIFO insert cache (`xpatch_insert_cache_push()`) silently discarded rows with empty content (size=0 early return), but `commit_entry()` still advanced the ring head. Subsequent inserts then computed deltas against stale non-empty predecessors instead of the correct empty predecessor. This produced incorrect deltas on disk (wrong tag values), though the decoder compensated and returned correct data on read. The bug only affected the warm INSERT path (individual INSERTs); bulk COPY was unaffected. Fixed by storing empty content entries in the ring buffer and returning them as valid bases in `get_bases()`.
+
+### Technical
+
+- **11 total GUCs** (5 new, 5 modified, 1 unchanged). All visible in `pg_settings`.
+- **496 tests** across 18 test files (27 new in `test_guc_settings.py`, 9 new in `test_empty_content.py`).
+- Memory layout: `[header + stripe array][entry arrays][slot buffers]`, with entries and slots distributed evenly across stripes.
+
 ## [0.5.1] - 2026-02-15
 
 ### Fixed

@@ -6,6 +6,7 @@
 --     seq_tid_cache_size_mb, max_delta_columns
 --   - Existing GUC defaults/maxes raised for large-scale workloads
 --   - Lock striping for content cache (cache_partitions)
+--   - Fixed: insert cache dropping empty content causing stale delta bases
 --
--- No SQL-level changes needed (all GUCs are C-only).
+-- No SQL-level changes needed (all changes are C-only).
 -- This migration file exists for completeness.
