@@ -55,8 +55,8 @@
 /* Forward declaration */
 struct XPatchConfig;
 
-/* Maximum delta columns per table (matching xpatch_config.h) */
-#define XPATCH_MAX_DELTA_COLUMNS    32
+/* GUC variable for max delta columns per table (defined in xpatch_insert_cache.c) */
+extern int xpatch_max_delta_columns;
 
 /* Default number of FIFO slots */
 #define XPATCH_DEFAULT_INSERT_CACHE_SLOTS   16

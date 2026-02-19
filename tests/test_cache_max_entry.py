@@ -50,9 +50,9 @@ class TestCacheMaxEntryGUC:
             db.execute("SET pg_xpatch.cache_max_entry_kb = 8")
 
     def test_guc_rejects_above_maximum(self, db: psycopg.Connection):
-        """Values above maximum (4 MB = 4096 KB) are rejected."""
+        """Values above INT_MAX are rejected."""
         with pytest.raises(psycopg.errors.Error):
-            db.execute("SET pg_xpatch.cache_max_entry_kb = 8192")
+            db.execute("SET pg_xpatch.cache_max_entry_kb = 2147483648")
 
     def test_guc_accepts_boundary_min(self, db: psycopg.Connection):
         """Minimum value (16 KB) is accepted."""
@@ -62,12 +62,12 @@ class TestCacheMaxEntryGUC:
         assert val == "16kB"
 
     def test_guc_accepts_boundary_max(self, db: psycopg.Connection):
-        """Maximum value (4096 KB = 4 MB) is accepted."""
-        db.execute("SET pg_xpatch.cache_max_entry_kb = 4096")
+        """Large value (e.g. 1GB = 1048576 KB) is accepted with raised max."""
+        db.execute("SET pg_xpatch.cache_max_entry_kb = 1048576")
         row = db.execute("SHOW pg_xpatch.cache_max_entry_kb").fetchone()
         val = list(row.values())[0]
-        # PostgreSQL may display 4096kB as "4MB"
-        assert val in ("4096kB", "4MB")
+        # PostgreSQL may display 1048576kB as "1GB"
+        assert val in ("1048576kB", "1GB", "1024MB")
 
     def test_guc_visible_in_pg_settings(self, db: psycopg.Connection):
         """GUC appears in pg_settings with correct metadata."""

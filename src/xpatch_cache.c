@@ -49,19 +49,10 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 
-/* Maximum entries in shared cache (fixed at startup) 
- * This should be large enough to hold all reconstructed values
- * for active workloads. Each entry is small (~64 bytes), so we
- * can afford many entries. The content slots hold the actual data.
- */
-#define XPATCH_SHMEM_MAX_ENTRIES    65536
-
-/* Default maximum content size for a single entry (256KB).
- * Configurable via pg_xpatch.cache_max_entry_kb GUC. */
-#define XPATCH_DEFAULT_MAX_ENTRY_KB 256
-
-/* Content slot size (fixed to simplify memory management) */
-#define XPATCH_SLOT_SIZE            4096
+/* GUC variables (registered in pg_xpatch.c, defaults set here) */
+int xpatch_cache_max_entries = 65536;
+int xpatch_cache_slot_size_kb = 4;    /* in KB, converted to bytes at startup */
+int xpatch_cache_partitions = 32;
 
 /* Cache entry key - must be fixed size for shared memory hash */
 typedef struct XPatchCacheKey
@@ -86,12 +77,34 @@ typedef struct XPatchCacheEntry
     bool            tombstone;      /* Entry was deleted, continue probing */
 } XPatchCacheEntry;
 
-/* Content slot header */
-typedef struct XPatchContentSlot
+/*
+ * Content slots: variable-size, computed from xpatch_cache_slot_size_kb GUC.
+ *
+ * Each slot is laid out as:
+ *   [int32 next_slot][char data[slot_data_size]]
+ *
+ * Total slot size = xpatch_cache_slot_size_kb * 1024 bytes.
+ * Data area = total - sizeof(int32).
+ *
+ * These statics are computed once in shmem_startup and remain fixed
+ * for the lifetime of the postmaster (PGC_POSTMASTER GUC).
+ */
+static char *content_slots_base = NULL;  /* Base of content slot buffer */
+static int   slot_total_size;            /* xpatch_cache_slot_size_kb * 1024 */
+static int   slot_data_size;             /* slot_total_size - sizeof(int32) */
+
+/* Inline helpers for slot access via pointer arithmetic */
+static inline int32 *
+slot_next_ptr(int32 idx)
 {
-    int32           next_slot;      /* Next slot in chain (-1 if last) */
-    char            data[XPATCH_SLOT_SIZE - sizeof(int32)];
-} XPatchContentSlot;
+    return (int32 *)(content_slots_base + (Size)idx * slot_total_size);
+}
+
+static inline char *
+slot_data_ptr(int32 idx)
+{
+    return content_slots_base + (Size)idx * slot_total_size + sizeof(int32);
+}
 
 /* Shared cache header in shmem */
 typedef struct XPatchSharedCache
@@ -114,7 +127,6 @@ typedef struct XPatchSharedCache
 
 /* Pointers to shared memory structures */
 static XPatchSharedCache *shared_cache = NULL;
-static XPatchContentSlot *content_slots = NULL;
 static bool shmem_initialized = false;
 
 /* Hooks for shared memory */
@@ -132,7 +144,7 @@ xpatch_cache_shmem_exit(int code, Datum arg)
 {
     /* Clear per-backend pointers to shared memory */
     shared_cache = NULL;
-    content_slots = NULL;
+    content_slots_base = NULL;
     shmem_initialized = false;
 }
 
@@ -143,18 +155,20 @@ static Size
 xpatch_cache_shmem_size(void)
 {
     Size size = 0;
+    Size slot_bytes;
     int num_slots;
     
     /* Header + entry array */
     size = offsetof(XPatchSharedCache, entries);
-    size = add_size(size, mul_size(sizeof(XPatchCacheEntry), XPATCH_SHMEM_MAX_ENTRIES));
+    size = add_size(size, mul_size(sizeof(XPatchCacheEntry), xpatch_cache_max_entries));
     
     /* Content slots - use remaining space up to cache_size_mb */
-    num_slots = (xpatch_cache_size_mb * 1024 * 1024 - size) / sizeof(XPatchContentSlot);
+    slot_bytes = (Size)xpatch_cache_slot_size_kb * 1024;
+    num_slots = ((Size)xpatch_cache_size_mb * 1024 * 1024 - size) / slot_bytes;
     if (num_slots < 1000)
         num_slots = 1000;  /* Minimum slots */
     
-    size = add_size(size, mul_size(sizeof(XPatchContentSlot), num_slots));
+    size = add_size(size, mul_size(slot_bytes, num_slots));
     
     return size;
 }
@@ -182,9 +196,9 @@ init_free_slots(int num_slots)
     
     for (i = 0; i < num_slots - 1; i++)
     {
-        content_slots[i].next_slot = i + 1;
+        *slot_next_ptr(i) = i + 1;
     }
-    content_slots[num_slots - 1].next_slot = -1;
+    *slot_next_ptr(num_slots - 1) = -1;
     
     shared_cache->free_slot_head = 0;
     shared_cache->num_slots = num_slots;
@@ -209,21 +223,21 @@ alloc_slots(int num_needed)
             /* Not enough slots - free what we allocated */
             while (first_slot >= 0)
             {
-                int32 next = content_slots[first_slot].next_slot;
-                content_slots[first_slot].next_slot = shared_cache->free_slot_head;
+                int32 next = *slot_next_ptr(first_slot);
+                *slot_next_ptr(first_slot) = shared_cache->free_slot_head;
                 shared_cache->free_slot_head = first_slot;
                 first_slot = next;
             }
             return -1;
         }
         
-        shared_cache->free_slot_head = content_slots[slot].next_slot;
-        content_slots[slot].next_slot = -1;
+        shared_cache->free_slot_head = *slot_next_ptr(slot);
+        *slot_next_ptr(slot) = -1;
         
         if (first_slot < 0)
             first_slot = slot;
         else
-            content_slots[prev_slot].next_slot = slot;
+            *slot_next_ptr(prev_slot) = slot;
         
         prev_slot = slot;
     }
@@ -239,8 +253,8 @@ free_slots(int32 first_slot)
 {
     while (first_slot >= 0)
     {
-        int32 next = content_slots[first_slot].next_slot;
-        content_slots[first_slot].next_slot = shared_cache->free_slot_head;
+        int32 next = *slot_next_ptr(first_slot);
+        *slot_next_ptr(first_slot) = shared_cache->free_slot_head;
         shared_cache->free_slot_head = first_slot;
         first_slot = next;
     }
@@ -350,7 +364,7 @@ hash_cache_key(const XPatchCacheKey *key)
     h ^= (uint32) key->attnum;
     h *= 16777619u;
     
-    return h % XPATCH_SHMEM_MAX_ENTRIES;
+    return h % xpatch_cache_max_entries;
 }
 
 /*
@@ -363,9 +377,9 @@ find_entry(const XPatchCacheKey *key)
     uint32 hash = hash_cache_key(key);
     int probes = 0;
     
-    while (probes < XPATCH_SHMEM_MAX_ENTRIES)
+    while (probes < xpatch_cache_max_entries)
     {
-        int32 idx = (hash + probes) % XPATCH_SHMEM_MAX_ENTRIES;
+        int32 idx = (hash + probes) % xpatch_cache_max_entries;
         XPatchCacheEntry *entry = &shared_cache->entries[idx];
         
         if (!entry->in_use && !entry->tombstone)
@@ -408,9 +422,9 @@ find_free_entry_for_key(const XPatchCacheKey *key)
     int probes = 0;
     int32 first_tombstone = -1;
     
-    while (probes < XPATCH_SHMEM_MAX_ENTRIES)
+    while (probes < xpatch_cache_max_entries)
     {
-        int32 idx = (hash + probes) % XPATCH_SHMEM_MAX_ENTRIES;
+        int32 idx = (hash + probes) % xpatch_cache_max_entries;
         XPatchCacheEntry *entry = &shared_cache->entries[idx];
         
         /* Empty slot (never used) - can use it */
@@ -441,15 +455,14 @@ copy_to_slots(int32 first_slot, const bytea *content)
     const char *src = (const char *) content;
     Size remaining = content_len;
     int32 slot = first_slot;
-    Size slot_data_size = sizeof(content_slots[0].data);
     
     while (remaining > 0 && slot >= 0)
     {
-        Size to_copy = Min(remaining, slot_data_size);
-        memcpy(content_slots[slot].data, src, to_copy);
+        Size to_copy = Min(remaining, (Size)slot_data_size);
+        memcpy(slot_data_ptr(slot), src, to_copy);
         src += to_copy;
         remaining -= to_copy;
-        slot = content_slots[slot].next_slot;
+        slot = *slot_next_ptr(slot);
     }
 }
 
@@ -463,18 +476,17 @@ copy_from_slots(int32 first_slot, Size content_size)
     char *dst;
     Size remaining = content_size;
     int32 slot = first_slot;
-    Size slot_data_size = sizeof(content_slots[0].data);
     
     result = (bytea *) palloc(content_size);
     dst = (char *) result;
     
     while (remaining > 0 && slot >= 0)
     {
-        Size to_copy = Min(remaining, slot_data_size);
-        memcpy(dst, content_slots[slot].data, to_copy);
+        Size to_copy = Min(remaining, (Size)slot_data_size);
+        memcpy(dst, slot_data_ptr(slot), to_copy);
         dst += to_copy;
         remaining -= to_copy;
-        slot = content_slots[slot].next_slot;
+        slot = *slot_next_ptr(slot);
     }
     
     return result;
@@ -502,6 +514,10 @@ xpatch_shmem_startup(void)
                                     cache_size,
                                     &found);
     
+    /* Compute slot layout statics (same for postmaster and children) */
+    slot_total_size = xpatch_cache_slot_size_kb * 1024;
+    slot_data_size = slot_total_size - (int)sizeof(int32);
+    
     if (!found)
     {
         int i;
@@ -513,14 +529,14 @@ xpatch_shmem_startup(void)
         shared_cache->lru_head = -1;
         shared_cache->lru_tail = -1;
         shared_cache->num_entries = 0;
-        shared_cache->max_entries = XPATCH_SHMEM_MAX_ENTRIES;
+        shared_cache->max_entries = xpatch_cache_max_entries;
         pg_atomic_init_u64(&shared_cache->hit_count, 0);
         pg_atomic_init_u64(&shared_cache->miss_count, 0);
         pg_atomic_init_u64(&shared_cache->eviction_count, 0);
         pg_atomic_init_u64(&shared_cache->skip_count, 0);
         
         /* Initialize entry array */
-        for (i = 0; i < XPATCH_SHMEM_MAX_ENTRIES; i++)
+        for (i = 0; i < xpatch_cache_max_entries; i++)
         {
             shared_cache->entries[i].in_use = false;
             shared_cache->entries[i].tombstone = false;
@@ -531,22 +547,22 @@ xpatch_shmem_startup(void)
         
         /* Calculate content slots location */
         slots_offset = offsetof(XPatchSharedCache, entries);
-        slots_offset += sizeof(XPatchCacheEntry) * XPATCH_SHMEM_MAX_ENTRIES;
+        slots_offset += sizeof(XPatchCacheEntry) * xpatch_cache_max_entries;
         
-        content_slots = (XPatchContentSlot *) ((char *) shared_cache + slots_offset);
+        content_slots_base = (char *) shared_cache + slots_offset;
         
-        num_slots = (cache_size - slots_offset) / sizeof(XPatchContentSlot);
+        num_slots = (cache_size - slots_offset) / slot_total_size;
         init_free_slots(num_slots);
         
         elog(LOG, "pg_xpatch: shared cache initialized (%d entries, %d content slots, %zu MB)",
-             XPATCH_SHMEM_MAX_ENTRIES, num_slots, cache_size / (1024 * 1024));
+             xpatch_cache_max_entries, num_slots, cache_size / (1024 * 1024));
     }
     else
     {
-        /* Attach to existing cache - just set content_slots pointer */
+        /* Attach to existing cache - just set content_slots_base pointer */
         slots_offset = offsetof(XPatchSharedCache, entries);
-        slots_offset += sizeof(XPatchCacheEntry) * XPATCH_SHMEM_MAX_ENTRIES;
-        content_slots = (XPatchContentSlot *) ((char *) shared_cache + slots_offset);
+        slots_offset += sizeof(XPatchCacheEntry) * xpatch_cache_max_entries;
+        content_slots_base = (char *) shared_cache + slots_offset;
     }
     
     LWLockRelease(AddinShmemInitLock);
@@ -684,8 +700,7 @@ xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int64 seq,
     }
     
     /* Calculate slots needed */
-    num_slots_needed = (content_size + sizeof(content_slots[0].data) - 1) / 
-                       sizeof(content_slots[0].data);
+    num_slots_needed = (content_size + slot_data_size - 1) / slot_data_size;
     
     /* Build key with 128-bit BLAKE3 hash of group value */
     memset(&key, 0, sizeof(key));
@@ -775,7 +790,7 @@ xpatch_cache_invalidate_rel(Oid relid)
     
     LWLockAcquire(shared_cache->lock, LW_EXCLUSIVE);
     
-    for (i = 0; i < XPATCH_SHMEM_MAX_ENTRIES; i++)
+    for (i = 0; i < xpatch_cache_max_entries; i++)
     {
         XPatchCacheEntry *entry = &shared_cache->entries[i];
         
@@ -823,7 +838,7 @@ xpatch_cache_get_stats(XPatchCacheStats *stats)
     {
         int i;
         Size total = 0;
-        for (i = 0; i < XPATCH_SHMEM_MAX_ENTRIES; i++)
+        for (i = 0; i < xpatch_cache_max_entries; i++)
         {
             if (shared_cache->entries[i].in_use)
                 total += shared_cache->entries[i].content_size;

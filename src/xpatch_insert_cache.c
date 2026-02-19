@@ -48,8 +48,9 @@
 #include "utils/dsa.h"
 #include "utils/memutils.h"
 
-/* GUC variable */
+/* GUC variables */
 int xpatch_insert_cache_slots = XPATCH_DEFAULT_INSERT_CACHE_SLOTS;
+int xpatch_max_delta_columns = 32;
 
 /*
  * Slot structure in shared memory — fixed size, lightweight.
@@ -443,8 +444,8 @@ xpatch_insert_cache_get_slot(Oid relid, Datum group_value, Oid typid,
 
     if (depth < 1)
         depth = 1;
-    if (num_delta_cols > XPATCH_MAX_DELTA_COLUMNS)
-        num_delta_cols = XPATCH_MAX_DELTA_COLUMNS;
+    if (num_delta_cols > xpatch_max_delta_columns)
+        num_delta_cols = xpatch_max_delta_columns;
 
     ensure_dsa_attached();
 
@@ -872,7 +873,7 @@ xpatch_insert_cache_populate(int slot_idx, Relation rel,
     {
         seq = current_max_seq - i;
 
-        for (j = 0; j < config->num_delta_columns && j < XPATCH_MAX_DELTA_COLUMNS; j++)
+        for (j = 0; j < config->num_delta_columns && j < xpatch_max_delta_columns; j++)
         {
             bytea *content;
 

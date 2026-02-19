@@ -56,6 +56,10 @@ int xpatch_cache_max_entry_kb = XPATCH_DEFAULT_MAX_ENTRY_KB;
 /* GUC variables for seq caches (defined in xpatch_seq_cache.c) */
 extern int xpatch_group_cache_size_mb;
 extern int xpatch_tid_cache_size_mb;
+extern int xpatch_seq_tid_cache_size_mb;
+
+/* GUC variables for insert cache (defined in xpatch_insert_cache.c) */
+extern int xpatch_max_delta_columns;
 
 /* Track if we were loaded via shared_preload_libraries */
 static bool loaded_via_shared_preload = false;
@@ -91,14 +95,27 @@ _PG_init(void)
             "Size of the shared LRU cache in megabytes",
             "Controls shared memory allocated for caching decoded content across all backends",
             &xpatch_cache_size_mb,
-            XPATCH_DEFAULT_CACHE_SIZE_MB,  /* default */
+            XPATCH_DEFAULT_CACHE_SIZE_MB,  /* default 256 */
             1,                              /* min */
-            1024,                           /* max */
+            INT_MAX,                        /* max */
             PGC_POSTMASTER,                 /* context - requires restart */
             GUC_UNIT_MB,
             NULL,                           /* check_hook */
             NULL,                           /* assign_hook */
             NULL                            /* show_hook */
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.cache_max_entries",
+            "Maximum number of entries in the shared LRU cache",
+            "Controls how many decoded content entries the cache can hold simultaneously",
+            &xpatch_cache_max_entries,
+            65536,                           /* default */
+            1000,                            /* min */
+            INT_MAX,                         /* max */
+            PGC_POSTMASTER,
+            0,
+            NULL, NULL, NULL
         );
 
         DefineCustomIntVariable(
@@ -108,9 +125,35 @@ _PG_init(void)
             &xpatch_cache_max_entry_kb,
             XPATCH_DEFAULT_MAX_ENTRY_KB,    /* default 256 KB */
             16,                              /* min 16 KB */
-            4096,                            /* max 4 MB */
+            INT_MAX,                         /* max */
             PGC_SUSET,                       /* superuser can change at runtime */
             GUC_UNIT_KB,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.cache_slot_size_kb",
+            "Size of each content slot in the shared cache",
+            "Controls the granularity of content storage in the shared memory cache",
+            &xpatch_cache_slot_size_kb,
+            4,                               /* default 4 KB */
+            1,                               /* min 1 KB */
+            64,                              /* max 64 KB */
+            PGC_POSTMASTER,
+            GUC_UNIT_KB,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.cache_partitions",
+            "Number of lock partitions for the shared cache",
+            "Controls concurrency by striping the cache into independent partitions with separate locks",
+            &xpatch_cache_partitions,
+            32,                              /* default */
+            1,                               /* min */
+            256,                             /* max */
+            PGC_POSTMASTER,
+            0,
             NULL, NULL, NULL
         );
 
@@ -119,9 +162,9 @@ _PG_init(void)
             "Size of the group max seq cache in megabytes",
             "Controls shared memory for caching max sequence numbers per group (optimizes INSERT)",
             &xpatch_group_cache_size_mb,
-            8,                              /* default 8MB */
-            1,                              /* min */
-            256,                            /* max */
+            16,                              /* default 16MB */
+            1,                               /* min */
+            INT_MAX,                         /* max */
             PGC_POSTMASTER,
             GUC_UNIT_MB,
             NULL, NULL, NULL
@@ -132,9 +175,22 @@ _PG_init(void)
             "Size of the TID seq cache in megabytes",
             "Controls shared memory for caching TID to seq mappings (optimizes READ)",
             &xpatch_tid_cache_size_mb,
-            8,                              /* default 8MB */
-            1,                              /* min */
-            256,                            /* max */
+            16,                              /* default 16MB */
+            1,                               /* min */
+            INT_MAX,                         /* max */
+            PGC_POSTMASTER,
+            GUC_UNIT_MB,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.seq_tid_cache_size_mb",
+            "Size of the seq-to-TID cache in megabytes",
+            "Controls shared memory for caching seq to TID reverse mappings",
+            &xpatch_seq_tid_cache_size_mb,
+            16,                              /* default 16MB */
+            1,                               /* min */
+            INT_MAX,                         /* max */
             PGC_POSTMASTER,
             GUC_UNIT_MB,
             NULL, NULL, NULL
@@ -147,7 +203,20 @@ _PG_init(void)
             &xpatch_insert_cache_slots,
             XPATCH_DEFAULT_INSERT_CACHE_SLOTS,  /* default 16 */
             1,                                   /* min */
-            256,                                 /* max */
+            INT_MAX,                             /* max */
+            PGC_POSTMASTER,
+            0,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.max_delta_columns",
+            "Maximum number of delta-compressed columns per table",
+            "Controls the maximum number of columns that can use delta compression in a single table",
+            &xpatch_max_delta_columns,
+            32,                              /* default */
+            1,                               /* min */
+            INT_MAX,                         /* max */
             PGC_POSTMASTER,
             0,
             NULL, NULL, NULL

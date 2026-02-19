@@ -1,0 +1,11 @@
+-- pg_xpatch upgrade script: 0.5.1 -> 0.6.0
+--
+-- Changes in 0.6.0:
+--   - All hardcoded limits replaced with GUC variables
+--   - New GUCs: cache_max_entries, cache_slot_size_kb, cache_partitions,
+--     seq_tid_cache_size_mb, max_delta_columns
+--   - Existing GUC defaults/maxes raised for large-scale workloads
+--   - Lock striping for content cache (cache_partitions)
+--
+-- No SQL-level changes needed (all GUCs are C-only).
+-- This migration file exists for completeness.

@@ -41,9 +41,9 @@
 #include "utils/hsearch.h"
 
 /* Default cache sizes (configurable via GUC) */
-int xpatch_group_cache_size_mb = 8;  /* 8MB default */
-int xpatch_tid_cache_size_mb = 8;    /* 8MB default */
-int xpatch_seq_tid_cache_size_mb = 8; /* 8MB default - for seq->TID lookups */
+int xpatch_group_cache_size_mb = 16;  /* 16MB default */
+int xpatch_tid_cache_size_mb = 16;    /* 16MB default */
+int xpatch_seq_tid_cache_size_mb = 16; /* 16MB default - for seq->TID lookups */
 
 /*
  * Hash index special values:

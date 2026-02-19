@@ -48,18 +48,23 @@
 #include "utils/snapmgr.h"
 
 /* Extension version */
-#define PG_XPATCH_VERSION "0.5.1"
+#define PG_XPATCH_VERSION "0.6.0"
 
 /* Default configuration values */
 #define XPATCH_DEFAULT_KEYFRAME_EVERY   100
 #define XPATCH_DEFAULT_COMPRESS_DEPTH   1
 #define XPATCH_DEFAULT_ENABLE_ZSTD      true
-#define XPATCH_DEFAULT_CACHE_SIZE_MB    64
+#define XPATCH_DEFAULT_CACHE_SIZE_MB    256
 #define XPATCH_DEFAULT_MAX_ENTRY_KB     256
 
 /* GUC variables (declared in pg_xpatch.c) */
 extern int xpatch_cache_size_mb;
 extern int xpatch_cache_max_entry_kb;
+
+/* GUC variables for content cache (declared in xpatch_cache.c) */
+extern int xpatch_cache_max_entries;
+extern int xpatch_cache_slot_size_kb;
+extern int xpatch_cache_partitions;
 
 /* GUC variables for insert cache (declared in xpatch_insert_cache.c) */
 extern int xpatch_insert_cache_slots;
