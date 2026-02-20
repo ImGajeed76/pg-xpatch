@@ -41,7 +41,7 @@ SELECT * FROM xpatch.stats('documents');
 - **Auto-detection** - Automatically detects group_by, order_by, and delta columns
 - **Parallel scans** - Full support for parallel query execution
 - **Index support** - B-tree indexes work on all columns (including delta-compressed ones)
-- **MVCC** - Basic multi-version concurrency control
+- **MVCC** - Full multi-version concurrency control (READ COMMITTED, REPEATABLE READ, SERIALIZABLE)
 - **DELETE** - Cascade delete removes a version and all subsequent versions in the chain
 - **VACUUM** - Dead tuple cleanup works
 - **WAL logging** - Crash recovery supported
@@ -353,7 +353,7 @@ xpatch automatically creates indexes for efficient lookups:
 
 ## Testing
 
-pg-xpatch has a comprehensive pytest-based test suite with **496 tests** across 18 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
+pg-xpatch has a comprehensive pytest-based test suite with **567 tests** across 28 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
 
 ### Requirements
 
@@ -403,6 +403,16 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 | `test_cache_max_entry.py` | 25 | Cache max entry GUC, skip_count stats, oversized entry rejection, mixed sizes, large delta chains |
 | `test_guc_settings.py` | 27 | All 11 GUC defaults/metadata, PGC context enforcement, lock striping correctness (multi-group, stats aggregation, cross-stripe invalidation) |
 | `test_vacuum.py` | 25 | VACUUM, VACUUM FULL (error), ANALYZE, TRUNCATE + rollback, crash recovery after VACUUM |
+| `test_deep_audit_bugs.py` | 10 | REPEATABLE READ visibility, DELETE with TEXT group keys, same-transaction delete+insert seq integrity |
+| `test_stats_batching.py` | 5 | Stats accumulator batching: single/multi-group, COPY, rollback cleanup |
+| `test_seq_scan_visibility.py` | 4 | Strategy 3 seq scan MVCC defense-in-depth |
+| `test_advisory_lock_collision.py` | 4 | BLAKE3 advisory lock hash collision regression |
+| `test_datum_roundtrip.py` | 10 | Warm/cold path datum byte-flow consistency (TEXT, BYTEA, JSONB) |
+| `test_ffi_tag_encoding.py` | 10 | Rust FFI tag encoding/decoding round-trip |
+| `test_fifo_empty_content.py` | 11 | FIFO insert cache empty content handling regression |
+| `test_encode_pool.py` | 10 | Encode thread pool correctness under load |
+| `test_deadlock_delete.py` | 7 | Concurrent delete deadlock/contention regression |
+| `test_crash_recovery.py` | 7 | SIGKILL crash recovery, WAL replay integrity |
 
 ### Key Test Scenarios
 
@@ -429,15 +439,13 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 
 ### Technical Debt (Known Implementation Issues)
 
-These issues exist in the current implementation and may be addressed in future versions:
-
-- **MVCC for reconstructed tuples**: The `xpatch_tuple_satisfies_snapshot()` function uses proper MVCC checks for buffer-backed tuples, but trusts that virtual tuples (created during delta reconstruction) were built from visible source tuples. This is correct behavior but means visibility is checked at reconstruction time, not query time.
+- **Non-atomic DELETE WAL**: Cascading deletes use per-tuple critical sections with separate WAL records. A crash mid-chain could leave a broken delta chain. The correct fix (single critical section + single multi-delete WAL record per page) is complex and deferred to a future release. The window for this is extremely narrow in practice.
 
 These issues are documented for transparency. For typical workloads (versioned document storage, audit logs), they don't cause problems.
 
 ### PostgreSQL Version
 
-Thoroughly tested on PostgreSQL 16 with 496 test cases. Other versions may work but are not officially supported.
+Thoroughly tested on PostgreSQL 16 with 567 test cases. Other versions may work but are not officially supported.
 
 ## License
 

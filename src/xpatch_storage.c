@@ -316,11 +316,18 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
                     !TransactionIdDidCommit(xmin))
                     continue;
                 
-                /* Skip if tuple is deleted by a committed transaction */
+                /*
+                 * Skip if tuple is deleted by a committed transaction
+                 * or by the current transaction.  Without the current-txn
+                 * check, a delete-then-insert within the same transaction
+                 * would count the deleted tuple's seq, producing a stale
+                 * max_seq and creating sequence gaps or duplicates.
+                 */
                 if (!(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
                 {
                     TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
-                    if (TransactionIdDidCommit(xmax))
+                    if (TransactionIdDidCommit(xmax) ||
+                        TransactionIdIsCurrentTransactionId(xmax))
                         continue;
                 }
             }
@@ -873,6 +880,26 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
                 tuple.t_len = ItemIdGetLength(itemId);
                 tuple.t_tableOid = RelationGetRelid(rel);
                 ItemPointerSet(&tuple.t_self, blkno, offnum);
+                
+                /*
+                 * MVCC visibility check: skip tuples not visible to us.
+                 * Without this, we could return a dead/aborted tuple that
+                 * happens to share the same seq number slot.
+                 */
+                {
+                    TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple.t_data);
+                    
+                    if (!TransactionIdIsCurrentTransactionId(xmin) &&
+                        !TransactionIdDidCommit(xmin))
+                        continue;
+                    
+                    if (!(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
+                    {
+                        TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+                        if (TransactionIdDidCommit(xmax))
+                            continue;
+                    }
+                }
                 
                 /* Check group if specified */
                 if (config->group_by_attnum != InvalidAttrNumber)

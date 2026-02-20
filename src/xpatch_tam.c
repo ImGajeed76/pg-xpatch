@@ -96,77 +96,57 @@ compute_infobits(uint16 infomask, uint16 infomask2)
 
 /*
  * MVCC visibility check for xpatch tuples.
- * 
- * Implements Read Committed isolation level - a tuple is visible if:
- * 1. XMIN is committed (or current transaction) AND
- * 2. XMAX is invalid/aborted (tuple not deleted) OR
- *    XMAX is set but not yet committed (delete in progress by another txn)
+ *
+ * Delegates to HeapTupleSatisfiesVisibility() which properly handles all
+ * isolation levels (READ COMMITTED, REPEATABLE READ, SERIALIZABLE) by
+ * checking the tuple against the provided snapshot.
+ *
+ * The previous hand-rolled implementation only supported Read Committed
+ * semantics — it used raw TransactionIdDidCommit() instead of checking
+ * against the snapshot's xmin/xmax, which meant REPEATABLE READ and
+ * SERIALIZABLE were completely broken (they could see rows committed
+ * after the snapshot was taken).
+ *
+ * Special handling for xpatch cascading deletes:
+ * When a DELETE targets one tuple, xpatch's tuple_delete cascades to
+ * delete all subsequent tuples in the delta chain (same group, higher
+ * _xp_seq).  These cascaded deletes happen within the same command
+ * (same CommandId).  HeapTupleSatisfiesMVCC considers a tuple deleted
+ * with cmax == curcid as still visible (per PG convention: "delete not
+ * yet visible to this command").  If we returned true, the executor
+ * would try to delete the tuple again, get TM_SelfModified, and raise
+ * TriggeredDataChangeViolation.  So we must explicitly skip tuples
+ * already deleted by the current transaction before consulting the
+ * snapshot.
+ *
+ * The buffer must be share-locked or exclusive-locked by the caller,
+ * as HeapTupleSatisfiesVisibility may set hint bits on the page.
  *
  * Returns true if tuple is visible to the given snapshot.
  */
 static bool
-xpatch_tuple_is_visible(HeapTupleData *tuple, Snapshot snapshot)
+xpatch_tuple_is_visible(HeapTupleData *tuple, Snapshot snapshot, Buffer buffer)
 {
-    TransactionId xmin, xmax;
-    
     if (snapshot == NULL)
         return true;  /* No snapshot means return all tuples */
-    
-    xmin = HeapTupleHeaderGetRawXmin(tuple->t_data);
-    
-    /* Check XMIN - the inserting transaction */
-    if (TransactionIdIsCurrentTransactionId(xmin))
+
+    /*
+     * Fast-path: skip tuples already deleted by the current transaction.
+     * This handles xpatch's cascading DELETE, where tuple_delete marks
+     * multiple tuples as deleted within a single executor command.
+     * Without this check, HeapTupleSatisfiesMVCC would report them as
+     * visible (cmax == curcid), causing the executor to attempt a
+     * redundant delete and raise TriggeredDataChangeViolation.
+     */
+    if (!(tuple->t_data->t_infomask & HEAP_XMAX_INVALID) &&
+        !(tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI))
     {
-        /* Inserted by current transaction */
-        if (tuple->t_data->t_infomask & HEAP_XMAX_INVALID)
-            return true;  /* Not deleted */
-        
-        /* Check if deleted by current transaction */
-        xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
+        TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
         if (TransactionIdIsCurrentTransactionId(xmax))
-            return false;  /* Deleted by us */
-        
-        return true;  /* Delete by other txn not committed yet */
+            return false;
     }
-    
-    if (!TransactionIdDidCommit(xmin))
-    {
-        /* Inserter didn't commit (aborted or in-progress) */
-        if (TransactionIdDidAbort(xmin))
-            return false;  /* Definitely not visible */
-        
-        /* In-progress - not visible in Read Committed */
-        return false;
-    }
-    
-    /* XMIN committed - check XMAX for deletions */
-    if (tuple->t_data->t_infomask & HEAP_XMAX_INVALID)
-        return true;  /* Not deleted */
-    
-    if (tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI)
-    {
-        /* MultiXact - treat as visible for simplicity (no UPDATE support) */
-        return true;
-    }
-    
-    xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
-    
-    if (TransactionIdIsCurrentTransactionId(xmax))
-        return false;  /* Deleted by current transaction */
-    
-    if (!TransactionIdDidCommit(xmax))
-    {
-        /* Deleter didn't commit yet - tuple still visible */
-        if (TransactionIdDidAbort(xmax))
-        {
-            /* Deleter aborted - tuple is visible, fix hint bits */
-            tuple->t_data->t_infomask |= HEAP_XMAX_INVALID;
-        }
-        return true;
-    }
-    
-    /* Deleter committed - tuple is deleted and not visible */
-    return false;
+
+    return HeapTupleSatisfiesVisibility(tuple, snapshot, buffer);
 }
 
 /* Scan descriptor for xpatch tables */
@@ -679,7 +659,7 @@ xpatch_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
             ItemPointerSet(&tuple.t_self, scan->current_block, scan->current_offset - 1);
 
             /* MVCC visibility check - skip invisible tuples */
-            if (!xpatch_tuple_is_visible(&tuple, scan->base.rs_snapshot))
+            if (!xpatch_tuple_is_visible(&tuple, scan->base.rs_snapshot, scan->current_buffer))
                 continue;
 
             /* Increment sequence counter */
@@ -1336,6 +1316,21 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
                                    tupdesc, &group_isnull);
         if (group_isnull)
             group_value = (Datum) 0;
+        else
+        {
+            /*
+             * Copy the datum before releasing the buffer.  For pass-by-ref
+             * types (TEXT, VARCHAR, BYTEA) heap_getattr returns a pointer
+             * into the buffer page.  Without this copy, group_value would
+             * be a dangling pointer after ReleaseBuffer, leading to
+             * use-after-free when computing the group hash, comparing
+             * groups during the cascading delete scan, or updating the
+             * seq cache.
+             */
+            group_value = datumCopy(group_value,
+                                    group_attr->attbyval,
+                                    group_attr->attlen);
+        }
     }
     
     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -2796,7 +2791,7 @@ xpatch_scan_bitmap_next_tuple(TableScanDesc scan,
         ItemPointerSet(&tuple.t_self, xscan->bm_block, off);
 
         /* MVCC visibility check — skip invisible tuples */
-        if (!xpatch_tuple_is_visible(&tuple, scan->rs_snapshot))
+        if (!xpatch_tuple_is_visible(&tuple, scan->rs_snapshot, buffer))
             continue;
 
         break;  /* Found a visible tuple */

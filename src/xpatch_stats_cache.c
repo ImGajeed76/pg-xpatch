@@ -18,10 +18,12 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "catalog/namespace.h"
 #include "executor/spi.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -30,20 +32,39 @@
 /* Size of XPatchGroupHash when serialized to bytea (h1 + h2 = 16 bytes) */
 #define XPATCH_GROUP_HASH_SIZE (sizeof(uint64) * 2)
 
-/* SQL statements */
-static const char *UPSERT_GROUP_STATS_SQL =
-    "INSERT INTO xpatch.group_stats ("
-    "  relid, group_hash, row_count, keyframe_count, max_seq, "
-    "  raw_size_bytes, compressed_size_bytes, sum_avg_delta_tags"
-    ") VALUES ($1, $2, 1, $3, $4, $5, $6, $7) "
-    "ON CONFLICT (relid, group_hash) DO UPDATE SET "
-    "  row_count = xpatch.group_stats.row_count + 1, "
-    "  keyframe_count = xpatch.group_stats.keyframe_count + EXCLUDED.keyframe_count, "
-    "  max_seq = GREATEST(xpatch.group_stats.max_seq, EXCLUDED.max_seq), "
-    "  raw_size_bytes = xpatch.group_stats.raw_size_bytes + EXCLUDED.raw_size_bytes, "
-    "  compressed_size_bytes = xpatch.group_stats.compressed_size_bytes + EXCLUDED.compressed_size_bytes, "
-    "  sum_avg_delta_tags = xpatch.group_stats.sum_avg_delta_tags + EXCLUDED.sum_avg_delta_tags";
+/* ============================================================================
+ * Pending stats accumulator
+ *
+ * Instead of doing SPI_connect + UPSERT + SPI_finish per row, we accumulate
+ * stats in a per-backend hash table and flush once at transaction commit.
+ * This reduces O(rows) SPI calls to O(groups) for COPY and multi-row
+ * transactions.
+ * ============================================================================ */
 
+/* Hash key: (relid, group_hash) */
+typedef struct
+{
+    Oid             relid;
+    XPatchGroupHash group_hash;
+} PendingStatsKey;
+
+/* Hash entry: accumulated counters for one group */
+typedef struct
+{
+    PendingStatsKey key;
+    int64           row_count;
+    int64           keyframe_count;
+    int64           max_seq;
+    int64           raw_size;
+    int64           compressed_size;
+    double          sum_avg_delta_tags;
+} PendingStatsEntry;
+
+/* Per-backend state */
+static HTAB *pending_stats = NULL;
+static bool  xact_callback_registered = false;
+
+/* SQL statements */
 static const char *DELETE_GROUP_STATS_SQL =
     "DELETE FROM xpatch.group_stats WHERE relid = $1 AND group_hash = $2";
 
@@ -80,8 +101,126 @@ group_hash_to_bytea(XPatchGroupHash group_hash)
 }
 
 /*
+ * Flush all pending stats to xpatch.group_stats via a single SPI session.
+ * Called at transaction commit (or explicitly).
+ */
+static void
+xpatch_stats_cache_flush_pending(void)
+{
+    HASH_SEQ_STATUS status;
+    PendingStatsEntry *entry;
+    int ret;
+
+    if (pending_stats == NULL)
+        return;
+
+    ret = SPI_connect();
+    if (ret != SPI_OK_CONNECT)
+    {
+        elog(WARNING, "xpatch_stats_cache: flush SPI_connect failed: %d", ret);
+        goto cleanup;
+    }
+
+    /*
+     * PRE_COMMIT fires after the snapshot is released, so SPI cannot execute
+     * SQL without one.  Push a transaction snapshot for the duration of the
+     * flush.
+     */
+    PushActiveSnapshot(GetTransactionSnapshot());
+
+    hash_seq_init(&status, pending_stats);
+    while ((entry = (PendingStatsEntry *) hash_seq_search(&status)) != NULL)
+    {
+        Oid argtypes[8] = {OIDOID, BYTEAOID, INT8OID, INT8OID,
+                            INT8OID, INT8OID, INT8OID, FLOAT8OID};
+        Datum values[8];
+        bytea *hash_bytea;
+
+        hash_bytea = group_hash_to_bytea(entry->key.group_hash);
+
+        values[0] = ObjectIdGetDatum(entry->key.relid);
+        values[1] = PointerGetDatum(hash_bytea);
+        values[2] = Int64GetDatum(entry->row_count);
+        values[3] = Int64GetDatum(entry->keyframe_count);
+        values[4] = Int64GetDatum(entry->max_seq);
+        values[5] = Int64GetDatum(entry->raw_size);
+        values[6] = Int64GetDatum(entry->compressed_size);
+        values[7] = Float8GetDatum(entry->sum_avg_delta_tags);
+
+        ret = SPI_execute_with_args(
+            "INSERT INTO xpatch.group_stats ("
+            "  relid, group_hash, row_count, keyframe_count, max_seq, "
+            "  raw_size_bytes, compressed_size_bytes, sum_avg_delta_tags"
+            ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+            "ON CONFLICT (relid, group_hash) DO UPDATE SET "
+            "  row_count = xpatch.group_stats.row_count + EXCLUDED.row_count, "
+            "  keyframe_count = xpatch.group_stats.keyframe_count + EXCLUDED.keyframe_count, "
+            "  max_seq = GREATEST(xpatch.group_stats.max_seq, EXCLUDED.max_seq), "
+            "  raw_size_bytes = xpatch.group_stats.raw_size_bytes + EXCLUDED.raw_size_bytes, "
+            "  compressed_size_bytes = xpatch.group_stats.compressed_size_bytes + EXCLUDED.compressed_size_bytes, "
+            "  sum_avg_delta_tags = xpatch.group_stats.sum_avg_delta_tags + EXCLUDED.sum_avg_delta_tags",
+            8, argtypes, values, NULL, false, 0);
+
+        if (ret != SPI_OK_INSERT)
+            elog(WARNING, "xpatch_stats_cache: batch upsert failed: %d", ret);
+    }
+
+    PopActiveSnapshot();
+    SPI_finish();
+
+cleanup:
+    hash_destroy(pending_stats);
+    pending_stats = NULL;
+}
+
+/*
+ * Transaction callback: flush pending stats on commit, discard on abort.
+ */
+static void
+xpatch_stats_xact_callback(XactEvent event, void *arg)
+{
+    switch (event)
+    {
+        case XACT_EVENT_PRE_COMMIT:
+            xpatch_stats_cache_flush_pending();
+            break;
+
+        case XACT_EVENT_ABORT:
+            /* Discard accumulated stats — the rows were rolled back */
+            if (pending_stats != NULL)
+            {
+                hash_destroy(pending_stats);
+                pending_stats = NULL;
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+/*
+ * Ensure the xact callback is registered (idempotent).
+ */
+static void
+ensure_xact_callback(void)
+{
+    if (!xact_callback_registered)
+    {
+        RegisterXactCallback(xpatch_stats_xact_callback, NULL);
+        xact_callback_registered = true;
+    }
+}
+
+/*
  * Update group stats after INSERT.
- * Simple UPSERT - increment counts.
+ *
+ * Accumulates stats in a per-backend hash table (no SPI).
+ * The accumulated stats are flushed to xpatch.group_stats in a single
+ * SPI session at transaction commit via RegisterXactCallback.
+ *
+ * This reduces O(rows) SPI round-trips to O(groups) for COPY and
+ * multi-row transactions.
  */
 void
 xpatch_stats_cache_update_group(
@@ -93,42 +232,53 @@ xpatch_stats_cache_update_group(
     int64 compressed_size,
     double avg_delta_tag)
 {
-    int ret;
-    Oid argtypes[7];
-    Datum values[7];
-    bytea *hash_bytea;
+    PendingStatsKey key;
+    PendingStatsEntry *entry;
+    bool found;
 
-    if ((ret = SPI_connect()) != SPI_OK_CONNECT)
+    ensure_xact_callback();
+
+    /* Create hash table on first use in this transaction */
+    if (pending_stats == NULL)
     {
-        elog(WARNING, "xpatch_stats_cache: SPI_connect failed: %d", ret);
-        return;
+        HASHCTL hash_ctl;
+
+        memset(&hash_ctl, 0, sizeof(hash_ctl));
+        hash_ctl.keysize = sizeof(PendingStatsKey);
+        hash_ctl.entrysize = sizeof(PendingStatsEntry);
+        hash_ctl.hcxt = TopTransactionContext;
+        pending_stats = hash_create("pending_stats", 64, &hash_ctl,
+                                     HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
     }
 
-    hash_bytea = group_hash_to_bytea(group_hash);
+    /* Build key */
+    memset(&key, 0, sizeof(key));
+    key.relid = relid;
+    key.group_hash = group_hash;
 
-    argtypes[0] = OIDOID;
-    argtypes[1] = BYTEAOID;
-    argtypes[2] = INT4OID;
-    argtypes[3] = INT8OID;
-    argtypes[4] = INT8OID;
-    argtypes[5] = INT8OID;
-    argtypes[6] = FLOAT8OID;
-
-    values[0] = ObjectIdGetDatum(relid);
-    values[1] = PointerGetDatum(hash_bytea);
-    values[2] = Int32GetDatum(is_keyframe ? 1 : 0);
-    values[3] = Int64GetDatum(max_seq);
-    values[4] = Int64GetDatum(raw_size);
-    values[5] = Int64GetDatum(compressed_size);
-    values[6] = Float8GetDatum(avg_delta_tag);
-
-    ret = SPI_execute_with_args(UPSERT_GROUP_STATS_SQL, 7, argtypes, values, NULL, false, 0);
-    if (ret != SPI_OK_INSERT)
+    /* Find or create entry */
+    entry = (PendingStatsEntry *) hash_search(pending_stats, &key,
+                                               HASH_ENTER, &found);
+    if (!found)
     {
-        elog(WARNING, "xpatch_stats_cache: upsert failed: %d", ret);
+        /* New group in this transaction */
+        entry->row_count = 0;
+        entry->keyframe_count = 0;
+        entry->max_seq = 0;
+        entry->raw_size = 0;
+        entry->compressed_size = 0;
+        entry->sum_avg_delta_tags = 0.0;
     }
 
-    SPI_finish();
+    /* Accumulate */
+    entry->row_count++;
+    if (is_keyframe)
+        entry->keyframe_count++;
+    if (max_seq > entry->max_seq)
+        entry->max_seq = max_seq;
+    entry->raw_size += raw_size;
+    entry->compressed_size += compressed_size;
+    entry->sum_avg_delta_tags += avg_delta_tag;
 }
 
 /*
@@ -561,8 +711,12 @@ xpatch_stats_cache_refresh_groups(Oid relid, XPatchGroupHash *group_hashes, int 
 
             /* Re-lock buffer to continue scanning */
             LockBuffer(buffer, BUFFER_LOCK_SHARE);
-            /* Re-get page pointer after re-locking */
+            /* Re-get page pointer and maxoff after re-locking.
+             * The buffer pin prevents VACUUM from reclaiming tuples,
+             * but re-reading maxoff is defensive against any page
+             * reorganization that could occur while unlocked. */
             page = BufferGetPage(buffer);
+            maxoff = PageGetMaxOffsetNumber(page);
 
             entry->row_count++;
             if (is_keyframe)

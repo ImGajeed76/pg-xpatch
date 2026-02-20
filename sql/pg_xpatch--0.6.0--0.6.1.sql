@@ -1,0 +1,15 @@
+-- pg_xpatch upgrade script: 0.6.0 -> 0.6.1
+--
+-- Changes in 0.6.1:
+--   - Fixed: REPEATABLE READ / SERIALIZABLE isolation broken (hand-rolled
+--     visibility check replaced with HeapTupleSatisfiesVisibility)
+--   - Fixed: use-after-free in DELETE with TEXT/VARCHAR/BYTEA group keys
+--   - Fixed: hint bit write under shared buffer lock (eliminated by the
+--     visibility function replacement)
+--   - Fixed: xpatch_get_max_seq counted same-transaction deleted tuples
+--   - Fixed: stale maxoff after buffer unlock/relock in stats refresh
+--   - Performance: stats batching (O(groups) SPI instead of O(rows))
+--   - Defense-in-depth: MVCC visibility check in Strategy 3 seq scan
+--
+-- No SQL-level changes needed (all changes are C-only).
+-- This migration file exists for completeness.

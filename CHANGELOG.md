@@ -2,6 +2,26 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
+## [0.6.1] - 2026-02-20
+
+### Fixed
+
+- **Critical: REPEATABLE READ and SERIALIZABLE isolation broken** - The hand-rolled `xpatch_tuple_is_visible()` function ignored the snapshot entirely, using raw `TransactionIdDidCommit()` instead of checking against the snapshot's xmin/xmax boundaries. This meant REPEATABLE READ transactions could see rows committed after the snapshot was taken, and SERIALIZABLE isolation was completely ineffective. Replaced with PostgreSQL's `HeapTupleSatisfiesVisibility()` which properly handles all isolation levels. Added a pre-check for same-transaction deletes to avoid `TriggeredDataChangeViolation` during xpatch's cascading DELETE.
+
+- **Critical: Use-after-free in DELETE with TEXT/VARCHAR/BYTEA group keys** - In the DELETE path, `heap_getattr()` returns a pointer into the buffer page for pass-by-reference types (TEXT, VARCHAR, BYTEA). The buffer was released before the group value was used for hash computation, group comparison during cascading delete, and seq cache updates. This was a dangling pointer for any non-integer group key type. Fixed by calling `datumCopy()` before releasing the buffer.
+
+- **Critical: Hint bit write under shared buffer lock** - The old `xpatch_tuple_is_visible()` wrote `t_infomask |= HEAP_XMAX_INVALID` (a hint bit) while holding only `BUFFER_LOCK_SHARE`, which is a non-atomic write on a shared page. This could corrupt hint bits under concurrent access. Eliminated by replacing the entire function with `HeapTupleSatisfiesVisibility()`, which handles hint bits correctly via `SetHintBits()`.
+
+- **`xpatch_get_max_seq` counted same-transaction deleted tuples** - On cache miss, the max sequence scan checked `TransactionIdDidCommit(xmax)` to skip deleted tuples, but this returns false for the current transaction's own deletes. A delete-then-insert within the same transaction would see the deleted tuple's sequence number as still valid, producing stale max_seq values and potential sequence gaps or duplicates. Fixed by adding `TransactionIdIsCurrentTransactionId(xmax)` check.
+
+- **Stale page metadata after buffer unlock/relock in stats refresh** - `xpatch_stats_cache_refresh_groups()` unlocked the buffer for delta reconstruction, then re-locked and continued iteration with a stale `maxoff` variable. Although the buffer pin prevents VACUUM from reclaiming tuples, `maxoff` is now re-read after re-locking as a defensive measure.
+
+### Technical
+
+- **567 tests** across 28 test files, all passing. 10 new test files added for regression coverage of all investigated bugs.
+- Stats batching: replaced per-row SPI with in-memory `HTAB` accumulator flushed at `XACT_EVENT_PRE_COMMIT`. O(groups) SPI calls instead of O(rows).
+- MVCC defense-in-depth: added visibility check to Strategy 3 sequential scan fallback in `xpatch_fetch_by_seq`.
+
 ## [0.6.0] - 2026-02-19
 
 ### Added
