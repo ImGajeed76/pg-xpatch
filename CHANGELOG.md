@@ -2,6 +2,20 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
+## [0.6.3] - 2026-02-23
+
+### Fixed
+
+- **Critical: Second race in encode pool — straggler escaping workers_in_flight** - The `workers_in_flight` increment in 0.6.2 was placed after `pthread_mutex_unlock`, leaving a window where a worker was awake and about to enter the task loop but not yet counted as in-flight. The main thread could see `workers_in_flight == 0` during this window and reset counters while the worker was about to grab tasks. Fixed by moving the `workers_in_flight` increment inside the mutex (before unlock), so a worker is atomically counted as in-flight the moment it is released from the condvar wait.
+
+- **Counter reset order reversed** - The `next_task` counter was being reset to 0 before `completed`, leaving a window where a straggler could see `next_task == 0` and grab a task from the new batch while `completed` still held the old value. Reversed to reset `completed` first, then `next_task` last, so task dispatch cannot begin until all counters are clean.
+
+- **Shutdown check moved inside mutex** - The shutdown flag check was after `pthread_mutex_unlock`, so a worker could miss a shutdown signal that arrived between the unlock and the check. Moved inside the mutex critical section.
+
+### Added
+
+- **Diagnostic tracking for encode pool** - Added `task_completed[]` per-task completion tracking and `entry_count` to aid debugging encode pool issues under production load (e.g., Linux kernel import with 7M+ pool dispatches).
+
 ## [0.6.2] - 2026-02-22
 
 ### Fixed

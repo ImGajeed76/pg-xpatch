@@ -1,11 +1,9 @@
 """
 Regression test for the encode pool race condition (permanent hang).
 
-Fixed in 0.6.2 by adding atomic_int workers_in_flight to the EncodePool struct.
-Workers increment it when entering the task loop and decrement when exiting.
-The main thread drains all stragglers (workers_in_flight == 0) before resetting
-next_task/completed for the next batch.  Also added CHECK_FOR_INTERRUPTS() to
-the completion spin-wait for cancellability.
+Fixed in 0.6.2 (workers_in_flight drain counter, CHECK_FOR_INTERRUPTS) and
+hardened in 0.6.3 (workers_in_flight increment moved inside mutex, counter
+reset order reversed, shutdown check moved inside mutex, diagnostic tracking).
 
 Original bug (pre-0.6.2):
   In xpatch_encode_pool.c, function xpatch_encode_pool_execute(), there was a
@@ -129,10 +127,8 @@ class TestEncodePoolRaceCondition:
     """
     Regression tests for the next_task/completed reset race condition.
 
-    Fixed in 0.6.2 by adding an ``atomic_int workers_in_flight`` counter:
-    workers increment it when entering the task loop and decrement when
-    exiting.  The main thread drains all stragglers before resetting
-    next_task/completed for the next batch.
+    Fixed in 0.6.2 (workers_in_flight drain counter) and hardened in 0.6.3
+    (increment inside mutex, reversed reset order, diagnostic tracking).
 
     These tests verify the fix holds under aggressive conditions:
     ~250,000 pool dispatches with large→small column transitions, high

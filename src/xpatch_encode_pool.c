@@ -121,6 +121,10 @@ typedef struct EncodePool
 
     /* Batch sequence number — workers compare to detect new batch */
     atomic_int      batch_seq;
+
+    /* Diagnostic: track which task indices completed */
+    atomic_int      task_completed[512];
+    atomic_int      entry_count;
 } EncodePool;
 
 static EncodePool pool = {
@@ -157,19 +161,19 @@ worker_func(void *arg)
                 break;
             pthread_cond_wait(&pool.batch_ready, &pool.batch_mutex);
         }
-        pthread_mutex_unlock(&pool.batch_mutex);
 
         if (atomic_load(&pool.shutdown))
+        {
+            pthread_mutex_unlock(&pool.batch_mutex);
             break;
+        }
+
+        atomic_fetch_add(&pool.workers_in_flight, 1);
+        pthread_mutex_unlock(&pool.batch_mutex);
 
         my_batch_seq = atomic_load(&pool.batch_seq);
 
-        /*
-         * Signal that we are entering the task loop.  The main thread
-         * waits for workers_in_flight == 0 before resetting next_task
-         * and completed for the next batch.
-         */
-        atomic_fetch_add(&pool.workers_in_flight, 1);
+        atomic_fetch_add(&pool.entry_count, 1);
 
         /* Spin-grab tasks via atomic fetch-add — no mutex in hot path */
         while (1)
@@ -205,6 +209,7 @@ worker_func(void *arg)
             }
 
             atomic_fetch_add(&pool.completed, 1);
+            atomic_store(&pool.task_completed[task_idx], 1);
         }
 
         /* Signal that we have left the task loop */
@@ -413,14 +418,19 @@ xpatch_encode_pool_execute(EncodeBatch *batch)
     /* Set up batch for workers — safe now, no stragglers in task loop */
     pool.tasks = tasks;
     pool.num_tasks = batch->num_tasks;
-    atomic_store(&pool.next_task, 0);
     atomic_store(&pool.completed, 0);
+    atomic_store(&pool.entry_count, 0);
+    for (i = 0; i < batch->num_tasks; i++)
+        atomic_store(&pool.task_completed[i], 0);
+    atomic_store(&pool.next_task, 0);
 
     /* Wake workers — one broadcast per batch */
     pthread_mutex_lock(&pool.batch_mutex);
     atomic_fetch_add(&pool.batch_seq, 1);
     pthread_cond_broadcast(&pool.batch_ready);
     pthread_mutex_unlock(&pool.batch_mutex);
+
+    atomic_fetch_add(&pool.entry_count, 1);
 
     /* Leader participates: grab tasks via same atomic counter */
     while (1)
@@ -455,6 +465,7 @@ xpatch_encode_pool_execute(EncodeBatch *batch)
         }
 
         atomic_fetch_add(&pool.completed, 1);
+        atomic_store(&pool.task_completed[task_idx], 1);
     }
 
     /* Spin-wait for all tasks to complete */

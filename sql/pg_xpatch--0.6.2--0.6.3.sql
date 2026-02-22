@@ -1,0 +1,16 @@
+-- pg_xpatch upgrade script: 0.6.2 -> 0.6.3
+--
+-- Changes in 0.6.3:
+--   - Fixed: second race in encode pool — workers_in_flight increment moved
+--     inside batch_mutex so a worker is counted as in-flight before releasing
+--     the lock, preventing the main thread from seeing workers_in_flight == 0
+--     while a worker is between mutex unlock and the old increment location.
+--   - Fixed: reversed counter reset order (completed before next_task) as an
+--     additional defense against stragglers seeing a reset next_task.
+--   - Fixed: shutdown check moved inside mutex to prevent a worker from missing
+--     the shutdown signal after condvar wakeup.
+--   - Added diagnostic task_completed[] and entry_count tracking for debugging
+--     encode pool issues under production load.
+--
+-- No SQL-level changes needed (all changes are C-only).
+-- This migration file exists for completeness.
