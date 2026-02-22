@@ -48,7 +48,7 @@
 #include "utils/snapmgr.h"
 
 /* Extension version */
-#define PG_XPATCH_VERSION "0.6.1"
+#define PG_XPATCH_VERSION "0.6.2"
 
 /* Default configuration values */
 #define XPATCH_DEFAULT_KEYFRAME_EVERY   100

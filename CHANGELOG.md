@@ -2,6 +2,14 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
+## [0.6.2] - 2026-02-22
+
+### Fixed
+
+- **Critical: Race condition in encode pool causing permanent backend hang** - In `xpatch_encode_pool_execute()`, there was a race window between resetting `next_task` (line 359) and `completed` (line 360). A straggler worker from the previous batch could grab a task from the new batch (after `next_task` was reset to 0) and increment `completed`, only to have that increment wiped when `completed` was reset to 0 on the next line. This caused the main thread's spin-wait (`while (completed < num_tasks)`) to hang permanently. The hang was non-deterministic, triggered by high `encode_threads` (32), multiple small delta columns, and rapid COPY dispatches. Fixed by adding an `atomic_int workers_in_flight` counter: workers increment it when entering the task loop and decrement when exiting. The main thread now drains all stragglers (`while (workers_in_flight > 0)`) before resetting counters for the next batch.
+
+- **Backend unkillable during encode pool hang** - The spin-wait loop in `xpatch_encode_pool_execute()` had no `CHECK_FOR_INTERRUPTS()` call, so a hung backend could not be cancelled via `pg_cancel_backend()` or `pg_terminate_backend()`. Added `CHECK_FOR_INTERRUPTS()` to the spin-wait loop.
+
 ## [0.6.1] - 2026-02-20
 
 ### Fixed

@@ -1,0 +1,12 @@
+-- pg_xpatch upgrade script: 0.6.1 -> 0.6.2
+--
+-- Changes in 0.6.2:
+--   - Fixed: race condition in encode pool causing permanent backend hang
+--     during bulk COPY with encode_threads > 1. A straggler worker from the
+--     previous batch could slip between the next_task and completed counter
+--     resets, causing the main thread to spin-wait forever.
+--   - Added CHECK_FOR_INTERRUPTS to encode pool spin-wait so hung backends
+--     can be cancelled via pg_cancel_backend() / pg_terminate_backend().
+--
+-- No SQL-level changes needed (all changes are C-only).
+-- This migration file exists for completeness.

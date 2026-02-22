@@ -107,6 +107,15 @@ typedef struct EncodePool
     atomic_int      next_task;      /* Workers atomically increment to grab tasks */
     atomic_int      completed;      /* Workers atomically increment on completion */
 
+    /*
+     * Straggler drain counter.  Workers increment this when entering the
+     * inner task loop and decrement when exiting.  The main thread waits
+     * for workers_in_flight == 0 before resetting next_task/completed for
+     * the next batch, closing the race window where a straggler from the
+     * previous batch could grab a task and have its completion wiped.
+     */
+    atomic_int      workers_in_flight;
+
     /* Shutdown flag */
     atomic_bool     shutdown;
 
@@ -155,6 +164,13 @@ worker_func(void *arg)
 
         my_batch_seq = atomic_load(&pool.batch_seq);
 
+        /*
+         * Signal that we are entering the task loop.  The main thread
+         * waits for workers_in_flight == 0 before resetting next_task
+         * and completed for the next batch.
+         */
+        atomic_fetch_add(&pool.workers_in_flight, 1);
+
         /* Spin-grab tasks via atomic fetch-add — no mutex in hot path */
         while (1)
         {
@@ -190,6 +206,9 @@ worker_func(void *arg)
 
             atomic_fetch_add(&pool.completed, 1);
         }
+
+        /* Signal that we have left the task loop */
+        atomic_fetch_sub(&pool.workers_in_flight, 1);
     }
 
     return NULL;
@@ -229,6 +248,7 @@ xpatch_encode_pool_init(void)
     pool.num_tasks = 0;
     atomic_store(&pool.next_task, 0);
     atomic_store(&pool.completed, 0);
+    atomic_store(&pool.workers_in_flight, 0);
     atomic_store(&pool.shutdown, false);
     atomic_store(&pool.batch_seq, 0);
     pool.num_threads = num_threads;
@@ -353,7 +373,44 @@ xpatch_encode_pool_execute(EncodeBatch *batch)
         tasks[i].result_valid = false;
     }
 
-    /* Set up batch for workers */
+    /*
+     * Drain straggler workers from the previous batch.
+     *
+     * A worker is "in flight" from the moment it enters the inner task
+     * loop until it exits (break on task_idx >= num_tasks).  We must
+     * wait for all workers to exit before resetting next_task and
+     * completed, otherwise a straggler can:
+     *   1. See the reset next_task (0) and grab a task from the NEW batch
+     *   2. Complete it and increment completed
+     *   3. Have that increment wiped by our completed = 0 reset
+     * This permanently loses one completion and the spin-wait hangs.
+     *
+     * This loop is fast: workers exit the inner loop within one
+     * fetch_add cycle after all tasks are claimed (bounded work).
+     */
+    while (atomic_load(&pool.workers_in_flight) > 0)
+    {
+        #ifdef __x86_64__
+        __builtin_ia32_pause();
+        #else
+        sched_yield();
+        #endif
+    }
+
+    /*
+     * Free stale tasks left over from a previous cancelled execution.
+     * If CHECK_FOR_INTERRUPTS() fired during the spin-wait, the longjmp
+     * skipped the free(tasks) at the end of this function, leaving
+     * pool.tasks pointing at leaked memory.  Now that all workers are
+     * drained (workers_in_flight == 0), it is safe to free.
+     */
+    if (pool.tasks != NULL)
+    {
+        free(pool.tasks);
+        pool.tasks = NULL;
+    }
+
+    /* Set up batch for workers — safe now, no stragglers in task loop */
     pool.tasks = tasks;
     pool.num_tasks = batch->num_tasks;
     atomic_store(&pool.next_task, 0);
@@ -403,12 +460,19 @@ xpatch_encode_pool_execute(EncodeBatch *batch)
     /* Spin-wait for all tasks to complete */
     while (atomic_load(&pool.completed) < batch->num_tasks)
     {
-        /* Yield to avoid burning CPU while waiting for workers */
         #ifdef __x86_64__
         __builtin_ia32_pause();
         #else
         sched_yield();
         #endif
+
+        /*
+         * Allow PostgreSQL to process cancel/terminate signals.
+         * Without this, a hung backend (e.g., from any future bug in
+         * the completion logic) cannot be killed via pg_cancel_backend()
+         * or pg_terminate_backend(), requiring a SIGKILL.
+         */
+        CHECK_FOR_INTERRUPTS();
     }
 
     /*
@@ -482,6 +546,13 @@ xpatch_encode_pool_shutdown(void)
     for (i = 0; i < pool.num_threads; i++)
     {
         pthread_join(pool.threads[i], NULL);
+    }
+
+    /* Free stale tasks left over from a cancelled execution */
+    if (pool.tasks != NULL)
+    {
+        free(pool.tasks);
+        pool.tasks = NULL;
     }
 
     pthread_mutex_destroy(&pool.batch_mutex);

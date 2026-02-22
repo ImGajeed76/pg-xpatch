@@ -302,9 +302,9 @@ class TestCacheFunctional:
         )
 
     def test_version_string(self, db: psycopg.Connection):
-        """Version string contains 0.6.1."""
+        """Version string contains 0.6.2."""
         raw = db.execute("SELECT xpatch.version()").fetchone()["version"]
-        assert "0.6.1" in raw, f"Expected '0.6.1' in version, got '{raw}'"
+        assert "0.6.2" in raw, f"Expected '0.6.2' in version, got '{raw}'"
 
 
 # ---------------------------------------------------------------------------

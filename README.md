@@ -353,7 +353,7 @@ xpatch automatically creates indexes for efficient lookups:
 
 ## Testing
 
-pg-xpatch has a comprehensive pytest-based test suite with **567 tests** across 28 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
+pg-xpatch has a comprehensive pytest-based test suite with **570 tests** across 29 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
 
 ### Requirements
 
@@ -411,6 +411,7 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 | `test_ffi_tag_encoding.py` | 10 | Rust FFI tag encoding/decoding round-trip |
 | `test_fifo_empty_content.py` | 11 | FIFO insert cache empty content handling regression |
 | `test_encode_pool.py` | 10 | Encode thread pool correctness under load |
+| `test_encode_pool_race_condition.py` | 3 | Encode pool race condition regression: hang detection (COPY, INSERT), sequential-vs-parallel correctness |
 | `test_deadlock_delete.py` | 7 | Concurrent delete deadlock/contention regression |
 | `test_crash_recovery.py` | 7 | SIGKILL crash recovery, WAL replay integrity |
 
@@ -445,7 +446,7 @@ These issues are documented for transparency. For typical workloads (versioned d
 
 ### PostgreSQL Version
 
-Thoroughly tested on PostgreSQL 16 with 567 test cases. Other versions may work but are not officially supported.
+Thoroughly tested on PostgreSQL 16 with 570 test cases. Other versions may work but are not officially supported.
 
 ## License
 
