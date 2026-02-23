@@ -68,6 +68,11 @@ SELECT * FROM xpatch.stats('documents');
 SELECT * FROM xpatch.warm_cache('documents');
 SELECT * FROM xpatch.warm_cache('documents', max_groups => 100);
 
+-- Parallel cache warming via background workers (much faster for large tables)
+SELECT * FROM xpatch.warm_cache_parallel('documents');
+SELECT * FROM xpatch.warm_cache_parallel('documents', max_workers => 8);
+SELECT * FROM xpatch.warm_cache_parallel('documents', max_workers => 8, max_groups => 1000);
+
 -- Inspect internal storage for a specific group (debugging/analysis)
 SELECT * FROM xpatch.inspect('documents', 1);  -- group_value = 1
 
@@ -181,21 +186,25 @@ pg_xpatch.seq_tid_cache_size_mb = 64    # Seq-to-TID cache (default: 16)
 pg_xpatch.insert_cache_slots = 64       # Concurrent insert slots (default: 16)
 pg_xpatch.max_delta_columns = 32        # Max delta columns per table (default: 32)
 pg_xpatch.encode_threads = 4            # Parallel encoding threads (default: 0)
+pg_xpatch.warm_cache_workers = 4        # Default workers for warm_cache_parallel (default: 4)
 ```
 
 **Lock striping** (v0.6.0): The content cache is partitioned into `cache_partitions` independent stripes, each with its own lock. This eliminates contention between concurrent backends. With the default of 32 stripes, up to 32 backends can access the cache simultaneously without blocking each other.
 
 Entries larger than `cache_max_entry_kb` are silently skipped by the cache. A `WARNING` is logged on the first skip per backend session (subsequent skips log at `DEBUG1`). Use `xpatch.cache_stats()` to monitor the `skip_count` counter.
 
-`cache_max_entry_kb` uses `PGC_SUSET` context (superusers can change at runtime). `encode_threads` uses `PGC_USERSET` (any user can change per-session). All other GUCs are `PGC_POSTMASTER` (require a restart).
+`cache_max_entry_kb` uses `PGC_SUSET` context (superusers can change at runtime). `encode_threads` and `warm_cache_workers` use `PGC_USERSET` (any user can change per-session). All other GUCs are `PGC_POSTMASTER` (require a restart).
 
 Cache warming example:
 ```sql
 -- Cold query: ~2.3ms
 SELECT COUNT(*) FROM documents;
 
--- Warm the cache
+-- Warm the cache (sequential PL/pgSQL)
 SELECT * FROM xpatch.warm_cache('documents');
+
+-- Or warm in parallel (C implementation, much faster for large tables)
+SELECT * FROM xpatch.warm_cache_parallel('documents');
 
 -- Warm query: ~0.7ms
 SELECT COUNT(*) FROM documents;
@@ -401,7 +410,7 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 | `test_types.py` | 39 | All group types (INT/BIGINT/TEXT/VARCHAR/UUID), order types (INT/BIGINT/SMALLINT/TIMESTAMP), delta types (TEXT/BYTEA/JSON/JSONB), special characters, boundary values |
 | `test_utility_functions.py` | 52 | All SQL-callable functions: version, stats, inspect, describe, physical, cache_stats, warm_cache, refresh_stats, dump_configs, invalidate_config |
 | `test_cache_max_entry.py` | 25 | Cache max entry GUC, skip_count stats, oversized entry rejection, mixed sizes, large delta chains |
-| `test_guc_settings.py` | 27 | All 11 GUC defaults/metadata, PGC context enforcement, lock striping correctness (multi-group, stats aggregation, cross-stripe invalidation) |
+| `test_guc_settings.py` | 27 | All 12 GUC defaults/metadata, PGC context enforcement, lock striping correctness (multi-group, stats aggregation, cross-stripe invalidation) |
 | `test_vacuum.py` | 25 | VACUUM, VACUUM FULL (error), ANALYZE, TRUNCATE + rollback, crash recovery after VACUUM |
 | `test_deep_audit_bugs.py` | 10 | REPEATABLE READ visibility, DELETE with TEXT group keys, same-transaction delete+insert seq integrity |
 | `test_stats_batching.py` | 5 | Stats accumulator batching: single/multi-group, COPY, rollback cleanup |
@@ -414,6 +423,7 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 | `test_encode_pool_race_condition.py` | 3 | Encode pool race condition regression: hang detection (COPY, INSERT), sequential-vs-parallel correctness |
 | `test_deadlock_delete.py` | 7 | Concurrent delete deadlock/contention regression |
 | `test_crash_recovery.py` | 7 | SIGKILL crash recovery, WAL replay integrity |
+| `test_warm_cache_parallel.py` | 32 | Parallel cache warming: basic, workers, max_groups, keyframe sections, cache population, no-group-by, errors, correctness, parallel execution, stress |
 
 ### Key Test Scenarios
 

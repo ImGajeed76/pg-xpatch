@@ -2,6 +2,50 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
+## [0.7.0] - 2026-02-23
+
+### Added
+
+- **Parallel cache warming via background workers** — New `xpatch.warm_cache_parallel()` function implemented in C. Discovers all groups and keyframe sections, then distributes reconstruction work across N PostgreSQL dynamic background workers using a lock-free atomic work queue. The leader process also participates in the work queue for maximum utilization.
+
+- **New GUC: `pg_xpatch.warm_cache_workers`** — Default number of background workers for `warm_cache_parallel()` (default: 4, PGC_USERSET). Overridable per-call via the `max_workers` parameter.
+
+- **`xpatch.warm_cache_parallel()` function** with signature:
+  ```sql
+  xpatch.warm_cache_parallel(
+      table_name  REGCLASS,
+      max_workers INT DEFAULT NULL,   -- NULL = use GUC default
+      max_groups  INT DEFAULT NULL    -- NULL = all groups
+  ) RETURNS TABLE (
+      rows_warmed     BIGINT,
+      groups_warmed   BIGINT,
+      sections_warmed BIGINT,
+      workers_used    INT,
+      duration_ms     FLOAT8
+  )
+  ```
+
+- **Two levels of parallelism exploited**:
+  - Inter-group: Groups are completely independent delta chains
+  - Intra-group (keyframe sections): Sections starting from keyframes can be reconstructed independently
+
+- **Graceful fallback**: If no BGW slots are available, falls back to sequential C warming with a NOTICE. If `max_workers=0`, uses sequential C path directly (still much faster than the PL/pgSQL `warm_cache()`).
+
+- **DSM-based work distribution**: Group values serialized into a Dynamic Shared Memory segment. Supports all group column types: pass-by-value (INT, BIGINT, OID), varlena (TEXT, BYTEA), fixed-length pass-by-ref (UUID, POINT, MACADDR), and C-string types.
+
+- **32 new tests** in `test_warm_cache_parallel.py` covering: basic functionality, worker configuration, max_groups, keyframe sections, cache population, no-group-by tables, error handling, correctness comparison with PL/pgSQL warm_cache, parallel execution, and stress tests.
+
+### Changed
+
+- **No artificial limits**: `max_workers` accepts up to `INT_MAX` (PostgreSQL's `max_worker_processes` is the real limit). No cap on group value size or task count — DSM and memory are the natural limits.
+
+### Technical
+
+- **591 tests** across 29 test files, all passing.
+- Workers use `dsm_pin_mapping()` to prevent transaction-abort from detaching the DSM segment prematurely.
+- `CHECK_FOR_INTERRUPTS()` in worker task loop for cancellability.
+- SPI memory context correctness: group arrays and datum copies allocated in caller's context before `SPI_finish()`.
+
 ## [0.6.3] - 2026-02-23
 
 ### Fixed

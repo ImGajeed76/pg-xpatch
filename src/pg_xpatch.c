@@ -42,6 +42,7 @@
 #include "xpatch_encode_pool.h"
 #include "xpatch_compress.h"
 #include "xpatch_config.h"
+#include "xpatch_warm.h"
 
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -235,16 +236,31 @@ _PG_init(void)
             NULL, NULL, NULL
         );
 
+        DefineCustomIntVariable(
+            "pg_xpatch.warm_cache_workers",
+            "Default number of background workers for warm_cache_parallel()",
+            "Controls how many dynamic background workers are launched for "
+            "parallel cache warming (0 = sequential, overridable per-call)",
+            &xpatch_warm_cache_workers,
+            XPATCH_DEFAULT_WARM_WORKERS,     /* default 4 */
+            0,                                /* min */
+            INT_MAX,                          /* max (PG limits via max_worker_processes) */
+            PGC_USERSET,                      /* can be changed per-session */
+            0,
+            NULL, NULL, NULL
+        );
+
         /* Request shared memory for caches - hooks into shmem_request_hook */
         xpatch_cache_request_shmem();
         xpatch_seq_cache_request_shmem();
         xpatch_insert_cache_request_shmem();
 
-        elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries (xpatch library %s, cache %d MB, max_entry %d KB, group_cache %d MB, tid_cache %d MB, insert_cache_slots %d, encode_threads %d)",
+        elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries (xpatch library %s, cache %d MB, max_entry %d KB, group_cache %d MB, tid_cache %d MB, insert_cache_slots %d, encode_threads %d, warm_workers %d)",
              PG_XPATCH_VERSION, xpatch_lib_version(), xpatch_cache_size_mb,
              xpatch_cache_max_entry_kb, xpatch_group_cache_size_mb,
              xpatch_tid_cache_size_mb,
-             xpatch_insert_cache_slots, xpatch_encode_threads);
+             xpatch_insert_cache_slots, xpatch_encode_threads,
+             xpatch_warm_cache_workers);
     }
     else
     {
