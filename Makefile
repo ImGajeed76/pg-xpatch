@@ -59,13 +59,15 @@ DATA = sql/pg_xpatch--0.1.0.sql sql/pg_xpatch--0.1.1.sql sql/pg_xpatch--0.2.0.sq
        sql/pg_xpatch--0.6.0.sql sql/pg_xpatch--0.6.1.sql \
        sql/pg_xpatch--0.6.2.sql sql/pg_xpatch--0.6.3.sql \
        sql/pg_xpatch--0.7.0.sql \
+       sql/pg_xpatch--0.8.0.sql \
        sql/pg_xpatch--0.1.0--0.1.1.sql \
        sql/pg_xpatch--0.1.1--0.2.0.sql sql/pg_xpatch--0.2.0--0.2.1.sql \
        sql/pg_xpatch--0.2.1--0.3.0.sql sql/pg_xpatch--0.3.0--0.3.1.sql \
        sql/pg_xpatch--0.3.1--0.4.0.sql sql/pg_xpatch--0.4.0--0.5.0.sql \
        sql/pg_xpatch--0.5.0--0.5.1.sql sql/pg_xpatch--0.5.1--0.6.0.sql \
        sql/pg_xpatch--0.6.0--0.6.1.sql sql/pg_xpatch--0.6.1--0.6.2.sql \
-       sql/pg_xpatch--0.6.2--0.6.3.sql sql/pg_xpatch--0.6.3--0.7.0.sql
+       sql/pg_xpatch--0.6.2--0.6.3.sql sql/pg_xpatch--0.6.3--0.7.0.sql \
+       sql/pg_xpatch--0.7.0--0.8.0.sql
 EXTRA_CLEAN = lib/libxpatch_c.a lib/xpatch.h lib/blake3/*.o
 
 # Tests: see tests/ directory (pytest)

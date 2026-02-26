@@ -1,0 +1,11 @@
+-- pg_xpatch upgrade script: 0.7.0 -> 0.8.0
+--
+-- Changes in 0.8.0:
+--   - Three-level cache system (L1/L2/L3) with chain index and path planner
+--   - L1: renamed GUCs (pg_xpatch.cache_* -> pg_xpatch.l1_cache_*)
+--   - L2: compressed delta cache in shared memory
+--   - L3: persistent disk cache tables (per-table, opt-in)
+--   - Chain index: always-on in-memory index for optimal reconstruction paths
+--   - Path planner: bottom-up DP algorithm for cheapest reconstruction
+
+-- (changes will be added here as implementation proceeds)
