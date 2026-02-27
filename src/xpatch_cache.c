@@ -48,6 +48,7 @@
  */
 
 #include "xpatch_cache.h"
+#include "xpatch_chain_index.h"
 #include "xpatch_hash.h"
 
 #include "miscadmin.h"
@@ -378,6 +379,19 @@ evict_lru_entry(XPatchCacheStripe *stripe, XPatchCacheEntry *entries,
     /* Free content slots */
     if (victim->slot_index >= 0)
         free_slots(stripe, slots_base, victim->slot_index);
+
+    /*
+     * Clear CHAIN_BIT_L1 in chain index for evicted entry.
+     * Lockless byte write — safe while holding stripe lock.
+     */
+    if (xpatch_chain_index_is_ready())
+    {
+        xpatch_chain_index_update_bits(victim->key.relid,
+                                       victim->key.group_hash,
+                                       victim->key.attnum,
+                                       victim->key.seq,
+                                       0, CHAIN_BIT_L1);
+    }
 
     /*
      * Mark entry as tombstone (not in_use but also not empty).
@@ -963,6 +977,14 @@ xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int64 seq,
     stripe->num_entries++;
 
     LWLockRelease(stripe->lock);
+
+    /* Set CHAIN_BIT_L1 — lockless byte write, safe outside stripe lock */
+    if (xpatch_chain_index_is_ready())
+    {
+        xpatch_chain_index_update_bits(key.relid, key.group_hash,
+                                       key.attnum, key.seq,
+                                       CHAIN_BIT_L1, 0);
+    }
 }
 
 /*

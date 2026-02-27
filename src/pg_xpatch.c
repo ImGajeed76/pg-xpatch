@@ -160,6 +160,61 @@ _PG_init(void)
             NULL, NULL, NULL
         );
 
+        /*
+         * L1 cache GUC aliases — new preferred names.
+         * Point to the SAME C variables as the old pg_xpatch.cache_* names.
+         * Both names work; old names kept for one version cycle.
+         */
+        DefineCustomIntVariable(
+            "pg_xpatch.l1_cache_size_mb",
+            "Size of the L1 decompressed content cache in megabytes (alias for cache_size_mb)",
+            NULL,
+            &xpatch_cache_size_mb,
+            XPATCH_DEFAULT_CACHE_SIZE_MB, 1, INT_MAX,
+            PGC_POSTMASTER, GUC_UNIT_MB,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l1_cache_max_entries",
+            "Maximum number of L1 cache entries (alias for cache_max_entries)",
+            NULL,
+            &xpatch_cache_max_entries,
+            65536, 1000, INT_MAX,
+            PGC_POSTMASTER, 0,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l1_cache_max_entry_kb",
+            "Maximum size of a single L1 cache entry (alias for cache_max_entry_kb)",
+            NULL,
+            &xpatch_cache_max_entry_kb,
+            XPATCH_DEFAULT_MAX_ENTRY_KB, 16, INT_MAX,
+            PGC_SUSET, GUC_UNIT_KB,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l1_cache_slot_size_kb",
+            "Size of each L1 content slot (alias for cache_slot_size_kb)",
+            NULL,
+            &xpatch_cache_slot_size_kb,
+            4, 1, 64,
+            PGC_POSTMASTER, GUC_UNIT_KB,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l1_cache_partitions",
+            "Number of L1 lock partitions (alias for cache_partitions)",
+            NULL,
+            &xpatch_cache_partitions,
+            32, 1, 256,
+            PGC_POSTMASTER, 0,
+            NULL, NULL, NULL
+        );
+
         DefineCustomIntVariable(
             "pg_xpatch.group_cache_size_mb",
             "Size of the group max seq cache in megabytes",
