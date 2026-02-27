@@ -75,4 +75,7 @@ extern int xpatch_encode_threads;
 /* GUC variables for warm cache (declared in xpatch_warm.c) */
 extern int xpatch_warm_cache_workers;
 
+/* GUC variables for chain index (declared in xpatch_chain_index.c) */
+extern int xpatch_chain_index_initial_capacity;
+
 #endif /* PG_XPATCH_H */

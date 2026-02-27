@@ -42,6 +42,7 @@
 #include "xpatch_insert_cache.h"
 #include "xpatch_encode_pool.h"
 #include "xpatch_stats_cache.h"
+#include "xpatch_chain_index.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -1380,7 +1381,8 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                                                   (uint8 *) VARDATA_ANY(raw_content),
                                                   VARSIZE_ANY_EXHDR(raw_content),
                                                   config->enable_zstd);
-                
+                best_tag = XPATCH_KEYFRAME_TAG;
+
                 elog(DEBUG1, "xpatch: keyframe col %d: raw=%zu compressed=%zu",
                      delta_col_index,
                      VARSIZE_ANY_EXHDR(raw_content),
@@ -1608,7 +1610,23 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                                              (const uint8 *) VARDATA_ANY(cache_content),
                                              VARSIZE_ANY_EXHDR(cache_content));
                 }
-                
+
+                /* Update chain index with this version's entry */
+                {
+                    XPatchGroupHash ci_hash;
+                    uint8 ci_bits = CHAIN_BIT_DISK | CHAIN_BIT_L1;
+
+                    if (insert_cache_slot >= 0)
+                        ci_hash = insert_cache_hash;
+                    else
+                        ci_hash = xpatch_compute_group_hash(group_value, group_typid, false);
+
+                    xpatch_chain_index_insert(RelationGetRelid(rel), ci_hash,
+                                              config->delta_attnums[delta_col_index],
+                                              new_seq,
+                                              (uint32) best_tag, ci_bits);
+                }
+
                 pfree(cache_content);
             }
             

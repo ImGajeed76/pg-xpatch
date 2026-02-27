@@ -43,6 +43,7 @@
 #include "xpatch_compress.h"
 #include "xpatch_config.h"
 #include "xpatch_warm.h"
+#include "xpatch_chain_index.h"
 
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -250,10 +251,25 @@ _PG_init(void)
             NULL, NULL, NULL
         );
 
+        DefineCustomIntVariable(
+            "pg_xpatch.chain_index_initial_capacity",
+            "Initial per-group array capacity for the chain index",
+            "Controls the initial number of entries allocated per group "
+            "in the chain index. Arrays grow automatically by 2x when full.",
+            &xpatch_chain_index_initial_capacity,
+            64,                              /* default */
+            8,                               /* min */
+            INT_MAX,                         /* max */
+            PGC_POSTMASTER,
+            0,
+            NULL, NULL, NULL
+        );
+
         /* Request shared memory for caches - hooks into shmem_request_hook */
         xpatch_cache_request_shmem();
         xpatch_seq_cache_request_shmem();
         xpatch_insert_cache_request_shmem();
+        xpatch_chain_index_request_shmem();
 
         elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries (xpatch library %s, cache %d MB, max_entry %d KB, group_cache %d MB, tid_cache %d MB, insert_cache_slots %d, encode_threads %d, warm_workers %d)",
              PG_XPATCH_VERSION, xpatch_lib_version(), xpatch_cache_size_mb,

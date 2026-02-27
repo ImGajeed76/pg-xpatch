@@ -35,6 +35,7 @@
 #include "xpatch_seq_cache.h"
 #include "xpatch_insert_cache.h"
 #include "xpatch_stats_cache.h"
+#include "xpatch_chain_index.h"
 
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
@@ -1106,6 +1107,7 @@ xpatch_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
             /* Invalidate caches */
             xpatch_cache_invalidate_rel(RelationGetRelid(relation));
             xpatch_insert_cache_invalidate_rel(RelationGetRelid(relation));
+            xpatch_chain_index_invalidate_rel(RelationGetRelid(relation));
         }
         
         UnlockReleaseBuffer(buffer);
@@ -1584,7 +1586,8 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
      */
     xpatch_cache_invalidate_rel(relid);
     xpatch_insert_cache_invalidate_rel(relid);
-    
+    xpatch_chain_index_invalidate_rel(relid);
+
     /*
      * Step 6: Update seq cache - new max_seq is target_seq - 1
      * group_typid was already set when we fetched the group value earlier.
@@ -1890,6 +1893,7 @@ xpatch_relation_set_new_filelocator(Relation rel,
     xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
     xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
     xpatch_stats_cache_delete_table(relid);  /* Stats cache - delete on TRUNCATE */
+    xpatch_chain_index_invalidate_rel(relid); /* Chain index */
 
     /*
      * Initialize the physical storage for the new relation.
@@ -1912,6 +1916,7 @@ xpatch_relation_nontransactional_truncate(Relation rel)
     xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
     xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
     xpatch_stats_cache_delete_table(relid); /* Stats cache */
+    xpatch_chain_index_invalidate_rel(relid); /* Chain index */
 
     /* Delegate to heap */
     RelationTruncate(rel, 0);
@@ -2093,6 +2098,7 @@ xpatch_relation_vacuum(Relation rel, struct VacuumParams *params,
         xpatch_cache_invalidate_rel(relid);
         xpatch_seq_cache_invalidate_rel(relid);
         xpatch_insert_cache_invalidate_rel(relid);
+        xpatch_chain_index_invalidate_rel(relid);
         cache_invalidated = true;
     }
 
