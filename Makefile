@@ -19,6 +19,7 @@ OBJS = src/pg_xpatch.o \
        src/xpatch_utils.o \
        src/xpatch_warm.o \
        src/xpatch_chain_index.o \
+       src/xpatch_l2_cache.o \
        lib/blake3/blake3.o \
        lib/blake3/blake3_dispatch.o \
        lib/blake3/blake3_portable.o

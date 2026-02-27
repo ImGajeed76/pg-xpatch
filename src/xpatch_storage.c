@@ -43,6 +43,7 @@
 #include "xpatch_encode_pool.h"
 #include "xpatch_stats_cache.h"
 #include "xpatch_chain_index.h"
+#include "xpatch_l2_cache.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -1611,7 +1612,7 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                                              VARSIZE_ANY_EXHDR(cache_content));
                 }
 
-                /* Update chain index with this version's entry */
+                /* Update chain index and populate L2 with compressed delta */
                 {
                     XPatchGroupHash ci_hash;
                     uint8 ci_bits = CHAIN_BIT_DISK | CHAIN_BIT_L1;
@@ -1620,6 +1621,16 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                         ci_hash = insert_cache_hash;
                     else
                         ci_hash = xpatch_compute_group_hash(group_value, group_typid, false);
+
+                    /* Store compressed blob in L2 (sets CHAIN_BIT_L2 internally) */
+                    xpatch_l2_cache_put(RelationGetRelid(rel), ci_hash,
+                                        new_seq,
+                                        config->delta_attnums[delta_col_index],
+                                        compressed);
+
+                    /* If L2 accepted it, add the L2 bit to the chain index entry */
+                    if (xpatch_l2_cache_is_ready())
+                        ci_bits |= CHAIN_BIT_L2;
 
                     xpatch_chain_index_insert(RelationGetRelid(rel), ci_hash,
                                               config->delta_attnums[delta_col_index],

@@ -44,6 +44,7 @@
 #include "xpatch_config.h"
 #include "xpatch_warm.h"
 #include "xpatch_chain_index.h"
+#include "xpatch_l2_cache.h"
 
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -265,16 +266,87 @@ _PG_init(void)
             NULL, NULL, NULL
         );
 
+        /* --- L2 cache GUCs --- */
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l2_cache_size_mb",
+            "Size of the L2 compressed delta cache in megabytes",
+            "Controls shared memory allocated for L2 compressed delta cache",
+            &xpatch_l2_cache_size_mb,
+            XPATCH_L2_DEFAULT_SIZE_MB,       /* default 1024 */
+            1,                                /* min */
+            INT_MAX,                          /* max */
+            PGC_POSTMASTER,
+            GUC_UNIT_MB,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l2_cache_max_entries",
+            "Maximum number of entries in the L2 cache",
+            "Controls how many compressed delta entries the L2 cache can hold",
+            &xpatch_l2_cache_max_entries,
+            XPATCH_L2_DEFAULT_MAX_ENTRIES,   /* default 4M */
+            1000,                             /* min */
+            INT_MAX,                          /* max */
+            PGC_POSTMASTER,
+            0,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l2_cache_slot_size",
+            "Size of each content slot in the L2 cache (bytes)",
+            "Controls the granularity of content storage in the L2 cache",
+            &xpatch_l2_cache_slot_size,
+            XPATCH_L2_DEFAULT_SLOT_SIZE,     /* default 512 */
+            64,                               /* min */
+            65536,                            /* max */
+            PGC_POSTMASTER,
+            0,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l2_cache_partitions",
+            "Number of lock partitions for the L2 cache",
+            "Controls concurrency by striping the L2 cache into independent partitions",
+            &xpatch_l2_cache_partitions,
+            XPATCH_L2_DEFAULT_PARTITIONS,    /* default 16 */
+            1,                                /* min */
+            256,                              /* max */
+            PGC_POSTMASTER,
+            0,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l2_cache_max_entry_kb",
+            "Maximum size of a single L2 cache entry in kilobytes",
+            "Compressed deltas larger than this are not cached in L2",
+            &xpatch_l2_cache_max_entry_kb,
+            XPATCH_L2_DEFAULT_MAX_ENTRY_KB,  /* default 64 KB */
+            1,                                /* min */
+            INT_MAX,                          /* max */
+            PGC_SUSET,
+            GUC_UNIT_KB,
+            NULL, NULL, NULL
+        );
+
         /* Request shared memory for caches - hooks into shmem_request_hook */
         xpatch_cache_request_shmem();
         xpatch_seq_cache_request_shmem();
         xpatch_insert_cache_request_shmem();
         xpatch_chain_index_request_shmem();
+        xpatch_l2_cache_request_shmem();
 
-        elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries (xpatch library %s, cache %d MB, max_entry %d KB, group_cache %d MB, tid_cache %d MB, insert_cache_slots %d, encode_threads %d, warm_workers %d)",
-             PG_XPATCH_VERSION, xpatch_lib_version(), xpatch_cache_size_mb,
-             xpatch_cache_max_entry_kb, xpatch_group_cache_size_mb,
-             xpatch_tid_cache_size_mb,
+        elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries "
+             "(xpatch library %s, L1 %d MB, L2 %d MB, "
+             "group_cache %d MB, tid_cache %d MB, "
+             "insert_cache_slots %d, encode_threads %d, warm_workers %d)",
+             PG_XPATCH_VERSION, xpatch_lib_version(),
+             xpatch_cache_size_mb, xpatch_l2_cache_size_mb,
+             xpatch_group_cache_size_mb, xpatch_tid_cache_size_mb,
              xpatch_insert_cache_slots, xpatch_encode_threads,
              xpatch_warm_cache_workers);
     }

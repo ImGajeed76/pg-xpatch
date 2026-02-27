@@ -78,4 +78,11 @@ extern int xpatch_warm_cache_workers;
 /* GUC variables for chain index (declared in xpatch_chain_index.c) */
 extern int xpatch_chain_index_initial_capacity;
 
+/* GUC variables for L2 cache (declared in xpatch_l2_cache.c) */
+extern int xpatch_l2_cache_size_mb;
+extern int xpatch_l2_cache_max_entries;
+extern int xpatch_l2_cache_slot_size;
+extern int xpatch_l2_cache_partitions;
+extern int xpatch_l2_cache_max_entry_kb;
+
 #endif /* PG_XPATCH_H */

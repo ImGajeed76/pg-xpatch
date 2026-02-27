@@ -429,6 +429,21 @@ LANGUAGE C STRICT;
 
 COMMENT ON FUNCTION xpatch_insert_cache_stats() IS 'Get insert cache (FIFO) statistics including eviction_misses for race condition detection';
 
+-- Utility function: Get L2 compressed delta cache statistics
+CREATE FUNCTION xpatch_l2_cache_stats()
+RETURNS TABLE (
+    cache_size_bytes    BIGINT,
+    cache_max_bytes     BIGINT,
+    entries_count       BIGINT,
+    hit_count           BIGINT,
+    miss_count          BIGINT,
+    eviction_count      BIGINT,
+    skip_count          BIGINT
+) AS 'MODULE_PATHNAME', 'xpatch_l2_cache_stats_fn'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION xpatch_l2_cache_stats() IS 'Get L2 compressed delta cache statistics';
+
 -- Utility function: Get xpatch library version
 CREATE FUNCTION xpatch_version()
 RETURNS TEXT AS 'MODULE_PATHNAME', 'pg_xpatch_version'
@@ -872,6 +887,22 @@ RETURNS TABLE (
 $$ LANGUAGE SQL STABLE;
 
 COMMENT ON FUNCTION xpatch.insert_cache_stats() IS 'Get insert cache (FIFO) statistics including eviction_misses for race condition detection';
+
+-- xpatch.l2_cache_stats() - wrapper for xpatch_l2_cache_stats()
+CREATE OR REPLACE FUNCTION xpatch.l2_cache_stats()
+RETURNS TABLE (
+    cache_size_bytes    BIGINT,
+    cache_max_bytes     BIGINT,
+    entries_count       BIGINT,
+    hit_count           BIGINT,
+    miss_count          BIGINT,
+    eviction_count      BIGINT,
+    skip_count          BIGINT
+) AS $$
+    SELECT * FROM xpatch_l2_cache_stats();
+$$ LANGUAGE SQL STABLE;
+
+COMMENT ON FUNCTION xpatch.l2_cache_stats() IS 'Get L2 compressed delta cache statistics';
 
 -- ============================================================================
 -- xpatch_physical() - C function for raw physical delta access

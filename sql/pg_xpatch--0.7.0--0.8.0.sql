@@ -8,4 +8,33 @@
 --   - Chain index: always-on in-memory index for optimal reconstruction paths
 --   - Path planner: bottom-up DP algorithm for cheapest reconstruction
 
--- (changes will be added here as implementation proceeds)
+-- L2 cache statistics C function
+CREATE FUNCTION xpatch_l2_cache_stats()
+RETURNS TABLE (
+    cache_size_bytes    BIGINT,
+    cache_max_bytes     BIGINT,
+    entries_count       BIGINT,
+    hit_count           BIGINT,
+    miss_count          BIGINT,
+    eviction_count      BIGINT,
+    skip_count          BIGINT
+) AS 'MODULE_PATHNAME', 'xpatch_l2_cache_stats_fn'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION xpatch_l2_cache_stats() IS 'Get L2 compressed delta cache statistics';
+
+-- L2 cache statistics schema wrapper
+CREATE OR REPLACE FUNCTION xpatch.l2_cache_stats()
+RETURNS TABLE (
+    cache_size_bytes    BIGINT,
+    cache_max_bytes     BIGINT,
+    entries_count       BIGINT,
+    hit_count           BIGINT,
+    miss_count          BIGINT,
+    eviction_count      BIGINT,
+    skip_count          BIGINT
+) AS $$
+    SELECT * FROM xpatch_l2_cache_stats();
+$$ LANGUAGE SQL STABLE;
+
+COMMENT ON FUNCTION xpatch.l2_cache_stats() IS 'Get L2 compressed delta cache statistics';
