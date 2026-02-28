@@ -23,6 +23,7 @@ OBJS = src/pg_xpatch.o \
        src/xpatch_l3_cache.o \
        src/xpatch_l3_eviction.o \
        src/xpatch_path_planner.o \
+       src/xpatch_startup_warm.o \
        lib/blake3/blake3.o \
        lib/blake3/blake3_dispatch.o \
        lib/blake3/blake3_portable.o

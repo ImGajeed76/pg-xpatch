@@ -46,6 +46,7 @@
 #include "xpatch_chain_index.h"
 #include "xpatch_l2_cache.h"
 #include "xpatch_l3_eviction.h"
+#include "xpatch_startup_warm.h"
 
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -429,6 +430,9 @@ _PG_init(void)
 
         /* Register L3 eviction background worker */
         xpatch_l3_eviction_register_bgw();
+
+        /* Register startup warming background worker (one-shot) */
+        xpatch_startup_warm_register_bgw();
 
         elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries "
              "(xpatch library %s, L1 %d MB, L2 %d MB, "
