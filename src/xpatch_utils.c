@@ -35,6 +35,7 @@
 #include "xpatch_stats_cache.h"
 #include "xpatch_l2_cache.h"
 #include "xpatch_l3_cache.h"
+#include "xpatch_l3_eviction.h"
 #include "xpatch_chain_index.h"
 #include "xpatch_path_planner.h"
 
@@ -1053,4 +1054,22 @@ xpatch_l3_cache_drop_fn(PG_FUNCTION_ARGS)
     dropped = xpatch_l3_cache_drop(relid);
 
     PG_RETURN_BOOL(dropped);
+}
+
+/*
+ * xpatch_l3_eviction_pass_fn() — Run one eviction cycle synchronously.
+ *
+ * SQL-callable wrapper for xpatch_l3_eviction_run_once(). Flushes the
+ * access time buffer and runs eviction on all L3-enabled tables.
+ * Returns the number of access records flushed.
+ */
+PG_FUNCTION_INFO_V1(xpatch_l3_eviction_pass_fn);
+Datum
+xpatch_l3_eviction_pass_fn(PG_FUNCTION_ARGS)
+{
+    int32   flushed;
+
+    flushed = xpatch_l3_eviction_run_once();
+
+    PG_RETURN_INT32(flushed);
 }

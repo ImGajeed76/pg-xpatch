@@ -85,4 +85,8 @@ extern int xpatch_l2_cache_slot_size;
 extern int xpatch_l2_cache_partitions;
 extern int xpatch_l2_cache_max_entry_kb;
 
+/* GUC variables for L3 eviction (declared in xpatch_l3_eviction.c) */
+extern int xpatch_l3_eviction_interval_s;
+extern int xpatch_l3_access_buffer_size;
+
 #endif /* PG_XPATCH_H */

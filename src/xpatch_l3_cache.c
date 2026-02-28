@@ -38,6 +38,7 @@
  */
 
 #include "xpatch_l3_cache.h"
+#include "xpatch_l3_eviction.h"
 #include "xpatch_chain_index.h"
 
 #include "access/htup_details.h"
@@ -371,6 +372,10 @@ xpatch_l3_cache_get(Oid relid, XPatchGroupHash group_hash,
 
     SPI_finish();
     pfree(l3_table);
+
+    /* Record access for eviction tracking */
+    if (result != NULL)
+        xpatch_l3_access_record(relid, group_hash, seq, attnum);
 
     return result;
 }

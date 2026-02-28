@@ -21,6 +21,7 @@ OBJS = src/pg_xpatch.o \
        src/xpatch_chain_index.o \
        src/xpatch_l2_cache.o \
        src/xpatch_l3_cache.o \
+       src/xpatch_l3_eviction.o \
        src/xpatch_path_planner.o \
        lib/blake3/blake3.o \
        lib/blake3/blake3_dispatch.o \

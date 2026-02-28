@@ -273,3 +273,20 @@ $$ LANGUAGE SQL VOLATILE;
 
 COMMENT ON FUNCTION xpatch.drop_l3_cache(regclass) IS
     'Drop the L3 persistent disk cache table for an xpatch table. Returns true if the table existed.';
+
+-- L3 eviction pass: manually trigger one eviction cycle
+CREATE OR REPLACE FUNCTION xpatch_l3_eviction_pass()
+RETURNS INTEGER
+AS 'MODULE_PATHNAME', 'xpatch_l3_eviction_pass_fn'
+LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION xpatch_l3_eviction_pass() IS
+    'Run one L3 eviction cycle: flush access buffer and evict over-limit entries';
+
+CREATE OR REPLACE FUNCTION xpatch.l3_eviction_pass()
+RETURNS INTEGER AS $$
+    SELECT xpatch_l3_eviction_pass();
+$$ LANGUAGE SQL VOLATILE;
+
+COMMENT ON FUNCTION xpatch.l3_eviction_pass() IS
+    'Run one L3 eviction cycle: flush access buffer and evict over-limit entries. Returns number of access records flushed.';

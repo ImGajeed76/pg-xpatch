@@ -45,6 +45,7 @@
 #include "xpatch_warm.h"
 #include "xpatch_chain_index.h"
 #include "xpatch_l2_cache.h"
+#include "xpatch_l3_eviction.h"
 
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -388,12 +389,46 @@ _PG_init(void)
             NULL, NULL, NULL
         );
 
+        /* --- L3 eviction GUCs --- */
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l3_eviction_interval_s",
+            "L3 eviction worker cycle interval in seconds",
+            "How often the background worker flushes access records and "
+            "checks L3 table sizes for eviction",
+            &xpatch_l3_eviction_interval_s,
+            XPATCH_L3_DEFAULT_EVICTION_INTERVAL_S,  /* default 60 */
+            1,                                        /* min */
+            3600,                                     /* max 1 hour */
+            PGC_SIGHUP,
+            0,
+            NULL, NULL, NULL
+        );
+
+        DefineCustomIntVariable(
+            "pg_xpatch.l3_access_buffer_size",
+            "Number of entries in the L3 access time ring buffer",
+            "Controls the shared memory ring buffer for tracking L3 cache "
+            "reads. The eviction worker drains this buffer periodically.",
+            &xpatch_l3_access_buffer_size,
+            XPATCH_L3_DEFAULT_ACCESS_BUFFER_SIZE,  /* default 8192 */
+            64,                                     /* min */
+            1048576,                                /* max 1M */
+            PGC_POSTMASTER,
+            0,
+            NULL, NULL, NULL
+        );
+
         /* Request shared memory for caches - hooks into shmem_request_hook */
         xpatch_cache_request_shmem();
         xpatch_seq_cache_request_shmem();
         xpatch_insert_cache_request_shmem();
         xpatch_chain_index_request_shmem();
         xpatch_l2_cache_request_shmem();
+        xpatch_l3_eviction_request_shmem();
+
+        /* Register L3 eviction background worker */
+        xpatch_l3_eviction_register_bgw();
 
         elog(LOG, "pg_xpatch %s loaded via shared_preload_libraries "
              "(xpatch library %s, L1 %d MB, L2 %d MB, "
