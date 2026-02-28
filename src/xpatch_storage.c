@@ -44,6 +44,7 @@
 #include "xpatch_stats_cache.h"
 #include "xpatch_chain_index.h"
 #include "xpatch_l2_cache.h"
+#include "xpatch_path_planner.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -941,12 +942,403 @@ xpatch_fetch_by_seq(Relation rel, XPatchConfig *config,
 }
 
 /*
+ * Internal: Execute a reconstruction plan iteratively.
+ *
+ * Takes a PathPlan produced by xpatch_plan_path() and executes it step by
+ * step, from anchor to target, producing the decompressed content for the
+ * target version.
+ *
+ * For each step:
+ *   anchor_l1:      Read decompressed content from L1 shmem cache
+ *   anchor_l3:      (Not yet implemented — treated as disk fallback)
+ *   anchor_kf_l2:   Read compressed keyframe from L2, decode against empty base
+ *   anchor_kf_disk: Fetch physical tuple, decode keyframe
+ *   delta_l2:       Read compressed delta from L2, apply to running content
+ *   delta_disk:     Fetch physical tuple, apply delta to running content
+ *
+ * Stale plan handling: If L1 or L2 data is missing (evicted between plan and
+ * execute), we fall back to disk for that step. This produces correct results
+ * at slightly higher cost — no re-planning needed.
+ *
+ * The final result is cached in L1 for the target version.
+ * Returns a palloc'd bytea, or NULL on failure (caller should fall back
+ * to the old recursive path).
+ */
+static bytea *
+xpatch_reconstruct_planned(Relation rel, XPatchConfig *config,
+                           Datum group_value, int delta_col_index,
+                           PathPlan *plan)
+{
+    TupleDesc       tupdesc;
+    AttrNumber      attnum;
+    Oid             group_typid;
+    Oid             col_typid;
+    XPatchGroupHash group_hash;
+    bytea          *running = NULL;     /* Current decompressed content */
+    bytea          *delta_blob = NULL;  /* Compressed delta from L2 or disk */
+    bytea          *decoded = NULL;
+    int             i;
+
+    tupdesc = RelationGetDescr(rel);
+    attnum = config->delta_attnums[delta_col_index];
+    col_typid = TupleDescAttr(tupdesc, attnum - 1)->atttypid;
+    group_typid = get_group_column_typid(rel, config);
+    group_hash = xpatch_compute_group_hash(group_value, group_typid,
+                                           group_typid == InvalidOid);
+
+    for (i = 0; i < plan->num_steps; i++)
+    {
+        PathStep   *step = &plan->steps[i];
+        int64       step_seq = step->seq;
+
+        switch (step->action)
+        {
+            case PATH_ACTION_ANCHOR_L1:
+            {
+                /*
+                 * Read decompressed content from L1. If stale (evicted
+                 * between planning and execution), abort the plan — we
+                 * cannot safely fall through because this seq may be a
+                 * delta, not a keyframe.
+                 */
+                bytea *l1 = xpatch_cache_get(RelationGetRelid(rel),
+                                             group_value, group_typid,
+                                             step_seq, attnum);
+                if (l1 != NULL)
+                {
+                    if (running)
+                        pfree(running);
+                    running = l1;
+                    continue;
+                }
+                elog(DEBUG2, "xpatch plan: stale L1 at seq=" INT64_FORMAT
+                     ", aborting plan", step_seq);
+                goto plan_failed;
+            }
+
+            case PATH_ACTION_ANCHOR_KF_DISK:
+            {
+                /*
+                 * Fetch physical tuple from disk, decode as keyframe.
+                 * This handles both the explicit anchor_kf_disk action
+                 * and the fallback from stale L1 on a keyframe.
+                 */
+                HeapTuple   phys;
+                bool        isnull;
+                Datum       delta_datum;
+
+                phys = xpatch_fetch_by_seq(rel, config, group_value, step_seq);
+                if (phys == NULL)
+                {
+                    elog(WARNING, "xpatch plan: could not fetch seq="
+                         INT64_FORMAT " from disk", step_seq);
+                    goto plan_failed;
+                }
+
+                delta_datum = heap_getattr(phys, attnum, tupdesc, &isnull);
+                if (isnull)
+                {
+                    heap_freetuple(phys);
+                    goto plan_failed;
+                }
+
+                delta_blob = datum_to_bytea(delta_datum, col_typid, false);
+                heap_freetuple(phys);
+
+                decoded = xpatch_decode_delta(
+                    (running ? (uint8 *) VARDATA_ANY(running) : NULL),
+                    (running ? VARSIZE_ANY_EXHDR(running) : 0),
+                    (uint8 *) VARDATA_ANY(delta_blob),
+                    VARSIZE_ANY_EXHDR(delta_blob));
+
+                pfree(delta_blob);
+                delta_blob = NULL;
+
+                if (decoded == NULL)
+                    goto plan_failed;
+
+                if (running)
+                    pfree(running);
+                running = decoded;
+                decoded = NULL;
+                break;
+            }
+
+            case PATH_ACTION_ANCHOR_L3:
+            {
+                /* L3 not implemented yet — fall back to disk */
+                HeapTuple   phys;
+                bool        isnull;
+                Datum       delta_datum;
+
+                phys = xpatch_fetch_by_seq(rel, config, group_value, step_seq);
+                if (phys == NULL)
+                    goto plan_failed;
+
+                delta_datum = heap_getattr(phys, attnum, tupdesc, &isnull);
+                if (isnull)
+                {
+                    heap_freetuple(phys);
+                    goto plan_failed;
+                }
+
+                delta_blob = datum_to_bytea(delta_datum, col_typid, false);
+                heap_freetuple(phys);
+
+                decoded = xpatch_decode_delta(
+                    (running ? (uint8 *) VARDATA_ANY(running) : NULL),
+                    (running ? VARSIZE_ANY_EXHDR(running) : 0),
+                    (uint8 *) VARDATA_ANY(delta_blob),
+                    VARSIZE_ANY_EXHDR(delta_blob));
+
+                pfree(delta_blob);
+                delta_blob = NULL;
+
+                if (decoded == NULL)
+                    goto plan_failed;
+
+                if (running)
+                    pfree(running);
+                running = decoded;
+                decoded = NULL;
+                break;
+            }
+
+            case PATH_ACTION_ANCHOR_KF_L2:
+            {
+                /*
+                 * Read compressed keyframe from L2, decode against empty base.
+                 * On stale L2, fall back to disk.
+                 */
+                bytea *l2 = xpatch_l2_cache_get(RelationGetRelid(rel),
+                                                group_hash, step_seq, attnum);
+                if (l2 != NULL)
+                {
+                    decoded = xpatch_decode_delta(
+                        NULL, 0,
+                        (uint8 *) VARDATA_ANY(l2),
+                        VARSIZE_ANY_EXHDR(l2));
+                    pfree(l2);
+
+                    if (decoded == NULL)
+                        goto plan_failed;
+
+                    if (running)
+                        pfree(running);
+                    running = decoded;
+                    decoded = NULL;
+                    break;
+                }
+
+                /* Stale L2 — fall back to disk */
+                elog(DEBUG2, "xpatch plan: stale L2 keyframe at seq="
+                     INT64_FORMAT ", falling back to disk", step_seq);
+                {
+                    HeapTuple   phys;
+                    bool        isnull;
+                    Datum       delta_datum;
+
+                    phys = xpatch_fetch_by_seq(rel, config, group_value,
+                                               step_seq);
+                    if (phys == NULL)
+                        goto plan_failed;
+
+                    delta_datum = heap_getattr(phys, attnum, tupdesc, &isnull);
+                    if (isnull)
+                    {
+                        heap_freetuple(phys);
+                        goto plan_failed;
+                    }
+
+                    delta_blob = datum_to_bytea(delta_datum, col_typid, false);
+                    heap_freetuple(phys);
+
+                    decoded = xpatch_decode_delta(
+                        NULL, 0,
+                        (uint8 *) VARDATA_ANY(delta_blob),
+                        VARSIZE_ANY_EXHDR(delta_blob));
+
+                    pfree(delta_blob);
+                    delta_blob = NULL;
+
+                    if (decoded == NULL)
+                        goto plan_failed;
+
+                    if (running)
+                        pfree(running);
+                    running = decoded;
+                    decoded = NULL;
+                }
+                break;
+            }
+
+            case PATH_ACTION_DELTA_L2:
+            {
+                /*
+                 * Read compressed delta from L2, apply to running content.
+                 * On stale L2, fall back to disk.
+                 */
+                bytea *l2 = xpatch_l2_cache_get(RelationGetRelid(rel),
+                                                group_hash, step_seq, attnum);
+                if (l2 != NULL)
+                {
+                    if (running == NULL)
+                    {
+                        pfree(l2);
+                        goto plan_failed;
+                    }
+
+                    decoded = xpatch_decode_delta(
+                        (uint8 *) VARDATA_ANY(running),
+                        VARSIZE_ANY_EXHDR(running),
+                        (uint8 *) VARDATA_ANY(l2),
+                        VARSIZE_ANY_EXHDR(l2));
+                    pfree(l2);
+
+                    if (decoded == NULL)
+                        goto plan_failed;
+
+                    pfree(running);
+                    running = decoded;
+                    decoded = NULL;
+                    break;
+                }
+
+                /* Stale L2 — fall back to disk for this delta */
+                elog(DEBUG2, "xpatch plan: stale L2 delta at seq="
+                     INT64_FORMAT ", falling back to disk", step_seq);
+                __attribute__((fallthrough));
+            }
+
+            case PATH_ACTION_DELTA_DISK:
+            {
+                /*
+                 * Fetch compressed delta from disk, apply to running content.
+                 */
+                HeapTuple   phys;
+                bool        isnull;
+                Datum       delta_datum;
+
+                if (running == NULL)
+                    goto plan_failed;
+
+                phys = xpatch_fetch_by_seq(rel, config, group_value, step_seq);
+                if (phys == NULL)
+                {
+                    elog(WARNING, "xpatch plan: could not fetch seq="
+                         INT64_FORMAT " from disk for delta", step_seq);
+                    goto plan_failed;
+                }
+
+                delta_datum = heap_getattr(phys, attnum, tupdesc, &isnull);
+                if (isnull)
+                {
+                    heap_freetuple(phys);
+                    goto plan_failed;
+                }
+
+                delta_blob = datum_to_bytea(delta_datum, col_typid, false);
+                heap_freetuple(phys);
+
+                decoded = xpatch_decode_delta(
+                    (uint8 *) VARDATA_ANY(running),
+                    VARSIZE_ANY_EXHDR(running),
+                    (uint8 *) VARDATA_ANY(delta_blob),
+                    VARSIZE_ANY_EXHDR(delta_blob));
+
+                pfree(delta_blob);
+                delta_blob = NULL;
+
+                if (decoded == NULL)
+                    goto plan_failed;
+
+                pfree(running);
+                running = decoded;
+                decoded = NULL;
+                break;
+            }
+        }
+    }
+
+    /* Cache the final result in L1 */
+    if (running != NULL)
+    {
+        int64 target_seq = plan->steps[plan->num_steps - 1].seq;
+        xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid,
+                         target_seq, attnum, running);
+    }
+
+    return running;
+
+plan_failed:
+    /* Clean up and return NULL (caller falls back to recursive path) */
+    if (running)
+        pfree(running);
+    if (delta_blob)
+        pfree(delta_blob);
+    if (decoded)
+        pfree(decoded);
+    return NULL;
+}
+
+/*
+ * Internal: Try to reconstruct using the path planner.
+ *
+ * Consults the chain index and path planner to find the optimal
+ * reconstruction path, then executes it iteratively. Returns the
+ * decompressed content, or NULL if planning/execution failed (caller
+ * should fall back to the old recursive path).
+ *
+ * This is the new fast path that replaces recursion when the chain
+ * index is available.
+ */
+static bytea *
+xpatch_try_planned_reconstruct(Relation rel, XPatchConfig *config,
+                               Datum group_value, int64 target_seq,
+                               int delta_col_index)
+{
+    Oid             group_typid;
+    XPatchGroupHash group_hash;
+    AttrNumber      attnum;
+    ChainWalkResult chain;
+    PathPlan       *plan;
+    bytea          *result;
+
+    /* Chain index must be ready */
+    if (!xpatch_chain_index_is_ready())
+        return NULL;
+
+    group_typid = get_group_column_typid(rel, config);
+    group_hash = xpatch_compute_group_hash(group_value, group_typid,
+                                           group_typid == InvalidOid);
+    attnum = config->delta_attnums[delta_col_index];
+
+    /* Get the chain snapshot */
+    if (!xpatch_chain_index_get_chain(RelationGetRelid(rel), group_hash,
+                                      attnum, &chain))
+        return NULL;
+
+    /* Run the planner */
+    plan = xpatch_plan_path(&chain, target_seq, config->enable_zstd);
+    pfree(chain.entries);
+
+    if (plan == NULL)
+        return NULL;
+
+    /* Execute the plan */
+    result = xpatch_reconstruct_planned(rel, config, group_value,
+                                        delta_col_index, plan);
+    pfree(plan);
+
+    return result;
+}
+
+/*
  * Internal: Reconstruct a delta column given its compressed bytea directly.
  * This avoids re-fetching the tuple when we already have the compressed data.
  * 
- * This is a helper function used by both reconstruction paths:
- * 1. xpatch_reconstruct_column_with_tuple() - scan fast path (already has tuple)
- * 2. xpatch_reconstruct_column() - recursive base lookup (fetches by seq)
+ * FALLBACK PATH: This is the old recursive reconstruction used when the
+ * chain index is not yet ready (e.g., during early startup before warming).
  * 
  * The function handles two cases:
  * - Keyframe (tag=0xFF...): Decode against empty base (full content stored)
@@ -1034,18 +1426,16 @@ xpatch_reconstruct_from_delta(Relation rel, XPatchConfig *config,
  * Reconstruct the content of a delta column for a specific version.
  * 
  * This version fetches the tuple by sequence number - used for:
- * 1. Recursive base lookups during delta reconstruction
+ * 1. Recursive base lookups during delta reconstruction (fallback path)
  * 2. INSERT operations that need to compare with previous versions
  * 
  * For scan operations, use xpatch_reconstruct_column_with_tuple() instead,
  * which avoids re-fetching the tuple you already have (12x faster).
  * 
  * Reconstruction flow:
- * 1. Check LRU cache - O(1) hash lookup
- * 2. On miss: Fetch physical tuple by sequence - O(n) scan
- * 3. Extract compressed data from tuple
- * 4. If delta: recursively get base (may hit cache)
- * 5. Decode and cache result
+ * 1. Check L1 cache - O(1) hash lookup
+ * 2. Try path planner (chain index + bottom-up DP + iterative execution)
+ * 3. Fallback: fetch physical tuple and reconstruct recursively
  */
 bytea *
 xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
@@ -1067,32 +1457,28 @@ xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
     attr = TupleDescAttr(tupdesc, attnum - 1);
     typid = attr->atttypid;
     
-    /* 1. Check LRU cache first - O(1) hash lookup */
+    /* 1. Check L1 cache first - O(1) hash lookup */
     {
         Oid group_typid = get_group_column_typid(rel, config);
         result = xpatch_cache_get(RelationGetRelid(rel), group_value, group_typid, seq, attnum);
         if (result != NULL)
             return result;
     }
+
+    /* 2. Try path planner for optimal iterative reconstruction */
+    result = xpatch_try_planned_reconstruct(rel, config, group_value, seq,
+                                            delta_col_index);
+    if (result != NULL)
+        return result;
     
-    /* 2. Fetch the physical tuple for this sequence */
+    /* 3. Fallback: old recursive path (chain index not ready or plan failed) */
     physical_tuple = xpatch_fetch_by_seq(rel, config, group_value, seq);
     if (physical_tuple == NULL)
     {
-        /*
-         * Row not found - this could happen if:
-         * 1. A previous INSERT failed after allocating a sequence number
-         * 2. The row was deleted (which shouldn't normally happen in xpatch)
-         * 3. Data corruption
-         *
-         * We return NULL here instead of throwing an error so callers can
-         * handle this gracefully (e.g., by falling back to keyframe encoding).
-         */
         elog(WARNING, "xpatch: could not find row with sequence " INT64_FORMAT " (gap in chain?)", seq);
         return NULL;
     }
     
-    /* 3. Get the delta/compressed value from the tuple */
     delta_datum = heap_getattr(physical_tuple, attnum, tupdesc, &isnull);
     
     if (isnull)
@@ -1101,7 +1487,7 @@ xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
         return NULL;
     }
     
-    /* Convert to bytea and reconstruct */
+    /* Convert to bytea and reconstruct recursively */
     delta_bytea = datum_to_bytea(delta_datum, typid, false);
     result = xpatch_reconstruct_from_delta(rel, config, group_value, seq,
                                            delta_col_index, delta_bytea);
@@ -1114,18 +1500,19 @@ xpatch_reconstruct_column(Relation rel, XPatchConfig *config,
 
 /*
  * Reconstruct a delta column when we already have the physical tuple.
- * 
+ *
  * PERFORMANCE CRITICAL: This is the fast path for scan operations.
- * 
+ *
  * During sequential scans, we already have the physical tuple in memory
- * from reading the page. The naive approach would be to:
- *   1. Look up the tuple's sequence number
- *   2. Call xpatch_reconstruct_column() 
- *   3. Have it call xpatch_fetch_by_seq() to re-fetch the SAME tuple
- *   4. Do an O(n) scan to find it again
- * 
- * This function bypasses that wasteful re-fetch by accepting the tuple
- * we already have, providing a massive performance improvement for scans.
+ * from reading the page. This function keeps the tuple as fallback for
+ * recursive reconstruction, but first tries:
+ *
+ * Reconstruction flow:
+ * 1. Check L1 cache - O(1) hash lookup
+ * 2. Try path planner (chain index + bottom-up DP + iterative execution)
+ * 3. Fallback: use the tuple we already have for recursive reconstruction
+ *    (avoids the O(n) scan that xpatch_fetch_by_seq() would do)
+ *
  * With this optimization, count(*) on 10k rows: 11ms vs 135ms (12x faster).
  */
 bytea *
@@ -1148,26 +1535,31 @@ xpatch_reconstruct_column_with_tuple(Relation rel, XPatchConfig *config,
     attr = TupleDescAttr(tupdesc, attnum - 1);
     typid = attr->atttypid;
     
-    /* Check LRU cache first */
+    /* 1. Check L1 cache first - O(1) hash lookup */
     {
         Oid group_typid = get_group_column_typid(rel, config);
         result = xpatch_cache_get(RelationGetRelid(rel), group_value, group_typid, seq, attnum);
         if (result != NULL)
             return result;
     }
-    
-    /* Get the delta/compressed value from the tuple we already have */
+
+    /* 2. Try path planner for optimal iterative reconstruction */
+    result = xpatch_try_planned_reconstruct(rel, config, group_value, seq,
+                                            delta_col_index);
+    if (result != NULL)
+        return result;
+
+    /* 3. Fallback: use the tuple we already have for recursive reconstruction */
     delta_datum = heap_getattr(physical_tuple, attnum, tupdesc, &isnull);
-    
+
     if (isnull)
         return NULL;
-    
-    /* Convert to bytea and reconstruct */
+
     delta_bytea = datum_to_bytea(delta_datum, typid, false);
     result = xpatch_reconstruct_from_delta(rel, config, group_value, seq,
                                            delta_col_index, delta_bytea);
     pfree(delta_bytea);
-    
+
     return result;
 }
 
@@ -1595,12 +1987,11 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
             /* Cache the original content for future delta encoding */
             {
                 cache_content = datum_to_bytea(slot_getattr(slot, attnum, &isnull), typid, false);
-                xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid, new_seq, attnum, cache_content);
-                
+
                 /* Track sizes for stats */
                 total_raw_size += VARSIZE_ANY_EXHDR(cache_content);
                 total_compressed_size += VARSIZE(compressed);
-                
+
                 /* Push into FIFO insert cache for future inserts */
                 if (insert_cache_slot >= 0)
                 {
@@ -1612,17 +2003,23 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                                              VARSIZE_ANY_EXHDR(cache_content));
                 }
 
-                /* Update chain index and populate L2 with compressed delta */
+                /*
+                 * Update chain index and populate L2 with compressed delta.
+                 *
+                 * IMPORTANT: chain index insert MUST come before xpatch_cache_put()
+                 * because cache_put sets CHAIN_BIT_L1 via update_bits, which
+                 * requires the entry to already exist.
+                 */
                 {
                     XPatchGroupHash ci_hash;
-                    uint8 ci_bits = CHAIN_BIT_DISK | CHAIN_BIT_L1;
+                    uint8 ci_bits = CHAIN_BIT_DISK;
 
                     if (insert_cache_slot >= 0)
                         ci_hash = insert_cache_hash;
                     else
                         ci_hash = xpatch_compute_group_hash(group_value, group_typid, false);
 
-                    /* Store compressed blob in L2 (sets CHAIN_BIT_L2 internally) */
+                    /* Store compressed blob in L2 */
                     xpatch_l2_cache_put(RelationGetRelid(rel), ci_hash,
                                         new_seq,
                                         config->delta_attnums[delta_col_index],
@@ -1637,6 +2034,14 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                                               new_seq,
                                               (uint32) best_tag, ci_bits);
                 }
+
+                /*
+                 * Put decompressed content in L1 cache. This also sets
+                 * CHAIN_BIT_L1 in the chain index (entry must already
+                 * exist from above). Skipped entries (cache_max_entry_kb)
+                 * won't have the bit set — which is correct.
+                 */
+                xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid, new_seq, attnum, cache_content);
 
                 pfree(cache_content);
             }
