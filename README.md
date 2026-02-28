@@ -45,7 +45,10 @@ SELECT * FROM xpatch.stats('documents');
 - **DELETE** - Cascade delete removes a version and all subsequent versions in the chain
 - **VACUUM** - Dead tuple cleanup works
 - **WAL logging** - Crash recovery supported
-- **Shared memory cache** - Lock-striped LRU cache for reconstructed content across all backends
+- **Three-level cache** - L1 (decompressed content in shmem), L2 (compressed deltas in shmem), L3 (persistent on-disk cache per table)
+- **Chain index + path planner** - Shared memory index tracks which sequences are cached where; DP-based planner finds the cheapest reconstruction path
+- **Startup warming** - Background worker automatically repopulates L2 and the chain index from disk after restart
+- **L3 eviction** - Background worker enforces per-table size limits with LRU eviction
 - **Stats cache** - Statistics updated incrementally on INSERT/DELETE for instant `xpatch.stats()` calls
 
 ### What Doesn't Work (By Design)
@@ -79,12 +82,24 @@ SELECT * FROM xpatch.inspect('documents', 1);  -- group_value = 1
 -- View raw physical storage (delta bytes)
 SELECT * FROM xpatch.physical('documents');
 
--- Get cache statistics (requires shared_preload_libraries)
--- Returns: size_bytes, max_bytes, entries_count, hit_count, miss_count, eviction_count, skip_count
+-- Get L1 cache statistics (requires shared_preload_libraries)
+-- Returns: size_bytes, max_bytes, entries_count, hit_count, miss_count, eviction_count
 SELECT * FROM xpatch.cache_stats();
+
+-- Get L2 compressed delta cache statistics
+SELECT * FROM xpatch.l2_cache_stats();
 
 -- Get insert cache statistics
 SELECT * FROM xpatch.insert_cache_stats();
+
+-- View the reconstruction path the planner would use (debugging)
+SELECT * FROM xpatch.plan_path('documents'::regclass, '1', 3::int2, 50::int8);
+
+-- Drop the L3 cache table for a specific table
+SELECT xpatch.drop_l3_cache('documents');
+
+-- Manually run one L3 eviction cycle
+SELECT xpatch.l3_eviction_pass();
 
 -- Get xpatch library version
 SELECT xpatch.version();
@@ -165,17 +180,34 @@ Also remember that **writes parallelize across groups**. If you have 100 users e
 
 ### Cache Configuration
 
-The shared memory cache is **essential** for good read performance. Add to `postgresql.conf`:
+The three-level cache is **essential** for good read performance. Add to `postgresql.conf`:
 
 ```
 shared_preload_libraries = 'pg_xpatch'
 
-# Content cache (LRU, shared memory with lock striping)
-pg_xpatch.cache_size_mb = 512           # Total cache size (default: 256)
-pg_xpatch.cache_max_entries = 65536     # Max cache entries (default: 65536)
-pg_xpatch.cache_slot_size_kb = 4        # Content slot size (default: 4, range: 1-64)
-pg_xpatch.cache_partitions = 32         # Lock stripes for concurrency (default: 32, range: 1-256)
-pg_xpatch.cache_max_entry_kb = 256      # Max single entry size (default: 256, runtime-tunable)
+# L1: Decompressed content cache (LRU, shared memory, lock-striped)
+pg_xpatch.l1_cache_size_mb = 512        # Total L1 size (default: 256)
+pg_xpatch.l1_cache_max_entries = 65536  # Max L1 entries (default: 65536)
+pg_xpatch.l1_cache_slot_size_kb = 4     # L1 slot size (default: 4, range: 1-64)
+pg_xpatch.l1_cache_partitions = 32      # L1 lock stripes (default: 32, range: 1-256)
+pg_xpatch.l1_cache_max_entry_kb = 256   # Max single L1 entry (default: 256, runtime-tunable)
+
+# L2: Compressed delta cache (LRU, shared memory, lock-striped)
+pg_xpatch.l2_cache_size_mb = 1024       # Total L2 size (default: 1024)
+pg_xpatch.l2_cache_max_entries = 4194304 # Max L2 entries (default: 4M)
+pg_xpatch.l2_cache_partitions = 16      # L2 lock stripes (default: 16)
+pg_xpatch.l2_cache_slot_size = 512      # L2 slot size in bytes (default: 512)
+pg_xpatch.l2_cache_max_entry_kb = 64    # Max single L2 entry (default: 64, runtime-tunable)
+
+# L3: Persistent on-disk cache (per-table, configured in xpatch.table_config)
+# Enable: UPDATE xpatch.table_config SET l3_cache_enabled = true WHERE table_name = 'mytable';
+# Size:   UPDATE xpatch.table_config SET l3_cache_max_size_mb = 512 WHERE table_name = 'mytable';
+pg_xpatch.l3_eviction_interval_s = 60   # Eviction worker cycle (default: 60s)
+pg_xpatch.l3_access_buffer_size = 8192  # Access tracking ring buffer (default: 8192)
+
+# Chain index (shared memory, maps groups to cached sequences)
+pg_xpatch.chain_index_dir_slots = 4096  # Directory hash slots (default: 4096)
+pg_xpatch.chain_index_initial_capacity = 64  # Per-group array initial size (default: 64)
 
 # Sequence caches
 pg_xpatch.group_cache_size_mb = 64      # Group max-seq cache (default: 16)
@@ -189,11 +221,31 @@ pg_xpatch.encode_threads = 4            # Parallel encoding threads (default: 0)
 pg_xpatch.warm_cache_workers = 4        # Default workers for warm_cache_parallel (default: 4)
 ```
 
-**Lock striping** (v0.6.0): The content cache is partitioned into `cache_partitions` independent stripes, each with its own lock. This eliminates contention between concurrent backends. With the default of 32 stripes, up to 32 backends can access the cache simultaneously without blocking each other.
+#### How the Cache Levels Work
 
-Entries larger than `cache_max_entry_kb` are silently skipped by the cache. A `WARNING` is logged on the first skip per backend session (subsequent skips log at `DEBUG1`). Use `xpatch.cache_stats()` to monitor the `skip_count` counter.
+- **L1** stores decompressed content (ready to return to the client). Fast but large per entry (~KB). Shared across all backends. Evicted entries are not lost — L2 still has the compressed delta.
+- **L2** stores compressed deltas (the raw bytes from disk). 10-50x smaller than L1 entries. Populated on INSERT and by the startup warming BGW after restart. The path planner uses L2 entries as reconstruction anchors, avoiding SPI calls to disk.
+- **L3** stores decompressed content on disk in a per-table heap table (`xpatch.<table>_xp_l3`). Survives restarts and crashes. Useful for large datasets where L1+L2 can't hold everything. Enabled per-table. Eviction is handled by a background worker.
+- **Chain index** maps `(relid, group, column)` to known sequence ranges and which cache level holds each entry. The path planner queries this to find the cheapest reconstruction path without scanning disk.
 
-`cache_max_entry_kb` uses `PGC_SUSET` context (superusers can change at runtime). `encode_threads` and `warm_cache_workers` use `PGC_USERSET` (any user can change per-session). All other GUCs are `PGC_POSTMASTER` (require a restart).
+#### GUC Naming
+
+The old `pg_xpatch.cache_*` GUC names still work as aliases for backward compatibility. The new canonical names use `l1_cache_*` prefix:
+
+| Old name | New name |
+|----------|----------|
+| `cache_size_mb` | `l1_cache_size_mb` |
+| `cache_max_entries` | `l1_cache_max_entries` |
+| `cache_max_entry_kb` | `l1_cache_max_entry_kb` |
+| `cache_partitions` | `l1_cache_partitions` |
+| `cache_slot_size_kb` | `l1_cache_slot_size_kb` |
+
+#### Runtime-Tunable GUCs
+
+- `l1_cache_max_entry_kb` and `l2_cache_max_entry_kb` use `PGC_SUSET` (superusers can change at runtime)
+- `l3_eviction_interval_s` uses `PGC_SIGHUP` (changeable via `pg_ctl reload`)
+- `encode_threads` and `warm_cache_workers` use `PGC_USERSET` (any user can change per-session)
+- All other GUCs are `PGC_POSTMASTER` (require a restart)
 
 Cache warming example:
 ```sql
@@ -342,9 +394,10 @@ SELECT * FROM xpatch.get_config('my_table');
 ### Reconstruction
 
 When you SELECT a delta-compressed row:
-1. Find the nearest keyframe
-2. Apply deltas sequentially to reconstruct the content
-3. Cache the result for future queries
+1. The **path planner** queries the chain index to find all available anchors (keyframes on disk, L1/L2/L3 cached entries)
+2. A bottom-up DP algorithm computes the minimum-cost path from the best anchor to the target version
+3. Deltas are applied along the planned path (serving from L2 shmem when possible, falling back to disk)
+4. The result is cached in L1 (and optionally L3) for future queries
 
 ### Internal Column
 
@@ -362,7 +415,7 @@ xpatch automatically creates indexes for efficient lookups:
 
 ## Testing
 
-pg-xpatch has a comprehensive pytest-based test suite with **570 tests** across 29 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
+pg-xpatch has a comprehensive pytest-based test suite with **698 tests** across 37 test files. Each test runs in an isolated PostgreSQL database that is created and dropped automatically.
 
 ### Requirements
 
@@ -410,7 +463,13 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 | `test_types.py` | 39 | All group types (INT/BIGINT/TEXT/VARCHAR/UUID), order types (INT/BIGINT/SMALLINT/TIMESTAMP), delta types (TEXT/BYTEA/JSON/JSONB), special characters, boundary values |
 | `test_utility_functions.py` | 52 | All SQL-callable functions: version, stats, inspect, describe, physical, cache_stats, warm_cache, refresh_stats, dump_configs, invalidate_config |
 | `test_cache_max_entry.py` | 25 | Cache max entry GUC, skip_count stats, oversized entry rejection, mixed sizes, large delta chains |
-| `test_guc_settings.py` | 27 | All 12 GUC defaults/metadata, PGC context enforcement, lock striping correctness (multi-group, stats aggregation, cross-stripe invalidation) |
+| `test_guc_settings.py` | 37 | All 26 GUC defaults/metadata, PGC context enforcement, lock striping correctness, L1/L2 alias GUCs |
+| `test_l2_cache.py` | 18 | L2 population on INSERT, data integrity, invalidation on DELETE/TRUNCATE, large entry rejection, concurrent access, stats |
+| `test_l3_cache.py` | 27 | L3 enable/disable, table creation, insert/read population, data integrity, invalidation, persistence across restart, per-table config, concurrent access, path planner integration |
+| `test_l3_eviction.py` | 13 | L3 eviction GUCs, worker running, access tracking, eviction pass (tiny max size, preserves some, skips disabled), data correct after eviction, multi-table |
+| `test_path_planner.py` | 22 | Basic plans, cost model, graceful handling, chain walking, multi-delta columns, data integrity after planning |
+| `test_startup_warming.py` | 9 | Worker ran after restart, data readable, chain index repopulation, L2 stats reset, empty table, multiple tables, eviction worker still runs |
+| `test_e2e_correctness.py` | 10 | L3 crash persistence (SIGKILL), cross-level invalidation (DELETE/TRUNCATE across L1+L2+L3), L2 eviction fallback, full lifecycle (insert-restart-evict-read) |
 | `test_vacuum.py` | 25 | VACUUM, VACUUM FULL (error), ANALYZE, TRUNCATE + rollback, crash recovery after VACUUM |
 | `test_deep_audit_bugs.py` | 10 | REPEATABLE READ visibility, DELETE with TEXT group keys, same-transaction delete+insert seq integrity |
 | `test_stats_batching.py` | 5 | Stats accumulator batching: single/multi-group, COPY, rollback cleanup |
@@ -429,10 +488,13 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 
 - **MVCC visibility** across all scan types (sequential, index, bitmap)
 - **Concurrent operations**: parallel inserts, concurrent deletes with serialization, SERIALIZABLE isolation conflicts
-- **Crash recovery**: SIGKILL PostgreSQL, verify data integrity after recovery
+- **Crash recovery**: SIGKILL PostgreSQL, verify data integrity after recovery (including L3 persistence)
+- **Cross-level cache invalidation**: DELETE/TRUNCATE verified across L1+L2+L3 simultaneously
+- **Full lifecycle**: insert → read → restart → read → evict L3 → read, verified at every stage
 - **pg_dump/pg_restore**: full round-trip preserving data, _xp_seq values, and configuration
 - **All supported data types**: 5 group types, 5 order types, 5 delta types, special characters, boundary values
 - **Configuration validation**: all xpatch.configure() parameters, error paths, auto-detection
+- **Path planner correctness**: chain walking, keyframe boundaries, multi-group independence, cost model
 
 ## Limitations and Known Issues
 
@@ -445,7 +507,7 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 ### Current Limitations (May Be Addressed Later)
 
 - **`_xp_seq` visible**: PostgreSQL doesn't support hidden columns
-- **Cold read performance**: First query on uncached data is slow
+- **Cold read after restart**: The startup warming BGW repopulates L2 and the chain index automatically, but L1 is cold until data is read. First reads after restart use L2 (compressed deltas from shmem) or disk, which is slower than L1 hits.
 - **Write overhead**: Delta encoding adds INSERT latency
 
 ### Technical Debt (Known Implementation Issues)
@@ -456,7 +518,7 @@ These issues are documented for transparency. For typical workloads (versioned d
 
 ### PostgreSQL Version
 
-Thoroughly tested on PostgreSQL 16 with 570 test cases. Other versions may work but are not officially supported.
+Thoroughly tested on PostgreSQL 16 with 698 test cases. Other versions may work but are not officially supported.
 
 ## License
 

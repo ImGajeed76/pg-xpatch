@@ -2,6 +2,76 @@
 
 All notable changes to pg-xpatch will be documented in this file.
 
+## [0.8.0] - 2026-02-28
+
+### Added
+
+- **Three-level cache system (L1/L2/L3)** — Complete redesign of the caching architecture. The old single-level content cache is now "L1", complemented by two new levels:
+
+  - **L2: Compressed delta cache** — Shared memory LRU cache storing compressed deltas (not decompressed content). Uses 512-byte slots with 16 lock stripes. Default 1GB / 4M entries. Populated on INSERT and startup warming. Avoids SPI overhead during reconstruction by serving deltas directly from shmem. Configured via `l2_cache_size_mb`, `l2_cache_max_entries`, `l2_cache_partitions`, `l2_cache_slot_size`, `l2_cache_max_entry_kb`.
+
+  - **L3: Persistent heap-table cache** — Per-table on-disk cache stored in `xpatch.<table>_xp_l3`. Survives restarts and crashes. Enabled per-table via `UPDATE xpatch.table_config SET l3_cache_enabled = true`. Populated during INSERT and on cache-miss reconstruction. Size-limited via `l3_cache_max_size_mb` per table (default 256MB). Background worker performs LRU eviction based on `cached_at` timestamps.
+
+- **Chain index** — Shared memory structure that maps `(relid, group_hash, attnum)` to known sequence ranges and their cache residency bits (L1/L2/L3/disk). The path planner queries this to find optimal reconstruction anchors without scanning disk. Updated on L1/L2 put/evict. Configurable via `chain_index_dir_slots` and `chain_index_initial_capacity` GUCs.
+
+- **Path planner** — Bottom-up dynamic programming algorithm that computes the minimum-cost reconstruction path for a given target sequence. Considers all available anchors (keyframes on disk, L1 entries, L2 entries, L3 entries) and picks the cheapest chain of apply-delta steps. Replaces the old recursive reconstruction which always walked back to the nearest keyframe. Exposed via `xpatch.plan_path()` for debugging.
+
+- **Startup warming background worker** — One-shot BGW that runs after PostgreSQL starts. Performs a single sequential scan of each xpatch table's heap to repopulate the L2 cache and chain index from on-disk deltas. This means L2 is warm within seconds of a restart instead of requiring manual `warm_cache_parallel()` calls.
+
+- **L3 eviction background worker** — Periodic BGW (default every 60s) that enforces per-table `l3_cache_max_size_mb` limits by deleting the oldest L3 entries (by `cached_at`). Uses an in-memory ring buffer (`l3_access_buffer_size`, default 8192) for access tracking without per-read writes to the L3 table.
+
+- **Per-group cache invalidation on DELETE** — DELETE now removes only the affected group's entries from L1, L2, L3, and the chain index, instead of invalidating the entire relation's caches. Other groups' cached data is preserved.
+
+- **14 new GUCs**:
+  - `pg_xpatch.l1_cache_size_mb` — Alias for `cache_size_mb` (deprecated name still works)
+  - `pg_xpatch.l1_cache_max_entries` — Alias for `cache_max_entries`
+  - `pg_xpatch.l1_cache_max_entry_kb` — Alias for `cache_max_entry_kb`
+  - `pg_xpatch.l1_cache_partitions` — Alias for `cache_partitions`
+  - `pg_xpatch.l1_cache_slot_size_kb` — Alias for `cache_slot_size_kb`
+  - `pg_xpatch.l2_cache_size_mb` — L2 total size (default: 1024MB)
+  - `pg_xpatch.l2_cache_max_entries` — L2 max entries (default: 4194304)
+  - `pg_xpatch.l2_cache_max_entry_kb` — L2 max single entry (default: 64KB, PGC_SUSET)
+  - `pg_xpatch.l2_cache_partitions` — L2 lock stripes (default: 16)
+  - `pg_xpatch.l2_cache_slot_size` — L2 slot size in bytes (default: 512)
+  - `pg_xpatch.l3_eviction_interval_s` — L3 eviction cycle interval (default: 60s, PGC_SIGHUP)
+  - `pg_xpatch.l3_access_buffer_size` — L3 access tracking ring buffer (default: 8192)
+  - `pg_xpatch.chain_index_dir_slots` — Chain index directory hash slots (default: 4096)
+  - `pg_xpatch.chain_index_initial_capacity` — Chain index per-group array initial size (default: 64)
+
+- **New SQL functions**:
+  - `xpatch.l2_cache_stats()` — Returns L2 cache size, entries, hits, misses, evictions, skip_count
+  - `xpatch.plan_path(table, group_value, attnum, target_seq)` — Returns the computed reconstruction path (action, source, cost per step)
+  - `xpatch.drop_l3_cache(table)` — Drops the L3 table for a given xpatch table
+  - `xpatch.l3_eviction_pass()` — Runs one eviction cycle synchronously, returns number of entries flushed
+
+- **L1 GUC rename**: Old `pg_xpatch.cache_*` GUC names are deprecated but still work as aliases. New canonical names use `l1_cache_*` prefix for clarity in the multi-level system.
+
+- **New `table_config` columns**: `l3_cache_enabled` (boolean, default false) and `l3_cache_max_size_mb` (integer, default 256, min 1) for per-table L3 configuration.
+
+- **Upgrade path**: `ALTER EXTENSION pg_xpatch UPDATE TO '0.8.0'` from v0.7.0. Migration adds L3 columns to `table_config`, creates new functions, and registers background workers.
+
+### Fixed
+
+- **VARSIZE on short-varlena in L2 cache** — `DatumGetByteaPP` can return short-varlena (1-byte header), but `VARSIZE()` assumes 4-byte header, producing corrupt sizes. Fixed with `VARSIZE_ANY` in L2 put, L3 get, and L1 copy_to_slots.
+
+- **L2 invalidate_rel missing tombstone** — Linear probing chains were broken because invalidated entries didn't set the tombstone flag. Subsequent lookups for entries past the gap would fail to find them.
+
+- **Chain index update_bits under shared lock** — `|=` is a non-atomic read-modify-write; performing it under `LW_SHARED` could lose concurrent updates. Changed to `LW_EXCLUSIVE`.
+
+- **Chain index insert overwrote cache_bits** — Used `=` instead of `|=`, losing previously set bits from other cache levels.
+
+- **Startup warming MVCC visibility** — Now handles `HEAP_XMAX_IS_MULTI` and `HEAP_XMAX_LOCK_ONLY` flags correctly.
+
+- **xpatch_get_max_seq MVCC** — Same multi-xact and lock-only flag handling added.
+
+### Technical
+
+- **698 tests** across 37 test files, all passing.
+- Lock ordering: L1 stripe → chain index stripe, L2 stripe → chain index stripe. No code path acquires chain index then L1/L2.
+- L2 architecture matches L1: striped LWLocks, linear probing hash, LRU eviction, chained content slots.
+- Path planner uses stack-allocated DP arrays bounded by `keyframe_every` (no heap allocation in hot path).
+- `PG_TRY(2)` / `PG_CATCH(2)` for nested error handling in PG16 (L3 bit scanning, startup warming).
+
 ## [0.7.0] - 2026-02-23
 
 ### Added
