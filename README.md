@@ -47,7 +47,7 @@ SELECT * FROM xpatch.stats('documents');
 - **WAL logging** - Crash recovery supported
 - **Three-level cache** - L1 (decompressed content in shmem), L2 (compressed deltas in shmem), L3 (persistent on-disk cache per table)
 - **Chain index + path planner** - Shared memory index tracks which sequences are cached where; DP-based planner finds the cheapest reconstruction path
-- **Startup warming** - Background worker automatically repopulates L2 and the chain index from disk after restart
+- **Startup warming** - Multi-database background workers automatically repopulate L2 and the chain index from disk after restart across all databases
 - **L3 eviction** - Background worker enforces per-table size limits with LRU eviction
 - **Stats cache** - Statistics updated incrementally on INSERT/DELETE for instant `xpatch.stats()` calls
 
@@ -224,7 +224,7 @@ pg_xpatch.warm_cache_workers = 4        # Default workers for warm_cache_paralle
 #### How the Cache Levels Work
 
 - **L1** stores decompressed content (ready to return to the client). Fast but large per entry (~KB). Shared across all backends. Evicted entries are not lost — L2 still has the compressed delta.
-- **L2** stores compressed deltas (the raw bytes from disk). 10-50x smaller than L1 entries. Populated on INSERT and by the startup warming BGW after restart. The path planner uses L2 entries as reconstruction anchors, avoiding SPI calls to disk.
+- **L2** stores compressed deltas (the raw bytes from disk). 10-50x smaller than L1 entries. Populated on INSERT, by the multi-database startup warming BGWs after restart, and by the read path when the planner falls back to disk (backfill). The path planner uses L2 entries as reconstruction anchors, avoiding SPI calls to disk.
 - **L3** stores decompressed content on disk in a per-table heap table (`xpatch.<table>_xp_l3`). Survives restarts and crashes. Useful for large datasets where L1+L2 can't hold everything. Enabled per-table. Eviction is handled by a background worker.
 - **Chain index** maps `(relid, group, column)` to known sequence ranges and which cache level holds each entry. The path planner queries this to find the cheapest reconstruction path without scanning disk.
 
@@ -507,7 +507,7 @@ python -m pytest tests/ -n auto -m "not crash_test and not stress"
 ### Current Limitations (May Be Addressed Later)
 
 - **`_xp_seq` visible**: PostgreSQL doesn't support hidden columns
-- **Cold read after restart**: The startup warming BGW repopulates L2 and the chain index automatically, but L1 is cold until data is read. First reads after restart use L2 (compressed deltas from shmem) or disk, which is slower than L1 hits.
+- **Cold read after restart**: The startup warming BGWs repopulate L2 and the chain index automatically across all databases, but L1 is cold until data is read. First reads after restart use L2 (compressed deltas from shmem) or disk, which is slower than L1 hits. When the planner falls back to disk, it backfills L2 so subsequent reads benefit.
 - **Write overhead**: Delta encoding adds INSERT latency
 
 ### Technical Debt (Known Implementation Issues)

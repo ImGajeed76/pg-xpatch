@@ -21,27 +21,23 @@
  */
 
 /*
- * xpatch_startup_warm.h -- Startup warming background worker
+ * xpatch_startup_warm.h -- Multi-database startup warming background worker
  *
- * Registers a one-shot static background worker that runs once after
- * recovery finishes (BGW_NEVER_RESTART). The worker connects to the
- * "postgres" database and performs a single-pass scan of every xpatch
- * table found in xpatch.table_config, building:
+ * Architecture:
  *
- *   1. Chain index -- insert(relid, group_hash, attnum, seq, base_offset,
- *                           CHAIN_BIT_DISK)
- *   2. L2 cache    -- put(relid, group_hash, seq, attnum, compressed_blob),
- *                     which also sets CHAIN_BIT_L2
+ * 1. A static coordinator BGW starts after recovery, connects to "postgres"
+ * 2. It enumerates all connectable databases via pg_database
+ * 3. For each database it launches a dynamic per-DB BGW via
+ *    RegisterDynamicBackgroundWorker (passing the database OID as main_arg)
+ * 4. Each per-DB worker connects to its database and warms all xpatch tables:
+ *      a) Direct-buffer scan: build chain index + populate L2
+ *      b) SPI scan of L3 PKs: set CHAIN_BIT_L3
+ * 5. The coordinator waits for all per-DB workers to finish, then exits
  *
- * After the table scan, if L3 is enabled for the table, the worker scans
- * the L3 table primary keys via SPI and sets CHAIN_BIT_L3 in the chain
- * index.
- *
- * The worker is interruptible (CHECK_FOR_INTERRUPTS between blocks) and
- * handles SIGTERM for clean shutdown.
- *
- * No GUCs -- the worker is always registered when the extension is loaded
- * via shared_preload_libraries.
+ * Graceful degradation:
+ * - No connection blocking.  Queries arriving before warming finishes
+ *   fall back to the recursive disk reconstruction path (correct but slower).
+ * - As warming progresses, subsequent queries benefit automatically.
  */
 
 #ifndef XPATCH_STARTUP_WARM_H
@@ -50,17 +46,20 @@
 #include "pg_xpatch.h"
 
 /*
- * Register the startup warming background worker.
- *
+ * Register the startup warming coordinator BGW.
  * Must be called from _PG_init() during shared_preload_libraries.
- * The worker starts once after recovery finishes and never restarts.
  */
 void xpatch_startup_warm_register_bgw(void);
 
 /*
- * Background worker entry point.
- * Exported so PostgreSQL can call it via bgw_function_name.
+ * Coordinator BGW entry point (static worker, connects to "postgres").
  */
 PGDLLEXPORT void xpatch_startup_warm_worker_main(Datum main_arg);
+
+/*
+ * Per-database worker entry point (dynamic worker).
+ * main_arg is the database OID to connect to.
+ */
+PGDLLEXPORT void xpatch_startup_warm_db_worker_main(Datum main_arg);
 
 #endif /* XPATCH_STARTUP_WARM_H */

@@ -16,7 +16,7 @@ All notable changes to pg-xpatch will be documented in this file.
 
 - **Path planner** — Bottom-up dynamic programming algorithm that computes the minimum-cost reconstruction path for a given target sequence. Considers all available anchors (keyframes on disk, L1 entries, L2 entries, L3 entries) and picks the cheapest chain of apply-delta steps. Replaces the old recursive reconstruction which always walked back to the nearest keyframe. Exposed via `xpatch.plan_path()` for debugging.
 
-- **Startup warming background worker** — One-shot BGW that runs after PostgreSQL starts. Performs a single sequential scan of each xpatch table's heap to repopulate the L2 cache and chain index from on-disk deltas. This means L2 is warm within seconds of a restart instead of requiring manual `warm_cache_parallel()` calls.
+- **Multi-database startup warming** — Two-tier background worker system that runs after PostgreSQL starts. A coordinator BGW connects to `postgres`, enumerates all connectable databases via `pg_database`, and launches a dynamic per-DB worker for each one. Each per-DB worker scans all xpatch tables in its database to repopulate the L2 cache and chain index from on-disk deltas. This means L2 is warm across all databases within seconds of a restart. Additionally, the read path now backfills L2 when the planner falls back to disk, ensuring L2 stays populated even after eviction.
 
 - **L3 eviction background worker** — Periodic BGW (default every 60s) that enforces per-table `l3_cache_max_size_mb` limits by deleting the oldest L3 entries (by `cached_at`). Uses an in-memory ring buffer (`l3_access_buffer_size`, default 8192) for access tracking without per-read writes to the L3 table.
 

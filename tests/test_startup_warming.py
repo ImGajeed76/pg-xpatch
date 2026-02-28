@@ -1,20 +1,21 @@
 """
 Test startup warming background worker.
 
-The startup warming worker runs once after PostgreSQL recovery finishes.
-It connects to the ``postgres`` database and performs a single-pass scan
-of all xpatch tables, building the chain index and populating L2 cache.
+The startup warming system uses a two-tier architecture:
 
-Since tests use ephemeral ``xptest_*`` databases (not ``postgres``), we
-cannot directly observe the warming worker operating on test tables.
-Instead we:
+  - A **coordinator** BGW starts after recovery, connects to ``postgres``,
+    enumerates all connectable databases via ``pg_database``, and launches
+    a dynamic per-DB worker for each one.
+  - Each **per-DB worker** connects to its target database and scans all
+    xpatch tables, building the chain index and populating L2 cache.
 
-  1. Verify the BGW is registered and runs (check PG logs after restart)
-  2. Verify it exits cleanly (one-shot: BGW_NEVER_RESTART)
-  3. Verify that data remains readable after restart (fallback path works)
-  4. Verify chain index + L2 are populated via INSERT path (not warming)
-     and that plan_path returns valid plans after restart
-  5. Test with empty tables, multiple tables
+Tests verify:
+
+  1. The coordinator BGW is registered and runs (check PG logs after restart)
+  2. Workers exit cleanly (one-shot: BGW_NEVER_RESTART)
+  3. Data remains readable after restart
+  4. Chain index + L2 are populated via INSERT path and warming worker
+  5. Edge cases: empty tables, multiple tables
 """
 
 from __future__ import annotations
@@ -55,8 +56,8 @@ def _pg_log_since_restart(n_lines: int = 50) -> str:
         return ""
 
 
-def _worker_log_present(log: str, *, pattern: str = "xpatch startup warming worker started") -> bool:
-    """Check if the startup warming worker logged its startup message."""
+def _worker_log_present(log: str, *, pattern: str = "xpatch startup warming coordinator started") -> bool:
+    """Check if the startup warming coordinator logged its startup message."""
     return pattern in log
 
 
@@ -221,9 +222,9 @@ class TestChainIndexAfterRestart:
             assert row is not None
             assert row["content"] == "chain v5"
 
-            # Now chain index should be populated (the read path fills it).
-            # plan_path should work, but may return empty if chain index
-            # wasn't populated by the warming worker (runs in postgres DB).
+            # Now chain index should be populated — either by the multi-DB
+            # warming worker (which warms all databases) or by the read
+            # path which populates chain index via the INSERT codepath.
             plan_after = new_conn.execute(
                 "SELECT * FROM xpatch.plan_path(%s::regclass, '1', 3::int2, 3::int8, false)",
                 [t],
@@ -267,8 +268,8 @@ class TestL2AfterRestart:
                 "SELECT * FROM xpatch.cache_stats()"
             ).fetchone()
 
-            # After restart, L2 should be empty (in test DB, warming
-            # worker operates on postgres DB, not this DB).
+            # After restart, L2 may have entries (the multi-DB warming
+            # worker now operates on all databases, including this one).
             # The important thing is it doesn't crash and stats are valid.
             assert stats_after is not None
         finally:
@@ -297,7 +298,7 @@ class TestStartupWarmEdgeCases:
 
         log = _pg_log_since_restart(200)
         # Worker should have started and completed without crash
-        assert "xpatch startup warming worker started" in log
+        assert "xpatch startup warming coordinator started" in log
         assert "PANIC" not in log, "Worker should not cause a PANIC"
 
         new_conn = _connect(db_name)

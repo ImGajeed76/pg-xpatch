@@ -1072,6 +1072,17 @@ xpatch_reconstruct_planned(Relation rel, XPatchConfig *config,
                     (uint8 *) VARDATA_ANY(delta_blob),
                     VARSIZE_ANY_EXHDR(delta_blob));
 
+                /* Backfill L2 with the compressed blob from disk */
+                if (xpatch_l2_cache_is_ready())
+                {
+                    xpatch_l2_cache_put(RelationGetRelid(rel), group_hash,
+                                        step_seq, attnum, delta_blob);
+                    xpatch_chain_index_update_bits(RelationGetRelid(rel),
+                                                   group_hash, attnum,
+                                                   step_seq,
+                                                   CHAIN_BIT_L2, 0);
+                }
+
                 pfree(delta_blob);
                 delta_blob = NULL;
 
@@ -1158,6 +1169,17 @@ xpatch_reconstruct_planned(Relation rel, XPatchConfig *config,
                         NULL, 0,
                         (uint8 *) VARDATA_ANY(delta_blob),
                         VARSIZE_ANY_EXHDR(delta_blob));
+
+                    /* Backfill L2 with the compressed keyframe from disk */
+                    if (xpatch_l2_cache_is_ready())
+                    {
+                        xpatch_l2_cache_put(RelationGetRelid(rel), group_hash,
+                                            step_seq, attnum, delta_blob);
+                        xpatch_chain_index_update_bits(RelationGetRelid(rel),
+                                                       group_hash, attnum,
+                                                       step_seq,
+                                                       CHAIN_BIT_L2, 0);
+                    }
 
                     pfree(delta_blob);
                     delta_blob = NULL;
@@ -1246,6 +1268,17 @@ xpatch_reconstruct_planned(Relation rel, XPatchConfig *config,
                     VARSIZE_ANY_EXHDR(running),
                     (uint8 *) VARDATA_ANY(delta_blob),
                     VARSIZE_ANY_EXHDR(delta_blob));
+
+                /* Backfill L2 with the compressed delta from disk */
+                if (xpatch_l2_cache_is_ready())
+                {
+                    xpatch_l2_cache_put(RelationGetRelid(rel), group_hash,
+                                        step_seq, attnum, delta_blob);
+                    xpatch_chain_index_update_bits(RelationGetRelid(rel),
+                                                   group_hash, attnum,
+                                                   step_seq,
+                                                   CHAIN_BIT_L2, 0);
+                }
 
                 pfree(delta_blob);
                 delta_blob = NULL;
