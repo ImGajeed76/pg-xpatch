@@ -1168,6 +1168,7 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
     Datum group_value = (Datum) 0;
     Oid group_typid = InvalidOid;
     bool group_isnull = false;
+    XPatchGroupHash group_hash;
     uint64 group_lock_id;
     Oid relid;
     BlockNumber blkno;
@@ -1346,8 +1347,9 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
      * Step 2: Acquire advisory lock on the group to prevent concurrent modifications
      */
     {
-        XPatchGroupHash group_hash = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
-        group_lock_id = xpatch_compute_group_lock_id(relid, group_hash);
+        XPatchGroupHash gh = xpatch_compute_group_hash(group_value, group_typid, group_isnull);
+        group_hash = gh;
+        group_lock_id = xpatch_compute_group_lock_id(relid, gh);
     }
     DirectFunctionCall1(pg_advisory_xact_lock_int8, Int64GetDatum((int64) group_lock_id));
     
@@ -1586,13 +1588,24 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
          deleted_count, target_seq);
     
     /*
-     * Step 5: Invalidate caches
+     * Step 5: Invalidate caches — targeted per-group invalidation.
+     *
+     * Only invalidate the affected group's entries (seq >= target_seq)
+     * instead of nuking the entire relation's caches. This preserves
+     * chain index, L1, L2, and L3 entries for unrelated groups.
      */
-    xpatch_cache_invalidate_rel(relid);
-    xpatch_insert_cache_invalidate_rel(relid);
-    xpatch_l2_cache_invalidate_rel(relid);
-    xpatch_l3_cache_invalidate_rel(relid);  /* L3 disk cache */
-    xpatch_chain_index_invalidate_rel(relid);
+    xpatch_cache_invalidate_group(relid, group_hash, target_seq);
+    xpatch_insert_cache_invalidate_rel(relid);  /* insert cache has no per-group API */
+    xpatch_l2_cache_invalidate_group(relid, group_hash, target_seq);
+    xpatch_l3_cache_invalidate_group(relid, group_hash, target_seq);
+    {
+        int dc;
+        for (dc = 0; dc < config->num_delta_columns; dc++)
+        {
+            xpatch_chain_index_delete(relid, group_hash,
+                                      config->delta_attnums[dc], target_seq);
+        }
+    }
 
     /*
      * Step 6: Update seq cache - new max_seq is target_seq - 1

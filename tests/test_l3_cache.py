@@ -419,17 +419,20 @@ class TestL3Invalidation:
     def test_delete_invalidates_l3(
         self, db: psycopg.Connection, make_table
     ):
-        """DELETE should invalidate L3 (drop the L3 table)."""
+        """DELETE should remove L3 entries for the deleted group."""
         t = make_table()
         enable_l3(db, t)
         insert_versions(db, t, group_id=1, count=5)
         assert l3_table_exists(db, t)
+        assert l3_count(db, t) > 0
 
         db.execute(f"DELETE FROM {t} WHERE group_id = 1")
 
-        # L3 table should be dropped on DELETE (invalidate_rel)
-        assert not l3_table_exists(db, t), \
-            "L3 table should be dropped after DELETE"
+        # L3 table still exists but all entries for the group are gone
+        assert l3_table_exists(db, t), \
+            "L3 table should still exist after per-group DELETE"
+        assert l3_count(db, t) == 0, \
+            "L3 entries for deleted group should be removed"
 
     def test_truncate_invalidates_l3(
         self, db: psycopg.Connection, make_table

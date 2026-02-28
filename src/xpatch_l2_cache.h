@@ -85,9 +85,16 @@ void xpatch_l2_cache_put(Oid relid, XPatchGroupHash group_hash,
 
 /*
  * Invalidate all L2 cache entries for a relation.
- * Called on DELETE/TRUNCATE/DROP. Also clears CHAIN_BIT_L2 in chain index.
+ * Called on TRUNCATE/DROP. Also clears CHAIN_BIT_L2 in chain index.
  */
 void xpatch_l2_cache_invalidate_rel(Oid relid);
+
+/*
+ * Invalidate L2 entries for a specific group with seq >= from_seq.
+ * Called on DELETE (cascade). More targeted than invalidate_rel.
+ */
+void xpatch_l2_cache_invalidate_group(Oid relid, XPatchGroupHash group_hash,
+                                       int64 from_seq);
 
 /*
  * Check if L2 cache is initialized and available.

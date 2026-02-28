@@ -33,11 +33,11 @@
  * ---------------------------------------------------------------------------
  */
 #define CHAIN_INDEX_NUM_STRIPES     16
-#define CHAIN_INDEX_DIR_SLOTS       4096    /* Initial directory hash slots */
 #define CHAIN_INDEX_LOAD_FACTOR_PCT 75      /* Grow directory at 75% full */
 
-/* GUC variable */
+/* GUC variables */
 int xpatch_chain_index_initial_capacity = 64;
+int xpatch_chain_index_dir_slots = 4096;
 
 /* ---------------------------------------------------------------------------
  * Directory entry — one slot in the open-addressing hash table
@@ -376,7 +376,7 @@ static Size
 chain_index_shmem_size(void)
 {
     return offsetof(ChainIndexShmem, dir_entries) +
-           (Size)CHAIN_INDEX_DIR_SLOTS * sizeof(ChainDirEntry);
+           (Size)xpatch_chain_index_dir_slots * sizeof(ChainDirEntry);
 }
 
 static void
@@ -425,7 +425,7 @@ chain_index_shmem_startup(void)
         /* Postmaster: initialize */
         memset(chain_index, 0, chain_index_shmem_size());
         chain_index->dsa_hdl = DSM_HANDLE_INVALID;
-        chain_index->dir_capacity = CHAIN_INDEX_DIR_SLOTS;
+        chain_index->dir_capacity = xpatch_chain_index_dir_slots;
         chain_index->dir_count = 0;
 
         pg_atomic_init_u64(&chain_index->insert_count, 0);
@@ -433,7 +433,7 @@ chain_index_shmem_startup(void)
         pg_atomic_init_u64(&chain_index->lookup_miss_count, 0);
         pg_atomic_init_u64(&chain_index->grow_count, 0);
 
-        for (i = 0; i < CHAIN_INDEX_DIR_SLOTS; i++)
+        for (i = 0; i < xpatch_chain_index_dir_slots; i++)
         {
             chain_index->dir_entries[i].in_use = false;
             chain_index->dir_entries[i].tombstone = false;
@@ -449,7 +449,7 @@ chain_index_shmem_startup(void)
     on_shmem_exit(chain_index_shmem_exit, (Datum)0);
 
     elog(LOG, "pg_xpatch: chain index initialized (%d directory slots, %d stripes)",
-         CHAIN_INDEX_DIR_SLOTS, CHAIN_INDEX_NUM_STRIPES);
+         xpatch_chain_index_dir_slots, CHAIN_INDEX_NUM_STRIPES);
 }
 
 /* ---------------------------------------------------------------------------

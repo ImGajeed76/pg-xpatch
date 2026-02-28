@@ -380,7 +380,7 @@ xpatch_l3_cache_get(Oid relid, XPatchGroupHash group_hash,
              * SPI memory is freed on SPI_finish().
              */
             spi_content = DatumGetByteaPP(datum);
-            content_size = VARSIZE(spi_content);
+            content_size = VARSIZE_ANY(spi_content);
             result = (bytea *) palloc(content_size);
             memcpy(result, spi_content, content_size);
         }
@@ -527,6 +527,51 @@ xpatch_l3_cache_invalidate(Oid relid, XPatchGroupHash group_hash,
         xpatch_chain_index_update_bits(relid, group_hash, attnum, seq,
                                        0, CHAIN_BIT_L3);
     }
+}
+
+void
+xpatch_l3_cache_invalidate_group(Oid relid, XPatchGroupHash group_hash,
+                                  int64 from_seq)
+{
+    char       *l3_table;
+    char       *sql;
+    Oid         argtypes[3] = { INT8OID, INT8OID, INT8OID };
+    Datum       values[3];
+    char        nulls[3] = { ' ', ' ', ' ' };
+
+    if (!l3_table_exists(relid))
+        return;
+
+    l3_table = xpatch_l3_cache_table_name(relid);
+    if (l3_table == NULL)
+        return;
+
+    values[0] = Int64GetDatum((int64) group_hash.h1);
+    values[1] = Int64GetDatum((int64) group_hash.h2);
+    values[2] = Int64GetDatum(from_seq);
+
+    if (SPI_connect() != SPI_OK_CONNECT)
+    {
+        pfree(l3_table);
+        return;
+    }
+
+    sql = psprintf(
+        "DELETE FROM %s "
+        "WHERE group_hash_h1 = $1 AND group_hash_h2 = $2 "
+        "  AND seq >= $3",
+        l3_table);
+
+    SPI_execute_with_args(sql, 3, argtypes, values, nulls, false, 0);
+    pfree(sql);
+
+    SPI_finish();
+    pfree(l3_table);
+
+    /*
+     * Note: CHAIN_BIT_L3 bits cleared by the caller via
+     * xpatch_chain_index_delete() which zeros all entries >= from_seq.
+     */
 }
 
 void

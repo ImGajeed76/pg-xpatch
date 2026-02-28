@@ -103,6 +103,14 @@ void xpatch_l3_cache_invalidate(Oid relid, XPatchGroupHash group_hash,
                                 int64 seq, AttrNumber attnum);
 
 /*
+ * Invalidate L3 entries for a group with seq >= from_seq.
+ *
+ * Called on cascade DELETE. Removes matching entries from the L3 table.
+ */
+void xpatch_l3_cache_invalidate_group(Oid relid, XPatchGroupHash group_hash,
+                                       int64 from_seq);
+
+/*
  * Drop the L3 cache table for a relation.
  *
  * Called by xpatch.drop_l3_cache() SQL function. Drops the L3 table

@@ -396,7 +396,9 @@ l2_evict_lru(L2CacheStripe *stripe, L2CacheEntry *entries, char *slots_base)
 
     /*
      * Clear CHAIN_BIT_L2 in chain index for evicted entry.
-     * This is a lockless byte write — safe to do while holding stripe lock.
+     * update_bits takes an exclusive chain index stripe lock, so the lock
+     * ordering here is: L2 stripe → chain index stripe (always safe,
+     * no code path acquires them in reverse).
      */
     if (xpatch_chain_index_is_ready())
     {
@@ -952,6 +954,55 @@ xpatch_l2_cache_invalidate_rel(Oid relid)
                  * lookups for entries sharing this probe chain would
                  * stop early and miss valid entries.
                  */
+                e->in_use = false;
+                e->tombstone = true;
+                e->slot_index = -1;
+                e->content_size = 0;
+                e->num_slots = 0;
+
+                stripe->num_entries--;
+            }
+        }
+
+        LWLockRelease(stripe->lock);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Public API: per-group invalidation
+ * ---------------------------------------------------------------------------
+ */
+void
+xpatch_l2_cache_invalidate_group(Oid relid, XPatchGroupHash group_hash,
+                                  int64 from_seq)
+{
+    int s;
+
+    if (!l2_initialized || l2_cache == NULL)
+        return;
+
+    for (s = 0; s < l2_cache->num_stripes; s++)
+    {
+        L2CacheStripe *stripe = &l2_cache->stripes[s];
+        L2CacheEntry *entries = l2_stripe_entries[s];
+        char *slots_base = l2_stripe_slots[s];
+        int i;
+
+        LWLockAcquire(stripe->lock, LW_EXCLUSIVE);
+
+        for (i = 0; i < stripe->max_entries; i++)
+        {
+            L2CacheEntry *e = &entries[i];
+
+            if (e->in_use && e->key.relid == relid &&
+                xpatch_group_hash_equals(e->key.group_hash, group_hash) &&
+                e->key.seq >= from_seq)
+            {
+                l2_lru_remove(stripe, entries, e, i);
+
+                if (e->slot_index >= 0)
+                    l2_free_slots(stripe, slots_base, e->slot_index);
+
                 e->in_use = false;
                 e->tombstone = true;
                 e->slot_index = -1;

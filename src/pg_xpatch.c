@@ -323,6 +323,22 @@ _PG_init(void)
             NULL, NULL, NULL
         );
 
+        DefineCustomIntVariable(
+            "pg_xpatch.chain_index_dir_slots",
+            "Number of directory hash slots in the chain index",
+            "Controls the maximum number of unique (table, column, group) "
+            "combinations the chain index can track. Each xpatch table "
+            "with N groups and M delta columns uses N*M slots. Increase "
+            "this for large datasets with many groups.",
+            &xpatch_chain_index_dir_slots,
+            4096,                            /* default */
+            256,                             /* min */
+            INT_MAX,                         /* max */
+            PGC_POSTMASTER,
+            0,
+            NULL, NULL, NULL
+        );
+
         /* --- L2 cache GUCs --- */
 
         DefineCustomIntVariable(

@@ -31,6 +31,7 @@
 #define XPATCH_CACHE_H
 
 #include "pg_xpatch.h"
+#include "xpatch_hash.h"
 
 /*
  * Request shared memory space for the cache.
@@ -78,6 +79,13 @@ void xpatch_cache_put(Oid relid, Datum group_value, Oid typid, int64 seq,
  * Called when a relation is dropped or truncated.
  */
 void xpatch_cache_invalidate_rel(Oid relid);
+
+/*
+ * Invalidate cache entries for a specific group with seq >= from_seq.
+ * Called on DELETE (cascade). More targeted than invalidate_rel.
+ */
+void xpatch_cache_invalidate_group(Oid relid, XPatchGroupHash group_hash,
+                                    int64 from_seq);
 
 /*
  * Get cache statistics.

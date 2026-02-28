@@ -382,7 +382,9 @@ evict_lru_entry(XPatchCacheStripe *stripe, XPatchCacheEntry *entries,
 
     /*
      * Clear CHAIN_BIT_L1 in chain index for evicted entry.
-     * Lockless byte write — safe while holding stripe lock.
+     * update_bits takes an exclusive chain index stripe lock, so the lock
+     * ordering here is: L1 stripe → chain index stripe (always safe,
+     * no code path acquires them in reverse).
      */
     if (xpatch_chain_index_is_ready())
     {
@@ -488,7 +490,7 @@ find_free_entry_for_key(XPatchCacheEntry *entries, int32 max_entries,
 static void
 copy_to_slots(char *slots_base, int32 first_slot, const bytea *content)
 {
-    Size content_len = VARSIZE(content);
+    Size content_len = VARSIZE_ANY(content);
     const char *src = (const char *) content;
     Size remaining = content_len;
     int32 slot = first_slot;
@@ -1020,6 +1022,55 @@ xpatch_cache_invalidate_rel(Oid relid)
                     free_slots(stripe, slots_base, entry->slot_index);
 
                 entry->in_use = false;
+                entry->slot_index = -1;
+                entry->content_size = 0;
+                entry->num_slots = 0;
+
+                stripe->num_entries--;
+            }
+        }
+
+        LWLockRelease(stripe->lock);
+    }
+}
+
+/*
+ * Invalidate cache entries for a specific group with seq >= from_seq.
+ * More targeted than invalidate_rel — only removes the affected group/seqs.
+ */
+void
+xpatch_cache_invalidate_group(Oid relid, XPatchGroupHash group_hash,
+                               int64 from_seq)
+{
+    int s;
+
+    if (!shmem_initialized || shared_cache == NULL)
+        return;
+
+    for (s = 0; s < shared_cache->num_stripes; s++)
+    {
+        XPatchCacheStripe *stripe = &shared_cache->stripes[s];
+        XPatchCacheEntry *entries = stripe_entries_base[s];
+        char *slots_base = stripe_slots_base[s];
+        int i;
+
+        LWLockAcquire(stripe->lock, LW_EXCLUSIVE);
+
+        for (i = 0; i < stripe->max_entries; i++)
+        {
+            XPatchCacheEntry *entry = &entries[i];
+
+            if (entry->in_use && entry->key.relid == relid &&
+                xpatch_group_hash_equals(entry->key.group_hash, group_hash) &&
+                entry->key.seq >= from_seq)
+            {
+                lru_remove(stripe, entries, entry, i);
+
+                if (entry->slot_index >= 0)
+                    free_slots(stripe, slots_base, entry->slot_index);
+
+                entry->in_use = false;
+                entry->tombstone = true;
                 entry->slot_index = -1;
                 entry->content_size = 0;
                 entry->num_slots = 0;

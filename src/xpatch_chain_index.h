@@ -19,7 +19,7 @@
  * Locking:
  *   - Directory reads (chain walks): shared lock on stripe
  *   - Directory writes (INSERT/DELETE): exclusive lock on stripe
- *   - cache_bits updates: lockless single-byte atomic writes (x86)
+ *   - cache_bits updates: exclusive lock on stripe (|= / &= is non-atomic RMW)
  */
 
 #ifndef XPATCH_CHAIN_INDEX_H
@@ -141,6 +141,7 @@ typedef struct ChainWalkResult
  * ---------------------------------------------------------------------------
  */
 extern int xpatch_chain_index_initial_capacity;
+extern int xpatch_chain_index_dir_slots;
 
 /* ---------------------------------------------------------------------------
  * Public API
@@ -182,7 +183,7 @@ extern bool xpatch_chain_index_get_chain(Oid relid, XPatchGroupHash group_hash,
                                           ChainWalkResult *result);
 
 /*
- * Update cache_bits for a specific entry. Lockless single-byte write.
+ * Update cache_bits for a specific entry under exclusive stripe lock.
  * Used by L1/L2/L3 caches on put/evict to keep the index current.
  *
  * set_bits:   bits to OR into cache_bits  (e.g., CHAIN_BIT_L1)
