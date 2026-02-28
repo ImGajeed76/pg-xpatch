@@ -34,6 +34,8 @@
 #include "xpatch_storage.h"
 #include "xpatch_stats_cache.h"
 #include "xpatch_l2_cache.h"
+#include "xpatch_chain_index.h"
+#include "xpatch_path_planner.h"
 
 #include "access/amapi.h"
 #include "access/heapam.h"
@@ -866,5 +868,170 @@ xpatch_physical(PG_FUNCTION_ARGS)
     }
 
     table_close(ctx->rel, AccessShareLock);
+    SRF_RETURN_DONE(funcctx);
+}
+
+/* ---------------------------------------------------------------------------
+ * xpatch_plan_path_fn — SQL-callable path planner for testing/inspection
+ * ---------------------------------------------------------------------------
+ * SQL signature:
+ *   xpatch.plan_path(rel regclass, group_value text, attnum int2,
+ *                    target_seq int8, enable_zstd bool DEFAULT true)
+ *   RETURNS TABLE(step_num int4, seq int8, action text, total_cost_ns int8)
+ *
+ * Computes the optimal reconstruction path for a given target version using
+ * the chain index and bottom-up DP path planner.
+ *
+ * Returns one row per step in the path (anchor first, target last).
+ * Returns no rows if the chain index is not ready or the group is not found.
+ */
+typedef struct PlanPathContext
+{
+    PathPlan   *plan;
+    int32       current_step;
+} PlanPathContext;
+
+PG_FUNCTION_INFO_V1(xpatch_plan_path_fn);
+Datum
+xpatch_plan_path_fn(PG_FUNCTION_ARGS)
+{
+    FuncCallContext    *funcctx;
+    PlanPathContext    *ctx;
+    TupleDesc           tupdesc;
+
+    if (SRF_IS_FIRSTCALL())
+    {
+        MemoryContext   oldcontext;
+        Oid             relid;
+        AttrNumber      attnum;
+        int64           target_seq;
+        bool            enable_zstd;
+        XPatchGroupHash group_hash;
+        ChainWalkResult chain;
+
+        funcctx = SRF_FIRSTCALL_INIT();
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        /* Parse arguments */
+        relid = PG_GETARG_OID(0);
+
+        if (PG_ARGISNULL(1))
+        {
+            /* NULL group -> zero hash (ungrouped table) */
+            group_hash.h1 = 0;
+            group_hash.h2 = 0;
+        }
+        else
+        {
+            /*
+             * Compute group hash using the table's actual group column type.
+             * The text input is cast to the group column type via its input
+             * function, then hashed with the correct type OID. This ensures
+             * the hash matches what the INSERT path stored in the chain index.
+             */
+            Relation    rel;
+            XPatchConfig *config;
+            text       *group_text = PG_GETARG_TEXT_PP(1);
+            char       *group_cstr = text_to_cstring(group_text);
+
+            rel = table_open(relid, AccessShareLock);
+            config = xpatch_get_config(rel);
+
+            if (config->group_by_attnum != InvalidAttrNumber)
+            {
+                TupleDesc   tdesc = RelationGetDescr(rel);
+                Form_pg_attribute grp_attr = TupleDescAttr(tdesc,
+                                                config->group_by_attnum - 1);
+                Oid         grp_typid = grp_attr->atttypid;
+                Oid         typinput;
+                Oid         typioparam;
+                Datum       group_datum;
+
+                getTypeInputInfo(grp_typid, &typinput, &typioparam);
+                group_datum = OidInputFunctionCall(typinput, group_cstr,
+                                                   typioparam, -1);
+                group_hash = xpatch_compute_group_hash(group_datum,
+                                                       grp_typid, false);
+            }
+            else
+            {
+                group_hash.h1 = 0;
+                group_hash.h2 = 0;
+            }
+
+            table_close(rel, AccessShareLock);
+            pfree(group_cstr);
+        }
+
+        attnum = PG_GETARG_INT16(2);
+        target_seq = PG_GETARG_INT64(3);
+        enable_zstd = PG_ARGISNULL(4) ? true : PG_GETARG_BOOL(4);
+
+        /* Allocate context */
+        ctx = (PlanPathContext *) palloc0(sizeof(PlanPathContext));
+        ctx->plan = NULL;
+        ctx->current_step = 0;
+
+        /* Try to plan if chain index is ready */
+        if (xpatch_chain_index_is_ready() &&
+            xpatch_chain_index_get_chain(relid, group_hash, attnum, &chain))
+        {
+            PathPlan *raw_plan;
+
+            raw_plan = xpatch_plan_path(&chain, target_seq, enable_zstd);
+
+            /* Copy plan into multi-call memory context */
+            if (raw_plan != NULL)
+            {
+                Size plan_size = offsetof(PathPlan, steps) +
+                                 raw_plan->num_steps * sizeof(PathStep);
+                ctx->plan = (PathPlan *) palloc(plan_size);
+                memcpy(ctx->plan, raw_plan, plan_size);
+                pfree(raw_plan);
+            }
+
+            pfree(chain.entries);
+        }
+
+        funcctx->user_fctx = ctx;
+
+        /* Build tupdesc: (step_num int4, seq int8, action text, total_cost_ns int8) */
+        tupdesc = CreateTemplateTupleDesc(4);
+        TupleDescInitEntry(tupdesc, (AttrNumber) 1, "step_num",
+                           INT4OID, -1, 0);
+        TupleDescInitEntry(tupdesc, (AttrNumber) 2, "seq",
+                           INT8OID, -1, 0);
+        TupleDescInitEntry(tupdesc, (AttrNumber) 3, "action",
+                           TEXTOID, -1, 0);
+        TupleDescInitEntry(tupdesc, (AttrNumber) 4, "total_cost_ns",
+                           INT8OID, -1, 0);
+        funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    ctx = (PlanPathContext *) funcctx->user_fctx;
+
+    if (ctx->plan != NULL && ctx->current_step < ctx->plan->num_steps)
+    {
+        Datum       values[4];
+        bool        nulls[4];
+        HeapTuple   tuple;
+        PathStep   *step = &ctx->plan->steps[ctx->current_step];
+
+        memset(nulls, 0, sizeof(nulls));
+
+        values[0] = Int32GetDatum(ctx->current_step + 1);
+        values[1] = Int64GetDatum(step->seq);
+        values[2] = CStringGetTextDatum(path_action_name(step->action));
+        values[3] = Int64GetDatum(ctx->plan->total_cost_ns);
+
+        tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+
+        ctx->current_step++;
+        SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+    }
+
     SRF_RETURN_DONE(funcctx);
 }

@@ -444,6 +444,25 @@ LANGUAGE C STRICT;
 
 COMMENT ON FUNCTION xpatch_l2_cache_stats() IS 'Get L2 compressed delta cache statistics';
 
+-- Path planner C function
+CREATE FUNCTION xpatch_plan_path(
+    rel         regclass,
+    group_value text,
+    attnum      int2,
+    target_seq  int8,
+    enable_zstd bool DEFAULT true
+)
+RETURNS TABLE (
+    step_num        INT4,
+    seq             INT8,
+    action          TEXT,
+    total_cost_ns   INT8
+) AS 'MODULE_PATHNAME', 'xpatch_plan_path_fn'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION xpatch_plan_path(regclass, text, int2, int8, bool) IS
+    'Compute optimal reconstruction path for a target version using bottom-up DP';
+
 -- Utility function: Get xpatch library version
 CREATE FUNCTION xpatch_version()
 RETURNS TEXT AS 'MODULE_PATHNAME', 'pg_xpatch_version'
@@ -903,6 +922,26 @@ RETURNS TABLE (
 $$ LANGUAGE SQL STABLE;
 
 COMMENT ON FUNCTION xpatch.l2_cache_stats() IS 'Get L2 compressed delta cache statistics';
+
+-- xpatch.plan_path() - wrapper for xpatch_plan_path()
+CREATE OR REPLACE FUNCTION xpatch.plan_path(
+    rel         regclass,
+    group_value text,
+    attnum      int2,
+    target_seq  int8,
+    enable_zstd bool DEFAULT true
+)
+RETURNS TABLE (
+    step_num        INT4,
+    seq             INT8,
+    action          TEXT,
+    total_cost_ns   INT8
+) AS $$
+    SELECT * FROM xpatch_plan_path(rel, group_value, attnum, target_seq, enable_zstd);
+$$ LANGUAGE SQL STABLE;
+
+COMMENT ON FUNCTION xpatch.plan_path(regclass, text, int2, int8, bool) IS
+    'Compute optimal reconstruction path for a target version using bottom-up DP';
 
 -- ============================================================================
 -- xpatch_physical() - C function for raw physical delta access
