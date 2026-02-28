@@ -426,7 +426,7 @@ l2_evict_lru(L2CacheStripe *stripe, L2CacheEntry *entries, char *slots_base)
 static void
 l2_copy_to_slots(char *base, int32 first_slot, const bytea *content)
 {
-    Size total = VARSIZE(content);
+    Size total = VARSIZE_ANY(content);
     const char *src = (const char *) content;
     Size remaining = total;
     int32 slot = first_slot;
@@ -800,7 +800,25 @@ xpatch_l2_cache_put(Oid relid, XPatchGroupHash group_hash,
     if (!l2_initialized || l2_cache == NULL || delta == NULL)
         return;
 
-    content_size = VARSIZE(delta);
+    /*
+     * Guard: reject external TOAST pointers. L2 copies raw varlena
+     * bytes into shared memory; a TOAST pointer would store the pointer
+     * structure, not the actual data.  Callers should detoast before
+     * calling l2_cache_put.
+     */
+    if (VARATT_IS_EXTERNAL(delta))
+    {
+        elog(DEBUG1, "pg_xpatch: L2 cache rejecting external TOAST pointer");
+        return;
+    }
+
+    /*
+     * Use VARSIZE_ANY to handle both 1-byte (short) and 4-byte varlena
+     * headers correctly.  DatumGetByteaPP / PG_DETOAST_DATUM_PACKED may
+     * return a short-varlena; plain VARSIZE assumes 4-byte header and
+     * would read garbage.
+     */
+    content_size = VARSIZE_ANY(delta);
 
     /* Reject entries exceeding size limit */
     if (content_size > (Size)xpatch_l2_cache_max_entry_kb * 1024)
@@ -928,8 +946,14 @@ xpatch_l2_cache_invalidate_rel(Oid relid)
                  * No chain index update here — the caller
                  * (xpatch_tam.c) handles chain index invalidation
                  * separately via xpatch_chain_index_invalidate_rel().
+                 *
+                 * IMPORTANT: Must set tombstone = true to preserve
+                 * linear probing chains. Without it, subsequent
+                 * lookups for entries sharing this probe chain would
+                 * stop early and miss valid entries.
                  */
                 e->in_use = false;
+                e->tombstone = true;
                 e->slot_index = -1;
                 e->content_size = 0;
                 e->num_slots = 0;

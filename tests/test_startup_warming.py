@@ -77,7 +77,7 @@ class TestStartupWarmWorker:
         # Give the worker a moment to run (it's one-shot and very fast)
         time.sleep(1)
 
-        log = _pg_log_since_restart(60)
+        log = _pg_log_since_restart(200)
         assert _worker_log_present(log), (
             "Expected 'xpatch startup warming worker started' in PG log "
             "after restart"
@@ -104,7 +104,7 @@ class TestStartupWarmWorker:
         pg_ctl.restart()
         time.sleep(1)
 
-        log = _pg_log_since_restart(60)
+        log = _pg_log_since_restart(200)
         assert "xpatch startup warming complete:" in log or \
                "xpatch startup warm:" in log, \
             "Expected warming completion message in PG log"
@@ -295,7 +295,7 @@ class TestStartupWarmEdgeCases:
         pg_ctl.restart()
         time.sleep(1)
 
-        log = _pg_log_since_restart(60)
+        log = _pg_log_since_restart(200)
         # Worker should have started and completed without crash
         assert "xpatch startup warming worker started" in log
         assert "PANIC" not in log, "Worker should not cause a PANIC"

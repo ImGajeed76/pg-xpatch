@@ -296,10 +296,17 @@ ensure_entry_capacity(GroupChainHeader *header, int32 new_count)
 
     ensure_dsa_attached();
 
-    /* Double capacity until sufficient */
+    /* Double capacity until sufficient, with overflow guard */
     new_capacity = header->capacity > 0 ? header->capacity : xpatch_chain_index_initial_capacity;
     while (new_capacity < new_count)
+    {
+        if (new_capacity > INT32_MAX / 2)
+        {
+            elog(WARNING, "xpatch_chain_index: capacity overflow (%d entries)", new_capacity);
+            return false;
+        }
         new_capacity *= 2;
+    }
 
     new_ptr = dsa_allocate_extended(chain_index_dsa,
                                      (Size)new_capacity * sizeof(ChainIndexEntry),
@@ -348,9 +355,12 @@ get_entry_ptr(GroupChainHeader *header, int64 seq)
     if (seq < header->base_seq || seq > header->max_seq)
         return NULL;
 
-    idx = (int32)(seq - header->base_seq);
-    if (idx < 0 || idx >= header->count)
-        return NULL;
+    {
+        int64 idx64 = seq - header->base_seq;
+        if (idx64 < 0 || idx64 >= (int64)header->count || idx64 > (int64)INT32_MAX)
+            return NULL;
+        idx = (int32) idx64;
+    }
 
     ensure_dsa_attached();
     entries = (ChainIndexEntry *)dsa_get_address(chain_index_dsa, header->entries_ptr);
@@ -589,7 +599,12 @@ xpatch_chain_index_insert(Oid relid, XPatchGroupHash group_hash,
     if (entry != NULL)
     {
         chain_entry_set_base_offset(entry, base_offset);
-        entry->cache_bits = cache_bits;
+        /*
+         * Merge cache_bits with |= instead of overwriting.  A concurrent
+         * INSERT may have already set CHAIN_BIT_L2 or CHAIN_BIT_L3 via
+         * update_bits; overwriting with = would lose those bits.
+         */
+        entry->cache_bits |= cache_bits;
     }
 
     LWLockRelease(&chain_index_locks[stripe].lock);
@@ -735,12 +750,11 @@ xpatch_chain_index_update_bits(Oid relid, XPatchGroupHash group_hash,
     stripe = chain_stripe_for_key(&key);
 
     /*
-     * Take shared lock just to find the entry pointer. The actual
-     * byte write to cache_bits is atomic on x86 (single byte store).
-     * A stale read by another backend would cause a suboptimal but
-     * correct path choice.
+     * Take exclusive lock because cache_bits update is a
+     * read-modify-write (|= / &=) that is NOT atomic even on x86.
+     * Two concurrent shared-lock holders doing |= can lose updates.
      */
-    LWLockAcquire(&chain_index_locks[stripe].lock, LW_SHARED);
+    LWLockAcquire(&chain_index_locks[stripe].lock, LW_EXCLUSIVE);
 
     dir_idx = dir_find(&key);
     if (dir_idx < 0)

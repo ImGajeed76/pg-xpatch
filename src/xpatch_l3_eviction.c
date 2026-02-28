@@ -459,9 +459,13 @@ eviction_pass(void)
         }
 
         /* Get current L3 table size */
-        sql = psprintf(
-            "SELECT pg_total_relation_size('%s'::regclass)",
-            l3_table);
+        {
+            char *quoted_lit = quote_literal_cstr(l3_table);
+            sql = psprintf(
+                "SELECT pg_total_relation_size(%s::regclass)",
+                quoted_lit);
+            pfree(quoted_lit);
+        }
 
         ret = SPI_execute(sql, true, 1);
         pfree(sql);

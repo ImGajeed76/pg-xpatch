@@ -126,14 +126,30 @@ char *
 xpatch_l3_cache_table_name(Oid relid)
 {
     char   *relname;
+    char   *l3name;
+    const char *quoted;
     char   *result;
 
     relname = get_rel_name(relid);
     if (relname == NULL)
         return NULL;
 
-    result = psprintf("xpatch.\"%s_xp_l3\"", relname);
+    /*
+     * Build the L3 table name, properly quoting to prevent SQL injection
+     * if the relation name contains special characters (e.g., double
+     * quotes).  quote_identifier() returns a palloc'd string only when
+     * quoting is needed; otherwise it returns the input pointer.
+     */
+    l3name = psprintf("%s_xp_l3", relname);
     pfree(relname);
+
+    quoted = quote_identifier(l3name);
+    result = psprintf("xpatch.%s", quoted);
+
+    if (quoted != l3name)
+        pfree((char *) quoted);
+    pfree(l3name);
+
     return result;
 }
 

@@ -144,6 +144,14 @@ xpatch_plan_path(const ChainWalkResult *chain, int64 target_seq,
     {
         cur_idx = (int32)(cur_seq - chain->base_seq);
 
+        /* Cycle / infinite-loop guard: can never visit more entries than exist */
+        if (chain_len > chain->count)
+        {
+            elog(DEBUG1, "xpatch path_planner: cycle detected after %d steps",
+                 chain_len);
+            goto cleanup;
+        }
+
         /* Bounds check */
         if (cur_idx < 0 || cur_idx >= chain->count)
         {

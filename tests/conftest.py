@@ -210,7 +210,7 @@ def _pg_is_ready(container: str = CONTAINER_NAME) -> bool:
 def _pg_restart(container: str = CONTAINER_NAME, timeout: int = 30) -> None:
     """Graceful restart of PostgreSQL inside the container."""
     _docker_exec(
-        "su postgres -c 'pg_ctl -D $PGDATA restart -w -t 10'",
+        "su postgres -c 'pg_ctl -D $PGDATA restart -w -t 10 -l /tmp/pg.log'",
         container=container, timeout=timeout,
     )
 

@@ -311,6 +311,9 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
             
             /*
              * MVCC visibility check: skip tuples that are not visible.
+             *
+             * Handles HEAP_XMAX_IS_MULTI (MultiXactId in xmax) and
+             * HEAP_XMAX_LOCK_ONLY (row-locked but not deleted).
              */
             {
                 TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple.t_data);
@@ -329,10 +332,27 @@ xpatch_get_max_seq(Relation rel, XPatchConfig *config, Datum group_value)
                  */
                 if (!(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
                 {
-                    TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
-                    if (TransactionIdDidCommit(xmax) ||
-                        TransactionIdIsCurrentTransactionId(xmax))
-                        continue;
+                    /* Lock-only xmax means the row is NOT deleted */
+                    if (tuple.t_data->t_infomask & HEAP_XMAX_LOCK_ONLY)
+                        ; /* visible — fall through */
+                    else if (tuple.t_data->t_infomask & HEAP_XMAX_IS_MULTI)
+                    {
+                        /*
+                         * MultiXactId in xmax.  Conservatively treat as
+                         * visible.  The tuple may just be locked, not
+                         * deleted.  A false positive is harmless for
+                         * max_seq (we might see a slightly too-high seq
+                         * from a tuple being concurrently deleted, but
+                         * that's the same race as without this check).
+                         */
+                    }
+                    else
+                    {
+                        TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+                        if (TransactionIdDidCommit(xmax) ||
+                            TransactionIdIsCurrentTransactionId(xmax))
+                            continue;
+                    }
                 }
             }
             
@@ -1334,6 +1354,17 @@ xpatch_try_planned_reconstruct(Relation rel, XPatchConfig *config,
  * 
  * Results are cached in the LRU content cache to avoid redundant decompression.
  */
+/*
+ * Maximum recursion depth for the fallback reconstruction path.
+ * Bounded by keyframe_every in practice (default 10), but we add
+ * a hard limit to prevent stack overflow with corrupt data or
+ * extreme keyframe_every settings.
+ */
+#define RECONSTRUCT_MAX_DEPTH 256
+
+/* Thread-local recursion depth counter */
+static int reconstruct_depth = 0;
+
 static bytea *
 xpatch_reconstruct_from_delta(Relation rel, XPatchConfig *config,
                                Datum group_value, int64 seq,
@@ -1345,6 +1376,16 @@ xpatch_reconstruct_from_delta(Relation rel, XPatchConfig *config,
     bytea *base_content;
     int64 base_seq;
     AttrNumber attnum;
+
+    if (reconstruct_depth >= RECONSTRUCT_MAX_DEPTH)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("xpatch: recursive reconstruction exceeded "
+                        "maximum depth %d at seq=" INT64_FORMAT,
+                        RECONSTRUCT_MAX_DEPTH, seq)));
+    }
+    reconstruct_depth++;
     
     attnum = config->delta_attnums[delta_col_index];
     
@@ -1407,6 +1448,7 @@ xpatch_reconstruct_from_delta(Relation rel, XPatchConfig *config,
         xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid, seq, attnum, result);
     }
     
+    reconstruct_depth--;
     return result;
 }
 

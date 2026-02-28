@@ -244,7 +244,9 @@ warm_single_table(Oid relid)
 
             /*
              * MVCC visibility check: skip uncommitted/deleted tuples.
-             * Follows the same pattern as xpatch_get_max_seq().
+             *
+             * Handles HEAP_XMAX_IS_MULTI (MultiXactId in xmax) and
+             * HEAP_XMAX_LOCK_ONLY (row-locked but not deleted).
              */
             {
                 TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple.t_data);
@@ -255,10 +257,28 @@ warm_single_table(Oid relid)
 
                 if (!(tuple.t_data->t_infomask & HEAP_XMAX_INVALID))
                 {
-                    TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
-                    if (TransactionIdDidCommit(xmax) ||
-                        TransactionIdIsCurrentTransactionId(xmax))
-                        continue;
+                    /* Lock-only xmax means the row is NOT deleted */
+                    if (tuple.t_data->t_infomask & HEAP_XMAX_LOCK_ONLY)
+                        ; /* visible — fall through */
+                    else if (tuple.t_data->t_infomask & HEAP_XMAX_IS_MULTI)
+                    {
+                        /*
+                         * MultiXactId in xmax — conservatively treat
+                         * as visible (the row may be locked, not deleted).
+                         * A proper check would use MultiXactIdIsRunning(),
+                         * but for warming, false positives (including a
+                         * deleted tuple) are harmless — the entry just
+                         * gets a stale chain index entry that will be
+                         * overwritten on next INSERT.
+                         */
+                    }
+                    else
+                    {
+                        TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+                        if (TransactionIdDidCommit(xmax) ||
+                            TransactionIdIsCurrentTransactionId(xmax))
+                            continue;
+                    }
                 }
             }
 
@@ -294,8 +314,13 @@ warm_single_table(Oid relid)
                 if (blob_isnull)
                     continue;
 
-                /* Detoast the compressed blob */
-                blob = DatumGetByteaPP(blob_datum);
+                /*
+                 * Detoast the compressed blob.  Use PG_DETOAST_DATUM to
+                 * guarantee a flat 4-byte-header copy that's safe to pass
+                 * to l2_cache_put (which uses VARSIZE_ANY) and survives
+                 * independently of the buffer page.
+                 */
+                blob = (bytea *) PG_DETOAST_DATUM(blob_datum);
 
                 /* Extract delta tag */
                 err = xpatch_get_delta_tag(
@@ -324,6 +349,16 @@ warm_single_table(Oid relid)
                  */
                 if (xpatch_l2_cache_is_ready())
                     xpatch_l2_cache_put(relid, group_hash, seq, attnum, blob);
+
+                /*
+                 * Free the detoasted copy.  PG_DETOAST_DATUM returns
+                 * a palloc'd copy when the datum was toasted; when not
+                 * toasted it returns the original pointer (into the
+                 * buffer page).  Only free if it differs from the
+                 * original datum pointer.
+                 */
+                if ((Pointer) blob != DatumGetPointer(blob_datum))
+                    pfree(blob);
 
                 warmed++;
             }
@@ -526,9 +561,28 @@ xpatch_startup_warm_worker_main(Datum main_arg)
             {
                 for (i = 0; i < (int) ntables && !sw_got_sigterm; i++)
                 {
-                    int64 n = warm_l3_bits(relids[i]);
-                    if (n > 0)
-                        total_l3_bits += n;
+                    MemoryContext l3_ctx = CurrentMemoryContext;
+
+                    BeginInternalSubTransaction(NULL);
+
+                    PG_TRY(2);
+                    {
+                        int64 n = warm_l3_bits(relids[i]);
+                        if (n > 0)
+                            total_l3_bits += n;
+
+                        ReleaseCurrentSubTransaction();
+                    }
+                    PG_CATCH(2);
+                    {
+                        MemoryContextSwitchTo(l3_ctx);
+                        FlushErrorState();
+                        RollbackAndReleaseCurrentSubTransaction();
+
+                        elog(LOG, "xpatch startup warm: skipping L3 bits "
+                             "for table OID %u (error)", relids[i]);
+                    }
+                    PG_END_TRY(2);
                 }
 
                 SPI_finish();
