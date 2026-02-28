@@ -44,6 +44,7 @@
 #include "xpatch_stats_cache.h"
 #include "xpatch_chain_index.h"
 #include "xpatch_l2_cache.h"
+#include "xpatch_l3_cache.h"
 #include "xpatch_path_planner.h"
 
 #include "access/genam.h"
@@ -1066,42 +1067,22 @@ xpatch_reconstruct_planned(Relation rel, XPatchConfig *config,
 
             case PATH_ACTION_ANCHOR_L3:
             {
-                /* L3 not implemented yet — fall back to disk */
-                HeapTuple   phys;
-                bool        isnull;
-                Datum       delta_datum;
-
-                phys = xpatch_fetch_by_seq(rel, config, group_value, step_seq);
-                if (phys == NULL)
-                    goto plan_failed;
-
-                delta_datum = heap_getattr(phys, attnum, tupdesc, &isnull);
-                if (isnull)
+                /*
+                 * Read decompressed content from L3 disk cache. If stale
+                 * (L3 table dropped or entry evicted), abort the plan.
+                 */
+                bytea *l3 = xpatch_l3_cache_get(RelationGetRelid(rel),
+                                                group_hash, step_seq, attnum);
+                if (l3 != NULL)
                 {
-                    heap_freetuple(phys);
-                    goto plan_failed;
+                    if (running)
+                        pfree(running);
+                    running = l3;
+                    break;
                 }
-
-                delta_blob = datum_to_bytea(delta_datum, col_typid, false);
-                heap_freetuple(phys);
-
-                decoded = xpatch_decode_delta(
-                    (running ? (uint8 *) VARDATA_ANY(running) : NULL),
-                    (running ? VARSIZE_ANY_EXHDR(running) : 0),
-                    (uint8 *) VARDATA_ANY(delta_blob),
-                    VARSIZE_ANY_EXHDR(delta_blob));
-
-                pfree(delta_blob);
-                delta_blob = NULL;
-
-                if (decoded == NULL)
-                    goto plan_failed;
-
-                if (running)
-                    pfree(running);
-                running = decoded;
-                decoded = NULL;
-                break;
+                elog(DEBUG2, "xpatch plan: stale L3 at seq=" INT64_FORMAT
+                     ", aborting plan", step_seq);
+                goto plan_failed;
             }
 
             case PATH_ACTION_ANCHOR_KF_L2:
@@ -1260,12 +1241,19 @@ xpatch_reconstruct_planned(Relation rel, XPatchConfig *config,
         }
     }
 
-    /* Cache the final result in L1 */
+    /* Cache the final result in L1 and L3 */
     if (running != NULL)
     {
         int64 target_seq = plan->steps[plan->num_steps - 1].seq;
         xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid,
                          target_seq, attnum, running);
+
+        /* Also store in L3 if enabled for this table */
+        if (config->l3_cache_enabled)
+        {
+            xpatch_l3_cache_put(RelationGetRelid(rel), group_hash,
+                                target_seq, attnum, running);
+        }
     }
 
     return running;
@@ -2042,6 +2030,28 @@ xpatch_logical_to_physical(Relation rel, XPatchConfig *config,
                  * won't have the bit set — which is correct.
                  */
                 xpatch_cache_put(RelationGetRelid(rel), group_value, group_typid, new_seq, attnum, cache_content);
+
+                /*
+                 * Store in L3 if enabled for this table. The chain index
+                 * entry already exists, so l3_cache_put can set CHAIN_BIT_L3.
+                 *
+                 * Guard: only attempt L3 put if L3 is enabled for this table,
+                 * to avoid SPI overhead on every INSERT when L3 is disabled.
+                 */
+                if (config->l3_cache_enabled)
+                {
+                    XPatchGroupHash l3_hash;
+
+                    if (insert_cache_slot >= 0)
+                        l3_hash = insert_cache_hash;
+                    else
+                        l3_hash = xpatch_compute_group_hash(group_value, group_typid, false);
+
+                    xpatch_l3_cache_put(RelationGetRelid(rel), l3_hash,
+                                        new_seq,
+                                        config->delta_attnums[delta_col_index],
+                                        cache_content);
+                }
 
                 pfree(cache_content);
             }

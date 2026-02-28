@@ -37,6 +37,7 @@
 #include "xpatch_stats_cache.h"
 #include "xpatch_chain_index.h"
 #include "xpatch_l2_cache.h"
+#include "xpatch_l3_cache.h"
 
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
@@ -1109,6 +1110,7 @@ xpatch_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
             xpatch_cache_invalidate_rel(RelationGetRelid(relation));
             xpatch_insert_cache_invalidate_rel(RelationGetRelid(relation));
             xpatch_l2_cache_invalidate_rel(RelationGetRelid(relation));
+            xpatch_l3_cache_invalidate_rel(RelationGetRelid(relation));
             xpatch_chain_index_invalidate_rel(RelationGetRelid(relation));
         }
         
@@ -1589,6 +1591,7 @@ xpatch_tuple_delete(Relation relation, ItemPointer tid,
     xpatch_cache_invalidate_rel(relid);
     xpatch_insert_cache_invalidate_rel(relid);
     xpatch_l2_cache_invalidate_rel(relid);
+    xpatch_l3_cache_invalidate_rel(relid);  /* L3 disk cache */
     xpatch_chain_index_invalidate_rel(relid);
 
     /*
@@ -1896,6 +1899,7 @@ xpatch_relation_set_new_filelocator(Relation rel,
     xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
     xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
     xpatch_l2_cache_invalidate_rel(relid);   /* L2 compressed delta cache */
+    xpatch_l3_cache_invalidate_rel(relid);   /* L3 disk cache */
     xpatch_stats_cache_delete_table(relid);  /* Stats cache - delete on TRUNCATE */
     xpatch_chain_index_invalidate_rel(relid); /* Chain index */
 
@@ -1920,6 +1924,7 @@ xpatch_relation_nontransactional_truncate(Relation rel)
     xpatch_seq_cache_invalidate_rel(relid);  /* Group max seq + TID seq caches */
     xpatch_insert_cache_invalidate_rel(relid); /* Insert FIFO cache */
     xpatch_l2_cache_invalidate_rel(relid);   /* L2 compressed delta cache */
+    xpatch_l3_cache_invalidate_rel(relid);   /* L3 disk cache */
     xpatch_stats_cache_delete_table(relid); /* Stats cache */
     xpatch_chain_index_invalidate_rel(relid); /* Chain index */
 
@@ -2104,6 +2109,7 @@ xpatch_relation_vacuum(Relation rel, struct VacuumParams *params,
         xpatch_seq_cache_invalidate_rel(relid);
         xpatch_insert_cache_invalidate_rel(relid);
         xpatch_l2_cache_invalidate_rel(relid);
+        xpatch_l3_cache_invalidate_rel(relid);
         xpatch_chain_index_invalidate_rel(relid);
         cache_invalidated = true;
     }

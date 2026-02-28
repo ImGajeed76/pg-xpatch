@@ -34,6 +34,7 @@
 #include "xpatch_storage.h"
 #include "xpatch_stats_cache.h"
 #include "xpatch_l2_cache.h"
+#include "xpatch_l3_cache.h"
 #include "xpatch_chain_index.h"
 #include "xpatch_path_planner.h"
 
@@ -1034,4 +1035,22 @@ xpatch_plan_path_fn(PG_FUNCTION_ARGS)
     }
 
     SRF_RETURN_DONE(funcctx);
+}
+
+/*
+ * xpatch_l3_cache_drop_fn(regclass) — Drop L3 cache table for a relation.
+ *
+ * SQL-callable wrapper for xpatch_l3_cache_drop(). Returns true if the
+ * L3 table existed and was dropped, false otherwise.
+ */
+PG_FUNCTION_INFO_V1(xpatch_l3_cache_drop_fn);
+Datum
+xpatch_l3_cache_drop_fn(PG_FUNCTION_ARGS)
+{
+    Oid     relid = PG_GETARG_OID(0);
+    bool    dropped;
+
+    dropped = xpatch_l3_cache_drop(relid);
+
+    PG_RETURN_BOOL(dropped);
 }

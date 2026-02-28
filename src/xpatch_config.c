@@ -303,7 +303,8 @@ read_config_from_catalog(Oid relid, XPatchConfig *config)
     {
         /* First try by OID (fastest) */
         ret = SPI_execute_with_args(
-            "SELECT group_by, order_by, delta_columns, keyframe_every, compress_depth, enable_zstd "
+            "SELECT group_by, order_by, delta_columns, keyframe_every, "
+            "       compress_depth, enable_zstd, l3_cache_enabled, l3_cache_max_size_mb "
             "FROM xpatch.table_config WHERE relid = $1",
             1, argtypes, values, nulls, true, 1);
         
@@ -312,7 +313,8 @@ read_config_from_catalog(Oid relid, XPatchConfig *config)
         {
             ret = SPI_execute_with_args(
                 "SELECT tc.group_by, tc.order_by, tc.delta_columns, tc.keyframe_every, "
-                "       tc.compress_depth, tc.enable_zstd "
+                "       tc.compress_depth, tc.enable_zstd, "
+                "       tc.l3_cache_enabled, tc.l3_cache_max_size_mb "
                 "FROM xpatch.table_config tc "
                 "JOIN pg_class c ON tc.schema_name = (SELECT nspname FROM pg_namespace WHERE oid = c.relnamespace) "
                 "                AND tc.table_name = c.relname "
@@ -415,6 +417,22 @@ read_config_from_catalog(Oid relid, XPatchConfig *config)
             if (!isnull)
                 config->enable_zstd = DatumGetBool(datum);
 
+            /* l3_cache_enabled (column 7, may not exist in older schemas) */
+            if (tupdesc->natts >= 7)
+            {
+                datum = SPI_getbinval(tuple, tupdesc, 7, &isnull);
+                if (!isnull)
+                    config->l3_cache_enabled = DatumGetBool(datum);
+            }
+
+            /* l3_cache_max_size_mb (column 8, may not exist in older schemas) */
+            if (tupdesc->natts >= 8)
+            {
+                datum = SPI_getbinval(tuple, tupdesc, 8, &isnull);
+                if (!isnull)
+                    config->l3_cache_max_size_mb = DatumGetInt32(datum);
+            }
+
             MemoryContextSwitchTo(oldcxt);
         }
     }
@@ -451,6 +469,8 @@ xpatch_parse_reloptions(Relation rel)
     config->compress_depth = XPATCH_DEFAULT_COMPRESS_DEPTH;
     config->enable_zstd = XPATCH_DEFAULT_ENABLE_ZSTD;
     config->group_by_attnum = InvalidAttrNumber;
+    config->l3_cache_enabled = false;
+    config->l3_cache_max_size_mb = 1024;
 
     MemoryContextSwitchTo(oldcxt);
 

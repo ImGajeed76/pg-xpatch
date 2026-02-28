@@ -36,10 +36,13 @@ CREATE TABLE xpatch.table_config (
     keyframe_every  INT NOT NULL DEFAULT 100,  -- Create keyframe every N rows
     compress_depth  INT NOT NULL DEFAULT 1,    -- Number of previous versions to try
     enable_zstd     BOOLEAN NOT NULL DEFAULT true,  -- Enable zstd compression
+    l3_cache_enabled    BOOLEAN NOT NULL DEFAULT false,   -- Enable L3 persistent disk cache
+    l3_cache_max_size_mb INT NOT NULL DEFAULT 1024,       -- Max L3 table size in MB
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
     CONSTRAINT valid_keyframe_every CHECK (keyframe_every >= 1 AND keyframe_every <= 10000),
-    CONSTRAINT valid_compress_depth CHECK (compress_depth >= 1 AND compress_depth <= 65535)
+    CONSTRAINT valid_compress_depth CHECK (compress_depth >= 1 AND compress_depth <= 65535),
+    CONSTRAINT valid_l3_cache_max_size CHECK (l3_cache_max_size_mb >= 1)
 );
 
 -- Index for lookup by name (used during restore)
@@ -102,7 +105,9 @@ CREATE OR REPLACE FUNCTION xpatch.configure(
     delta_columns TEXT[] DEFAULT NULL,   -- Columns to compress (NULL = auto-detect TEXT/BYTEA/JSON)
     keyframe_every INT DEFAULT 100,      -- Full snapshot every N rows
     compress_depth INT DEFAULT 1,        -- Try N previous versions for best delta
-    enable_zstd BOOLEAN DEFAULT true     -- Additional zstd compression
+    enable_zstd BOOLEAN DEFAULT true,    -- Additional zstd compression
+    l3_cache_enabled BOOLEAN DEFAULT false,  -- Enable L3 persistent disk cache
+    l3_cache_max_size_mb INT DEFAULT 1024    -- Max L3 table size in MB
 ) RETURNS VOID AS $$
 DECLARE
     v_relid OID;
@@ -214,9 +219,11 @@ BEGIN
     DELETE FROM xpatch.table_config WHERE relid = v_relid;
     
     INSERT INTO xpatch.table_config (relid, schema_name, table_name, group_by, order_by, 
-                                     delta_columns, keyframe_every, compress_depth, enable_zstd)
+                                     delta_columns, keyframe_every, compress_depth, enable_zstd,
+                                     l3_cache_enabled, l3_cache_max_size_mb)
     SELECT v_relid, n.nspname, c.relname, group_by, order_by, 
-           delta_columns, keyframe_every, compress_depth, enable_zstd
+           delta_columns, keyframe_every, compress_depth, enable_zstd,
+           l3_cache_enabled, l3_cache_max_size_mb
     FROM pg_class c
     JOIN pg_namespace n ON c.relnamespace = n.oid
     WHERE c.oid = v_relid;
@@ -942,6 +949,29 @@ $$ LANGUAGE SQL STABLE;
 
 COMMENT ON FUNCTION xpatch.plan_path(regclass, text, int2, int8, bool) IS
     'Compute optimal reconstruction path for a target version using bottom-up DP';
+
+-- ============================================================================
+-- L3 cache management functions
+-- ============================================================================
+
+-- C function: drop L3 cache table for a relation
+CREATE FUNCTION xpatch_l3_cache_drop(rel regclass)
+RETURNS BOOLEAN
+AS 'MODULE_PATHNAME', 'xpatch_l3_cache_drop_fn'
+LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION xpatch_l3_cache_drop(regclass) IS
+    'Drop the L3 persistent disk cache table for an xpatch table';
+
+-- SQL wrapper in xpatch schema
+CREATE OR REPLACE FUNCTION xpatch.drop_l3_cache(
+    table_name REGCLASS
+) RETURNS BOOLEAN AS $$
+    SELECT xpatch_l3_cache_drop(table_name);
+$$ LANGUAGE SQL VOLATILE;
+
+COMMENT ON FUNCTION xpatch.drop_l3_cache(regclass) IS
+    'Drop the L3 persistent disk cache table for an xpatch table. Returns true if the table existed.';
 
 -- ============================================================================
 -- xpatch_physical() - C function for raw physical delta access

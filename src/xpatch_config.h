@@ -56,6 +56,10 @@ typedef struct XPatchConfig
 
     /* Physical column mapping */
     AttrNumber  xp_seq_attnum;      /* _xp_seq column */
+
+    /* L3 cache settings (per-table, from xpatch.table_config) */
+    bool        l3_cache_enabled;   /* Enable L3 heap-table cache */
+    int         l3_cache_max_size_mb; /* Max L3 cache size in MB */
 } XPatchConfig;
 
 /*
