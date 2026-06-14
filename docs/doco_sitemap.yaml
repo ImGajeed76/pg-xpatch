@@ -1,0 +1,41 @@
+sitemap:
+  - title: Introduction
+    children:
+      - title: Overview
+        url: ./overview.md
+      - title: Installation
+        url: ./installation.md
+      - title: Quickstart
+        url: ./quickstart.md
+  - title: Concepts
+    children:
+      - title: How storage works
+        url: ./storage-model.md
+      - title: Caching & performance
+        url: ./caching-and-performance.md
+      - title: Benchmarks
+        url: ./benchmarks.md
+  - title: Guides
+    children:
+      - title: Configuring a table
+        url: ./configuration.md
+      - title: Tuning compression
+        url: ./tuning-compression.md
+      - title: Tuning read performance
+        url: ./tuning-read-performance.md
+      - title: Monitoring & introspection
+        url: ./monitoring.md
+      - title: Backup & restore
+        url: ./backup-and-restore.md
+  - title: Reference
+    children:
+      - title: SQL functions
+        url: ./sql-functions.md
+      - title: Server parameters
+        url: ./server-parameters.md
+      - title: Data types & limitations
+        url: ./types-and-limitations.md
+  - title: Examples
+    children:
+      - title: Versioned notes app
+        url: ./example-notes-app.md
